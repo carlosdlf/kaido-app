@@ -2,6 +2,15 @@
 
 **Notes and to-dos for developers, stored in your own git repo.**
 
+![Status: alpha](https://img.shields.io/badge/status-alpha-F2A93B?labelColor=24272C)
+[![License: MIT or Apache 2.0](https://img.shields.io/badge/license-MIT%20or%20Apache%202.0-F2A93B?labelColor=24272C)](#license)
+<!--
+Enable once the repository is published on GitHub:
+[![CI](https://img.shields.io/github/actions/workflow/status/kaidoapp/kaido/ci.yml?branch=main&label=ci&labelColor=24272C)](https://github.com/kaidoapp/kaido/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/codecov/c/github/kaidoapp/kaido?labelColor=24272C)](https://codecov.io/gh/kaidoapp/kaido)
+[![Release](https://img.shields.io/github/v/release/kaidoapp/kaido?include_prereleases&color=F2A93B&labelColor=24272C)](https://github.com/kaidoapp/kaido/releases)
+-->
+
 Kaido is a minimal, keyboard-first desktop app for keeping notes and task lists organized by project. Everything is plain Markdown in a git repository you own. There is no account, no server, and no lock-in: you can read and edit your notes with any editor, and Kaido syncs them in the background.
 
 > [!NOTE]
