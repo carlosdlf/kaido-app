@@ -10,8 +10,14 @@ Thanks for your interest in Kaido! This guide explains how to set up the project
 
 ## Development setup
 
-1. Install [Node.js](https://nodejs.org) 22+, [pnpm](https://pnpm.io), [Rust](https://rustup.rs) (stable) and `git`.
-2. Install the [Tauri prerequisites](https://tauri.app/start/prerequisites/) for your OS.
+1. Install [Node.js](https://nodejs.org) 22 or newer, [pnpm](https://pnpm.io), [Rust](https://rustup.rs) (stable, 1.85 or newer) and `git`.
+2. Install the [Tauri prerequisites](https://tauri.app/start/prerequisites/) for your OS. On Linux this includes the WebKitGTK and other system development packages; for example, on Debian or Ubuntu:
+
+   ```sh
+   sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
+     libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+   ```
+
 3. Clone and run:
 
    ```sh
@@ -26,21 +32,30 @@ Thanks for your interest in Kaido! This guide explains how to set up the project
 | Command | What it does |
 |---|---|
 | `pnpm tauri dev` | Run the app in development mode |
-| `pnpm check` | Type-check the frontend |
-| `pnpm lint` | Lint and check formatting |
-| `pnpm test` | Run frontend unit tests |
+| `pnpm dev` | Run only the frontend in a browser (no Tauri APIs) |
+| `pnpm build` | Build the frontend into `dist/` |
+| `pnpm tauri build` | Build the desktop app and installers |
+| `pnpm check` | Type-check the frontend, the Vite config, and the core without DOM types |
+| `pnpm lint` | Lint with ESLint and check formatting with Prettier |
+| `pnpm format` | Format all files with Prettier |
+| `pnpm test` | Run frontend unit tests (Vitest) |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Run Rust tests |
+| `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings` | Lint Rust code |
 
 ## Project layout
 
 ```
-src/          Svelte frontend
-  lib/core/     Platform-independent logic (parsing, index, search)
-  lib/storage/  Storage interface and implementations
-  lib/ui/       Components and design tokens
-src-tauri/    Rust backend (filesystem, git, OS integration)
-docs/         Architecture and contributor documentation
+src/            Svelte frontend (Vite single-page app)
+  main.ts         Entry point: loads fonts and global styles, mounts App.svelte
+  lib/core/       Platform-independent logic and its tests
+  lib/storage/    Storage interface and implementations
+  lib/ui/         Components, design tokens (tokens.css) and base styles
+src-tauri/      Rust backend (filesystem, git, OS integration)
+  capabilities/   Permissions granted to the webview
+docs/           Architecture and contributor documentation
 ```
+
+Code in `src/lib/core` must stay platform independent: no DOM APIs and no imports from Tauri or Svelte. `pnpm check` and `pnpm lint` enforce this. UI code reaches the platform through `src/lib/storage`.
 
 See [docs/architecture.md](docs/architecture.md) for how the pieces fit together.
 
@@ -67,7 +82,7 @@ docs: explain the notes folder layout
 
 1. Fork the repo and create a branch from `main`.
 2. Keep each PR focused on one change. Add or update tests when behavior changes.
-3. Make sure `pnpm check`, `pnpm lint`, `pnpm test` and the Rust tests pass.
+3. Make sure `pnpm check`, `pnpm lint`, `pnpm test`, and the Rust tests and Clippy pass.
 4. Use a Conventional Commit style PR title; PRs are squash-merged with that title.
 5. Don't edit `CHANGELOG.md` by hand; it is updated automatically on release.
 

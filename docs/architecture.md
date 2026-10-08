@@ -17,6 +17,26 @@ Kaido is a [Tauri v2](https://tauri.app) desktop app. The interface is written i
 
 Most logic lives in `lib/core` as plain TypeScript with no platform dependencies. The Rust side stays thin: file I/O, running `git`, watching the notes folder, and OS integration (tray, global shortcuts, notifications). Keeping the core in TypeScript lets future clients (web, mobile) reuse it by providing a different `Storage` implementation.
 
+## Frontend structure
+
+The frontend is a single-page app built with Vite and Svelte 5 (no SvelteKit). `src/main.ts` loads the bundled fonts and global styles, then mounts `src/App.svelte`.
+
+| Path | Contents | May import |
+|---|---|---|
+| `src/lib/core/` | Platform-independent logic and its unit tests (`*.test.ts`) | Other `core` modules only |
+| `src/lib/storage/` | The `Storage` interface and its implementations | `core`, `@tauri-apps/*` |
+| `src/lib/ui/` | Svelte components, `tokens.css` (design tokens), `base.css` | `core`, `storage`, `svelte` |
+
+The `$lib` alias points to `src/lib`. Fonts (JetBrains Mono, Geist) are bundled with the app, so nothing is loaded from the network.
+
+### Enforced boundaries
+
+These rules are checked by `pnpm check` and `pnpm lint`, so a violation fails the build checks:
+
+- **No platform types in the core.** `tsconfig.core.json` type-checks `src/lib/core` with only the `ES2022` library and no ambient types. Using `document`, `window` or other DOM APIs there is a type error.
+- **No Tauri, Svelte, UI or storage in the core.** ESLint rejects imports of `@tauri-apps/*`, `svelte`, `*.svelte`, `$lib/ui` and `$lib/storage` from `src/lib/core`.
+- **Platform access only through storage.** ESLint rejects `@tauri-apps/*` imports anywhere in `src/` except `src/lib/storage`.
+
 ## Tech stack
 
 | Area | Choice |
@@ -72,6 +92,24 @@ Settings are JSON, validated with a schema, and carry a `version` field for migr
 | `.kaido/config.json` | the workspace: project order, ignored paths | inside the workspace (synced) |
 
 Device settings override workspace settings, which override built-in defaults. Secrets are never stored in these files; they go to the OS keychain.
+
+## Security
+
+The webview runs with a strict Content Security Policy, defined in `src-tauri/tauri.conf.json` (`app.security.csp`, plus `devCsp` for development):
+
+| Directive | Value | Notes |
+|---|---|---|
+| `default-src` | `'self'` | |
+| `script-src` | `'self'` | Only scripts bundled with the app. No inline scripts, no `eval`. |
+| `style-src` | `'self' 'unsafe-inline'` | See below. |
+| `font-src` | `'self'` | Fonts are bundled. |
+| `img-src` | `'self' data: blob:` | |
+| `connect-src` | `'self' ipc: http://ipc.localhost` | IPC to the Rust backend. `devCsp` also allows the Vite dev server websocket. |
+| `object-src`, `form-action`, `frame-ancestors` | `'none'` | |
+
+**Inline styles.** Svelte and Vite in development, and the editor at runtime, inject `<style>` elements. By default Tauri adds hashes and nonces to the CSP, which would make browsers ignore `'unsafe-inline'`. Setting `dangerousDisableAssetCspModification: ["style-src"]` turns that off for `style-src` only, so inline styles work. This exception applies to styles only and must never be extended to `script-src`.
+
+**Capabilities.** The main window has a single capability (`src-tauri/capabilities/default.json`) granting `core:default`. New permissions are added only when a feature needs them, scoped as narrowly as possible.
 
 ## Performance budget
 

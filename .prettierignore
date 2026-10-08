@@ -1,0 +1,9 @@
+dist/
+node_modules/
+src-tauri/
+site/
+pnpm-lock.yaml
+CHANGELOG.md
+# Prose and CI files are formatted by hand.
+*.md
+.github/
