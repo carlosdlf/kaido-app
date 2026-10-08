@@ -85,6 +85,8 @@
   /* Layout */
   --sidebar-width: 240px;
   --list-width: 300px;
+  /* Every list row has this height so long lists can be virtualized. */
+  --list-row-height: 64px;
   --pane-header-height: 41px;
   --note-max-width: 720px;
   --checkbox-size: 15px;

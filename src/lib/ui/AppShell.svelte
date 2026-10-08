@@ -1,34 +1,79 @@
 <script lang="ts">
+  import { onMount } from "svelte";
+  import {
+    ALL_TASKS,
+    listItems,
+    listSummary,
+    listTitle,
+    sidebarEntries,
+    totalOpen,
+  } from "$lib/core/views";
+  import type { AppState } from "./appState.svelte";
   import EditorPane from "./EditorPane.svelte";
-  import { inbox, initialSelection, projects, sync } from "./fixtures";
   import ListPane from "./ListPane.svelte";
   import Sidebar from "./Sidebar.svelte";
-  import { listItems, listSummary, listTitle, openDocument } from "./workspace";
+  import StartScreen from "./StartScreen.svelte";
 
-  let folder: string = $state(initialSelection.folder);
-  let item: string = $state(initialSelection.item);
+  let { app }: { app: AppState } = $props();
 
-  const items = $derived(listItems(folder));
-  const doc = $derived(openDocument(item));
+  /** Refreshed every minute so relative ages stay current. */
+  let now = $state(Date.now());
 
-  function selectFolder(id: string) {
-    if (id === folder) return;
-    folder = id;
-    item = listItems(id)[0]?.id ?? "";
+  onMount(() => {
+    const timer = setInterval(() => (now = Date.now()), 60_000);
+    return () => clearInterval(timer);
+  });
+
+  const entries = $derived(sidebarEntries(app.workspace, app.summaries));
+  const items = $derived(listItems(app.workspace, app.folder, app.summaries));
+  const workspaceName = $derived(
+    app.phase.kind === "ready" ? (app.phase.root.split(/[\\/]/).filter(Boolean).pop() ?? "") : "",
+  );
+
+  function pick() {
+    void app.pickWorkspace();
   }
 </script>
 
-<div class="shell">
-  <Sidebar {inbox} {projects} {sync} selected={folder} onselect={selectFolder} />
-  <ListPane
-    title={listTitle(folder)}
-    summary={listSummary(folder)}
-    {items}
-    selected={item}
-    onselect={(id) => (item = id)}
+{#if app.phase.kind === "ready"}
+  <div class="shell">
+    <Sidebar
+      {entries}
+      allOpen={totalOpen(entries)}
+      {workspaceName}
+      warnings={app.warnings.map((warning) => warning.message)}
+      notice={app.notice}
+      onpick={pick}
+      selected={app.folder}
+      onselect={(id) => app.selectFolder(id)}
+    />
+    <ListPane
+      title={listTitle(app.folder)}
+      summary={listSummary(app.workspace, app.folder, app.summaries)}
+      {items}
+      emptyMessage={app.folder === ALL_TASKS ? "No open tasks." : "No notes yet."}
+      {now}
+      selected={app.item}
+      onselect={(id) => app.selectItem(id)}
+    />
+    <EditorPane doc={app.document} {now} />
+  </div>
+{:else if app.phase.kind === "no-workspace"}
+  <StartScreen
+    title="Open a workspace"
+    message="Choose a folder for your notes and tasks. It can be an existing git repository or an empty folder."
+    onpick={pick}
   />
-  <EditorPane {doc} />
-</div>
+{:else if app.phase.kind === "loading"}
+  <StartScreen title="Opening workspace" message={app.phase.path} busy onpick={pick} />
+{:else if app.phase.kind === "error"}
+  <StartScreen
+    title="Could not open the workspace"
+    message={app.phase.message}
+    error
+    onpick={pick}
+  />
+{/if}
 
 <style>
   .shell {

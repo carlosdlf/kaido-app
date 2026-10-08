@@ -10,6 +10,21 @@ const tauriImports = {
   message: "Only src/lib/storage may use Tauri APIs; go through the Storage interface.",
 };
 
+/** Imports forbidden in the platform-independent layers (core and config). */
+const pureLayerPatterns = [
+  tauriImports,
+  { group: ["svelte", "svelte/*"], message: "core and config must not depend on Svelte." },
+  { group: ["*.svelte"], message: "core and config must not import components." },
+  {
+    group: ["$lib/ui", "$lib/ui/*", "**/ui", "**/ui/*"],
+    message: "core and config must not depend on the UI layer.",
+  },
+  {
+    group: ["$lib/storage", "$lib/storage/*", "**/storage", "**/storage/*"],
+    message: "core and config must not depend on storage; receive data through arguments.",
+  },
+];
+
 export default defineConfig(
   {
     ignores: ["dist/", "node_modules/", "src-tauri/", "site/", "coverage/"],
@@ -55,23 +70,47 @@ export default defineConfig(
     },
   },
   {
-    // The core must stay platform independent: no Tauri, Svelte, UI or storage.
+    // Core and config must stay platform independent: no Tauri, Svelte, UI or storage.
+    files: ["src/lib/core/**/*.ts", "src/lib/config/**/*.ts"],
+    rules: {
+      "no-restricted-imports": ["error", { patterns: pureLayerPatterns }],
+    },
+  },
+  {
+    // Storage builds on core only: no configuration, UI or Svelte.
+    files: ["src/lib/storage/**/*.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            { group: ["svelte", "svelte/*"], message: "storage must not depend on Svelte." },
+            { group: ["*.svelte"], message: "storage must not import components." },
+            {
+              group: ["$lib/ui", "$lib/ui/*", "**/ui", "**/ui/*"],
+              message: "storage must not depend on the UI layer.",
+            },
+            {
+              group: ["$lib/config", "$lib/config/*", "**/config", "**/config/*"],
+              message: "storage must not depend on config; shared constants live in core.",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    // The core is the bottom layer; configuration builds on it, not the reverse.
     files: ["src/lib/core/**/*.ts"],
     rules: {
       "no-restricted-imports": [
         "error",
         {
           patterns: [
-            tauriImports,
-            { group: ["svelte", "svelte/*"], message: "core must not depend on Svelte." },
-            { group: ["*.svelte"], message: "core must not import components." },
+            ...pureLayerPatterns,
             {
-              group: ["$lib/ui", "$lib/ui/*", "**/ui", "**/ui/*"],
-              message: "core must not depend on the UI layer.",
-            },
-            {
-              group: ["$lib/storage", "$lib/storage/*", "**/storage", "**/storage/*"],
-              message: "core must not depend on storage; receive data through arguments.",
+              group: ["$lib/config", "$lib/config/*", "**/config", "**/config/*"],
+              message: "core must not depend on config; receive settings through arguments.",
             },
           ],
         },

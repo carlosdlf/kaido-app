@@ -38,9 +38,13 @@ Thanks for your interest in Kaido! This guide explains how to set up the project
 | `pnpm check` | Type-check the frontend, the Vite config, and the core without DOM types |
 | `pnpm lint` | Lint with ESLint and check formatting with Prettier |
 | `pnpm format` | Format all files with Prettier |
-| `pnpm test` | Run frontend unit tests (Vitest) |
+| `pnpm test` | Run frontend tests (Vitest) with coverage; fails if coverage drops below the thresholds |
+| `pnpm test:watch` | Run frontend tests in watch mode, without coverage |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Run Rust tests |
-| `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings` | Lint Rust code |
+| `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` | Lint Rust code, tests included |
+| `cargo fmt --manifest-path src-tauri/Cargo.toml --check` | Check Rust formatting |
+
+The Rust commands need a `dist/` folder to exist. Run `pnpm build` once, or create an empty one with `mkdir -p dist`.
 
 ## Project layout
 
@@ -48,16 +52,56 @@ Thanks for your interest in Kaido! This guide explains how to set up the project
 src/            Svelte frontend (Vite single-page app)
   main.ts         Entry point: loads fonts and global styles, mounts App.svelte
   lib/core/       Platform-independent logic and its tests
+  lib/config/     Settings schemas and parsing (platform independent)
   lib/storage/    Storage interface and implementations
-  lib/ui/         Components, design tokens (tokens.css) and base styles
+  lib/ui/         Components, app state, design tokens (tokens.css) and base styles
 src-tauri/      Rust backend (filesystem, git, OS integration)
   capabilities/   Permissions granted to the webview
 docs/           Architecture and contributor documentation
 ```
 
-Code in `src/lib/core` must stay platform independent: no DOM APIs and no imports from Tauri or Svelte. `pnpm check` and `pnpm lint` enforce this. UI code reaches the platform through `src/lib/storage`.
+Code in `src/lib/core` and `src/lib/config` must stay platform independent: no DOM APIs and no imports from Tauri or Svelte. `pnpm check` and `pnpm lint` enforce this. UI code reaches the platform through `src/lib/storage`.
 
 See [docs/architecture.md](docs/architecture.md) for how the pieces fit together.
+
+## Testing
+
+- **Every bug fix needs a regression test** that fails without the fix.
+- New behavior comes with tests. Logic belongs in `src/lib/core` or `src/lib/config`, where it is easy to test without a UI.
+- Frontend tests run with Vitest. Component tests (`src/lib/ui`, `src/App.test.ts`) use [Testing Library](https://testing-library.com/docs/svelte-testing-library/intro/) in jsdom; everything else runs in plain Node, so it cannot rely on DOM globals. Use `MemoryStorage` instead of real files.
+- Rust tests live next to the code (`#[cfg(test)]` modules) and use temporary folders.
+
+### Coverage
+
+CI fails if coverage drops below these thresholds:
+
+| Area | Lines, statements, functions | Branches |
+|---|---|---|
+| `src/lib/core` | 95% | 90% |
+| `src/lib/storage` | 95% | 90% |
+| `src/lib/config` | 95% | 90% |
+| `src/lib/ui` | 80% | 75% |
+| Rust (`src-tauri/src`, except `lib.rs` and `main.rs`) | 90% of lines | – |
+
+Frontend coverage is part of `pnpm test`; an HTML report is written to `coverage/`.
+
+```sh
+pnpm test
+```
+
+Rust coverage uses [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov). Install it once:
+
+```sh
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov
+```
+
+Then run the same check as CI:
+
+```sh
+cargo llvm-cov --manifest-path src-tauri/Cargo.toml --summary-only \
+  --ignore-filename-regex '/src/(lib|main)\.rs$' --fail-under-lines 90
+```
 
 ## Commit messages
 
@@ -81,8 +125,8 @@ docs: explain the notes folder layout
 ## Pull requests
 
 1. Fork the repo and create a branch from `main`.
-2. Keep each PR focused on one change. Add or update tests when behavior changes.
-3. Make sure `pnpm check`, `pnpm lint`, `pnpm test`, and the Rust tests and Clippy pass.
+2. Keep each PR focused on one change. Add or update tests when behavior changes; bug fixes include a regression test (see [Testing](#testing)).
+3. Make sure `pnpm check`, `pnpm lint`, `pnpm test`, Rust formatting, Clippy and the Rust coverage check pass.
 4. Use a Conventional Commit style PR title; PRs are squash-merged with that title.
 5. Don't edit `CHANGELOG.md` by hand; it is updated automatically on release.
 

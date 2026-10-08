@@ -20,3 +20,6 @@ src-tauri/gen/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Test coverage reports
+coverage/

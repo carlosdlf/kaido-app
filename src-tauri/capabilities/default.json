@@ -3,5 +3,14 @@
   "identifier": "default",
   "description": "Default capability for the main window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "allow-pick-workspace-folder",
+    "allow-open-workspace",
+    "allow-list-files",
+    "allow-read-file",
+    "allow-write-file",
+    "allow-read-settings",
+    "allow-write-settings"
+  ]
 }

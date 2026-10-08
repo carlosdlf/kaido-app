@@ -1,73 +1,87 @@
 <script lang="ts">
-  import { splitTags } from "$lib/core/tags";
-  import { parseTaskLine, type ParsedTask } from "$lib/core/tasks";
-  import type { OpenDocument } from "./workspace";
+  import { parseBlocks } from "$lib/core/blocks";
+  import { formatAge } from "$lib/core/time";
+  import { splitPath } from "$lib/core/views";
+  import type { DocumentState } from "./appState.svelte";
+  import InlineText from "./InlineText.svelte";
 
   interface Props {
-    doc: OpenDocument | undefined;
+    doc: DocumentState | null;
+    /** Current time, for the relative age. */
+    now: number;
   }
 
-  let { doc }: Props = $props();
+  let { doc, now }: Props = $props();
 
-  const NEWLINE = "\n";
-
-  function tasks(lines: string[]): ParsedTask[] {
-    return lines.map(parseTaskLine).filter((task): task is ParsedTask => task !== null);
-  }
+  const location = $derived(doc ? splitPath(doc.path) : null);
+  const blocks = $derived(doc?.status === "ready" ? parseBlocks(doc.text) : []);
 </script>
 
 <main class="editor-pane" aria-label="Editor">
-  {#if doc}
+  {#if doc && location}
     <header class="header">
-      <span class="path">{doc.folder}/<span class="file">{doc.file}</span></span>
-      <span class="status">saved · {doc.age}</span>
+      <span class="path">{location.folder}<span class="file">{location.file}</span></span>
+      {#if doc.status === "ready"}
+        <span class="status">read-only · {formatAge(doc.modified, now)}</span>
+      {/if}
     </header>
 
-    {#key `${doc.folder}/${doc.file}`}
-      <article class="note">
-        {#each doc.body as block, index (index)}
-          {#if block.kind === "heading" && block.level === 1}
-            <h1><span class="marker" aria-hidden="true">#</span> {block.text}</h1>
-          {:else if block.kind === "heading"}
-            <h2><span class="marker" aria-hidden="true">##</span> {block.text}</h2>
-          {:else if block.kind === "paragraph"}
-            <p>
-              {#each block.inlines as inline, inlineIndex (inlineIndex)}
-                {#if inline.kind === "code"}<code>{inline.text}</code>{:else}{inline.text}{/if}
-              {/each}
-            </p>
-          {:else if block.kind === "tags"}
-            <ul class="tags" aria-label="Tags">
-              {#each block.tags as tag (tag)}
-                <li class="tag">#{tag}</li>
-              {/each}
-            </ul>
-          {:else if block.kind === "shell"}
-            <pre class="code">{#each block.commands as command, i (i)}{#if i > 0}{NEWLINE}{/if}<span
-                  class="prompt"
-                  aria-hidden="true">$</span
-                > {command}{/each}</pre>
-          {:else if block.kind === "tasks"}
-            <ul class="checklist">
-              {#each tasks(block.lines) as task, taskIndex (taskIndex)}
-                <li>
-                  <label class="task">
-                    <!-- Read-only until task editing is wired to storage. -->
-                    <input type="checkbox" checked={task.done} disabled />
-                    <span class="task-text">
-                      {#each splitTags(task.text) as segment, segmentIndex (segmentIndex)}
-                        {#if segment.kind === "tag"}<span class="tag">{segment.text}</span
-                          >{:else}{segment.text}{/if}
-                      {/each}
-                    </span>
-                  </label>
-                </li>
-              {/each}
-            </ul>
-          {/if}
-        {/each}
-      </article>
-    {/key}
+    {#if doc.status === "ready"}
+      {#key doc.path}
+        <article class="note">
+          {#each blocks as block, index (index)}
+            {#if block.kind === "heading"}
+              {#if block.level === 1}
+                <h1><span class="marker" aria-hidden="true">#</span> {block.text}</h1>
+              {:else if block.level === 2}
+                <h2><span class="marker" aria-hidden="true">##</span> {block.text}</h2>
+              {:else}
+                <h3>
+                  <span class="marker" aria-hidden="true">{"#".repeat(block.level)}</span>
+                  {block.text}
+                </h3>
+              {/if}
+            {:else if block.kind === "paragraph"}
+              <p>
+                <InlineText text={block.text} />
+              </p>
+            {:else if block.kind === "code"}
+              <pre class="code">{block.text}</pre>
+            {:else if block.kind === "list"}
+              <ul class="bullets">
+                {#each block.items as text, itemIndex (itemIndex)}
+                  <li>
+                    <InlineText {text} />
+                  </li>
+                {/each}
+              </ul>
+            {:else}
+              <ul class="checklist">
+                {#each block.tasks as task, taskIndex (taskIndex)}
+                  <li>
+                    <label class="task">
+                      <!-- Read-only until task editing is wired to storage. -->
+                      <input type="checkbox" checked={task.done} disabled />
+                      <span class="task-text">
+                        <InlineText text={task.text} />
+                      </span>
+                    </label>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          {:else}
+            <p class="empty-note">This note is empty.</p>
+          {/each}
+        </article>
+      {/key}
+    {:else if doc.status === "too-large"}
+      <p class="empty" role="status">This file is larger than 8 MiB, too large to open in Kaido.</p>
+    {:else if doc.status === "missing"}
+      <p class="empty" role="status">This file no longer exists.</p>
+    {:else if doc.status === "error"}
+      <p class="empty" role="alert">Could not read this file: {doc.message}</p>
+    {/if}
   {:else}
     <p class="empty">No note selected.</p>
   {/if}
@@ -125,7 +139,8 @@
   }
 
   h1,
-  h2 {
+  h2,
+  h3 {
     color: var(--color-heading);
     font-weight: var(--font-weight-semibold);
   }
@@ -141,6 +156,11 @@
     font-size: var(--font-size-note-h2);
   }
 
+  h3 {
+    margin-bottom: var(--space-8);
+    font-size: var(--font-size-note);
+  }
+
   .marker {
     color: var(--color-dim);
     font-family: var(--font-ui);
@@ -149,24 +169,6 @@
 
   p {
     margin-bottom: var(--space-12);
-  }
-
-  code {
-    color: var(--color-accent);
-    font-size: var(--font-size-ui);
-  }
-
-  .tags {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-8);
-    margin-bottom: var(--space-28);
-    font-family: var(--font-ui);
-    font-size: var(--font-size-small);
-  }
-
-  .tag {
-    color: var(--color-accent);
   }
 
   .code {
@@ -181,7 +183,13 @@
     white-space: pre-wrap;
   }
 
-  .prompt {
+  .bullets {
+    margin-bottom: var(--space-12);
+    padding-left: var(--space-20);
+    list-style: disc;
+  }
+
+  .empty-note {
     color: var(--color-muted);
   }
 

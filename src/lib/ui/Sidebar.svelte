@@ -1,26 +1,38 @@
 <script lang="ts">
   import { nextListIndex } from "$lib/core/listNavigation";
-  import type { FolderFixture, SyncFixture } from "./fixtures";
-  import { ALL_TASKS, openTaskCount } from "./workspace";
+  import { ALL_TASKS, type SidebarEntry } from "$lib/core/views";
+  import { INBOX } from "$lib/core/workspace";
 
   interface Props {
-    inbox: FolderFixture;
-    projects: FolderFixture[];
-    sync: SyncFixture;
+    /** Projects in display order; the first one is the inbox. */
+    entries: SidebarEntry[];
+    allOpen: number | null;
+    /** Name of the workspace folder, shown in the footer. */
+    workspaceName: string;
+    warnings: string[];
+    /** A problem keeping the workspace up to date. */
+    notice: string | null;
+    onpick: () => void;
     selected: string;
     onselect: (id: string) => void;
   }
 
-  let { inbox, projects, sync, selected, onselect }: Props = $props();
+  let { entries, allOpen, workspaceName, warnings, notice, onpick, selected, onselect }: Props =
+    $props();
 
   let nav: HTMLElement | undefined = $state();
 
-  const inboxOpen = $derived(openTaskCount(inbox));
-  const allOpen = $derived(
-    projects.reduce((sum, project) => sum + openTaskCount(project), inboxOpen),
-  );
+  const inbox = $derived(entries.find((entry) => entry.name === INBOX));
+  const projects = $derived(entries.filter((entry) => entry.name !== INBOX));
+  const order = $derived([INBOX, ALL_TASKS, ...projects.map((project) => project.name)]);
 
-  const order = $derived([inbox.name, ALL_TASKS, ...projects.map((project) => project.name)]);
+  function count(value: number | null | undefined): string {
+    return value === null || value === undefined ? "…" : String(value);
+  }
+
+  function countLabel(value: number | null | undefined): string {
+    return value === null || value === undefined ? "counting open tasks" : `${value} open tasks`;
+  }
 
   function handleKeydown(event: KeyboardEvent) {
     // Only arrow through folder entries, not the other buttons in the nav.
@@ -51,13 +63,15 @@
         <button
           type="button"
           class="item"
-          data-nav-id={inbox.name}
-          tabindex={selected === inbox.name ? 0 : -1}
-          aria-current={selected === inbox.name ? "page" : undefined}
-          onclick={() => onselect(inbox.name)}
+          data-nav-id={INBOX}
+          tabindex={selected === INBOX ? 0 : -1}
+          aria-current={selected === INBOX ? "page" : undefined}
+          onclick={() => onselect(INBOX)}
         >
           <span class="label">~/inbox</span>
-          <span class="count" aria-label="{inboxOpen} open tasks">[{inboxOpen}]</span>
+          <span class="count" aria-label={countLabel(inbox?.openCount)}
+            >[{count(inbox?.openCount)}]</span
+          >
         </button>
       </li>
       <li>
@@ -70,30 +84,34 @@
           onclick={() => onselect(ALL_TASKS)}
         >
           <span class="label">~/all-tasks</span>
-          <span class="count" aria-label="{allOpen} open tasks">[{allOpen}]</span>
+          <span class="count" aria-label={countLabel(allOpen)}>[{count(allOpen)}]</span>
         </button>
       </li>
     </ul>
 
     <div class="group">
       <h2 class="heading" id="projects-heading"><span aria-hidden="true">#</span> projects</h2>
-      <ul class="group" aria-labelledby="projects-heading">
-        {#each projects as project (project.name)}
-          <li>
-            <button
-              type="button"
-              class="item"
-              data-nav-id={project.name}
-              tabindex={selected === project.name ? 0 : -1}
-              aria-current={selected === project.name ? "page" : undefined}
-              onclick={() => onselect(project.name)}
-            >
-              <span class="glyph" aria-hidden="true">▸</span>
-              <span class="label">{project.name}</span>
-            </button>
-          </li>
-        {/each}
-      </ul>
+      {#if projects.length > 0}
+        <ul class="group" aria-labelledby="projects-heading">
+          {#each projects as project (project.name)}
+            <li>
+              <button
+                type="button"
+                class="item"
+                data-nav-id={project.name}
+                tabindex={selected === project.name ? 0 : -1}
+                aria-current={selected === project.name ? "page" : undefined}
+                onclick={() => onselect(project.name)}
+              >
+                <span class="glyph" aria-hidden="true">▸</span>
+                <span class="label">{project.name}</span>
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {:else}
+        <p class="hint">No projects yet</p>
+      {/if}
       <button type="button" class="item add">
         <span aria-hidden="true">+</span>
         <span>new project</span>
@@ -101,17 +119,31 @@
     </div>
   </nav>
 
-  <footer class="sync">
-    <span class="visually-hidden">Sync status:</span>
-    <span>
-      {#if sync.state === "synced"}
-        <span class="sync-ok" aria-hidden="true">✓</span>
-      {:else}
-        <span class="sync-paused" aria-hidden="true">!</span>
-      {/if}
-      {sync.branch}
-    </span>
-    <span>{sync.label}</span>
+  <footer class="footer">
+    {#if notice}
+      <div class="notice" role="alert">
+        <p>{notice}</p>
+        <button type="button" class="notice-action" onclick={onpick}>Open folder…</button>
+      </div>
+    {/if}
+    {#if warnings.length > 0}
+      <details class="warnings">
+        <summary>
+          <span class="warning-mark" aria-hidden="true">!</span>
+          {warnings.length}
+          {warnings.length === 1 ? "settings warning" : "settings warnings"}
+        </summary>
+        <ul>
+          {#each warnings as warning, index (index)}
+            <li>{warning}</li>
+          {/each}
+        </ul>
+      </details>
+    {/if}
+    <div class="status">
+      <span class="workspace" title={workspaceName}>~/{workspaceName}</span>
+      <span>local only</span>
+    </div>
   </footer>
 </aside>
 
@@ -225,9 +257,14 @@
     color: var(--color-muted);
   }
 
-  .sync {
+  .hint {
+    padding: var(--space-6) var(--space-10);
+    color: var(--color-muted);
+  }
+
+  .footer {
     display: flex;
-    justify-content: space-between;
+    flex-direction: column;
     gap: var(--space-8);
     margin-top: auto;
     padding: var(--space-8) var(--space-10) 0;
@@ -236,11 +273,51 @@
     font-size: var(--font-size-meta);
   }
 
-  .sync-ok {
-    color: var(--color-success);
+  .status {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-8);
   }
 
-  .sync-paused {
+  .workspace {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .notice {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-6);
+    padding: var(--space-8);
+    background: var(--color-paused-bg);
+    border: var(--space-1) solid var(--color-paused-border);
+    border-radius: var(--radius-md);
+    color: var(--color-text);
+  }
+
+  .notice-action {
+    align-self: flex-start;
+    color: var(--color-accent);
+  }
+
+  .notice-action:hover {
+    color: var(--color-accent-hover);
+  }
+
+  .warnings summary {
+    cursor: pointer;
+  }
+
+  .warnings ul {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    padding-top: var(--space-6);
+    overflow-wrap: anywhere;
+  }
+
+  .warning-mark {
     color: var(--color-danger);
   }
 </style>

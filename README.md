@@ -38,6 +38,23 @@ my-notes/
 
 Kaido uses the `git` installed on your system, so it works with any remote (GitHub, GitLab, Gitea, your own server) and your existing SSH keys or credential helper.
 
+### Your notes folder
+
+You can open any existing folder. Kaido reads it like this:
+
+- Each top-level folder is a project. Its `tasks.md` is the project's task list.
+- Every other `.md` file is a note, including files in subfolders (`api-payments/auth/login.md`).
+- `.md` files at the top of the folder show up in the inbox.
+- Folders inside `_archive/` are archived projects.
+- Everything else is left alone: non-Markdown files, hidden files and folders (`.git`, anything starting with `.`), and `node_modules`.
+- To hide more paths, list them under `ignore` in `.kaido/config.json`:
+
+  ```json
+  { "version": 1, "ignore": ["drafts/", "*.draft.md"] }
+  ```
+
+Kaido picks up changes you make with other editors while it is running.
+
 ## Building from source
 
 Requirements: [Node.js](https://nodejs.org) 22+, [pnpm](https://pnpm.io), [Rust](https://rustup.rs) (stable), `git`, and the [Tauri prerequisites](https://tauri.app/start/prerequisites/) for your platform.

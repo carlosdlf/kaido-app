@@ -4,5 +4,5 @@
     "lib": ["ES2022"],
     "types": []
   },
-  "include": ["src/lib/core/**/*.ts"]
+  "include": ["src/lib/core/**/*.ts", "src/lib/config/**/*.ts"]
 }

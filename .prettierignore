@@ -2,6 +2,7 @@ dist/
 node_modules/
 src-tauri/
 site/
+coverage/
 pnpm-lock.yaml
 CHANGELOG.md
 # Prose and CI files are formatted by hand.
