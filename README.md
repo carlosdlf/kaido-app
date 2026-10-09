@@ -12,10 +12,10 @@
 ![Status: alpha](https://img.shields.io/badge/status-alpha-F2A93B?labelColor=24272C)
 [![License: MIT or Apache 2.0](https://img.shields.io/badge/license-MIT%20or%20Apache%202.0-F2A93B?labelColor=24272C)](#license)
 [![CI](https://img.shields.io/github/actions/workflow/status/carlosdlf/kaido-app/ci.yml?branch=main&label=ci&labelColor=24272C)](https://github.com/carlosdlf/kaido-app/actions/workflows/ci.yml)
+[![Test coverage: 99% app, 97% Rust](https://img.shields.io/badge/coverage-99%25%20app%20%C2%B7%2097%25%20rust-F2A93B?labelColor=24272C)](CONTRIBUTING.md#coverage)
 
 <!--
-Enable once coverage upload and the first release exist:
-[![Coverage](https://img.shields.io/codecov/c/github/carlosdlf/kaido-app?labelColor=24272C)](https://codecov.io/gh/carlosdlf/kaido-app)
+Enable once the first release exists:
 [![Release](https://img.shields.io/github/v/release/carlosdlf/kaido-app?include_prereleases&color=F2A93B&labelColor=24272C)](https://github.com/carlosdlf/kaido-app/releases)
 -->
 
@@ -26,7 +26,7 @@ Enable once coverage upload and the first release exist:
 Kaido is a small, fast desktop app for the notes and task lists you keep while you work: meeting notes, runbooks, ideas, and the to-dos for each project. Think of a notes app without the bloat, built for people who already live in a terminal and a git repo.
 
 - **Your files, not a database.** Every note is a plain Markdown file and every project is a folder. Open them in any editor, grep them, diff them.
-- **Your git repo is the sync.** Kaido will commit and sync in the background with the `git` you already use (in progress). No account, no server, no subscription, no lock-in.
+- **Your git repo is the sync.** Kaido commits and syncs in the background with the `git` you already use. No account, no server, no subscription, no lock-in.
 - **Organized by project.** Each project has its notes and one task list. An inbox catches everything that doesn't have a home yet.
 - **Keyboard first and instant.** Built with [Tauri](https://tauri.app) and Svelte. Opening the app, switching notes and searching should never make you wait.
 - **Safe by design.** Autosave never overwrites a newer version: if a file changed elsewhere, both versions are kept. Deleted notes go to the system trash and can be undone.
@@ -38,9 +38,9 @@ Kaido is a small, fast desktop app for the notes and task lists you keep while y
 
 | | |
 |---|---|
-| ✅ Available | Open any folder as a workspace · projects and notes from your folder structure · Markdown editor with autosave · new notes (`Ctrl+N`) and projects (`Ctrl+Shift+N`) · rename and delete with undo · table editing · task lists with keyboard shortcuts, subtasks, detail and done tasks kept in place · notes linked from tasks · **All tasks** view across projects · picks up changes made by other editors |
-| 🚧 Next | Background git sync |
-| 🗺️ Planned | Command palette (`Ctrl+K`) and instant search · global quick-capture shortcut · links between notes and per-note history · due dates and reminders · a CLI · web and mobile apps |
+| ✅ Available | Open any folder as a workspace · projects and notes from your folder structure · Markdown editor with autosave · new notes (`Ctrl+N`) and projects (`Ctrl+Shift+N`) · rename and delete with undo · table editing · task lists with keyboard shortcuts, subtasks, detail and done tasks kept in place · notes linked from tasks · **All tasks** view across projects · picks up changes made by other editors · background git sync with both versions kept on conflicts · search with `Ctrl+K` · global quick-capture shortcut |
+| 🚧 Next | First-run setup, settings and installable releases |
+| 🗺️ Planned | Tags · links between notes and per-note history · due dates and reminders · a CLI · web and mobile apps |
 
 ## How it works
 
