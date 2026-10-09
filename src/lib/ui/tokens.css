@@ -41,6 +41,8 @@
   --color-conflict-border: #5a4520;
   --color-paused-bg: #1f1315;
   --color-paused-border: #5a2a30;
+  /* Dims the app behind a dialog. */
+  --color-overlay: rgb(0 0 0 / 50%);
 
   /* Typography */
   --font-ui: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
@@ -96,6 +98,13 @@
   --icon-size: 14px;
   --selection-bar-width: 2px;
   --focus-ring-width: 2px;
+  /* Search palette: width, distance from the top, tallest it grows. */
+  --palette-width: 640px;
+  --palette-offset: 12vh;
+  --palette-max-height: 60vh;
+  /* Quick capture window: one row, and a project picker row. */
+  --capture-height: 52px;
+  --capture-row-height: 28px;
 
   /* Motion */
   --duration-fast: 80ms;

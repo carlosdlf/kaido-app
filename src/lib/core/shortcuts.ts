@@ -1,4 +1,4 @@
-/** Shortcuts that switch views. */
+/** Shortcuts that switch views or open the search palette. */
 
 import type { KeyPress } from "./newNote";
 
@@ -22,4 +22,15 @@ export function isSyncShortcut(event: KeyPress, mac: boolean): boolean {
 /** How the sync shortcut is announced (`aria-keyshortcuts`) and shown. */
 export function syncShortcutLabels(mac: boolean): { aria: string; hint: string } {
   return mac ? { aria: "Meta+Shift+S", hint: "⌘⇧S" } : { aria: "Control+Shift+S", hint: "^⇧S" };
+}
+
+/** `Ctrl+K`, or `Cmd+K` on macOS: open the search palette. */
+export function isSearchShortcut(event: KeyPress, mac: boolean): boolean {
+  if (event.key.toLowerCase() !== "k" || event.altKey || event.shiftKey) return false;
+  return mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+}
+
+/** How the search shortcut is announced (`aria-keyshortcuts`) and shown. */
+export function searchShortcutLabels(mac: boolean): { aria: string; hint: string } {
+  return mac ? { aria: "Meta+K", hint: "⌘K" } : { aria: "Control+K", hint: "^K" };
 }

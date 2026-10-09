@@ -38,3 +38,21 @@ describe("createStorage", () => {
     }
   });
 });
+
+describe("quick capture factories", () => {
+  it("connects the main window only inside the app", async () => {
+    const { createCaptureHost } = await import("./index");
+    const { TauriCaptureHost } = await import("./TauriCapture");
+    expect(createCaptureHost(true)).toBeInstanceOf(TauriCaptureHost);
+    expect(createCaptureHost()).toBeNull();
+  });
+
+  it("gives the capture page a channel everywhere", async () => {
+    const { createCaptureChannel } = await import("./index");
+    const { TauriCaptureChannel } = await import("./TauriCapture");
+    expect(createCaptureChannel(true)).toBeInstanceOf(TauriCaptureChannel);
+    const channel = createCaptureChannel();
+    expect(channel).not.toBeInstanceOf(TauriCaptureChannel);
+    await expect(channel.requestProjects()).resolves.toBeUndefined();
+  });
+});

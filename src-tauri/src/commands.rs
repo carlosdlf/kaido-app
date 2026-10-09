@@ -13,6 +13,7 @@ use tauri::ipc::{Invoke, InvokeBody, Request};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tauri_plugin_dialog::DialogExt;
 
+use crate::capture::ShortcutStatus;
 use crate::error::{AppError, AppResult};
 use crate::fs_ops::{self, FileContents, FileEntry, WriteCondition, WrittenFile};
 use crate::git::GitOptions;
@@ -39,6 +40,12 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         git_status,
         git_commit,
         git_sync,
+        capture_shortcut_status,
+        crate::capture::capture_submit,
+        crate::capture::capture_request_projects,
+        crate::capture::capture_hide,
+        crate::capture::capture_show,
+        crate::capture::capture_set_height,
     ]
 }
 
@@ -279,6 +286,13 @@ pub async fn git_sync(
     .await
 }
 
+/// Whether the quick capture shortcut was registered at startup. The main
+/// window asks once it is ready, so a failure is never missed.
+#[tauri::command]
+fn capture_shortcut_status(status: State<'_, ShortcutStatus>) -> ShortcutStatus {
+    status.inner().clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +318,7 @@ mod tests {
             .manage(crate::git::test_env::options())
             .manage(SyncControl::default())
             .manage(SettingsDir(settings_dir.path().join("config")))
+            .manage(ShortcutStatus::new(false))
             .invoke_handler(handler())
             .build(mock_context(noop_assets()))
             .unwrap();
@@ -363,6 +378,19 @@ mod tests {
     }
 
     #[test]
+    fn capture_shortcut_status_reports_registration() {
+        let (_app, webview, _settings) = app();
+        let status = invoke(&webview, "capture_shortcut_status", serde_json::json!({}));
+        assert_eq!(
+            status.unwrap(),
+            serde_json::json!({
+                "registered": false,
+                "shortcut": "CommandOrControl+Alt+Space",
+            })
+        );
+    }
+
+    #[test]
     fn every_command_is_declared_and_granted() {
         let build = include_str!("../build.rs");
         let capability: serde_json::Value =
@@ -374,6 +402,7 @@ mod tests {
             "git_status",
             "git_commit",
             "git_sync",
+            "capture_shortcut_status",
         ] {
             assert!(build.contains(&format!("\"{cmd}\"")), "{cmd}");
             let permission = format!("allow-{}", cmd.replace('_', "-"));

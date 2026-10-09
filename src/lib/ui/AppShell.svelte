@@ -12,11 +12,14 @@
   import { isNewNoteShortcut, newNoteShortcutLabels } from "$lib/core/newNote";
   import { isNewProjectShortcut, newProjectShortcutLabels } from "$lib/core/projectNames";
   import {
+    isSearchShortcut,
     isSyncShortcut,
     isViewModeShortcut,
+    searchShortcutLabels,
     syncShortcutLabels,
     viewModeShortcutLabels,
   } from "$lib/core/shortcuts";
+  import { PALETTE_COMMANDS, type PaletteCommandId } from "$lib/core/palette";
   import { describeSync } from "$lib/core/syncStatus";
   import { openTaskCount, type InsertPosition, type TaskRef } from "$lib/core/taskDocument";
   import { allTaskRows, taskRows, type RowOptions } from "$lib/core/taskRows";
@@ -30,6 +33,7 @@
   import TaskPane from "./TaskPane.svelte";
   import type { ViewMode } from "./ViewModeSwitch.svelte";
   import Toasts from "./Toasts.svelte";
+  import SearchPalette from "./SearchPalette.svelte";
   import { isMac } from "./platform";
 
   let { app }: { app: AppState } = $props();
@@ -55,6 +59,7 @@
   const newProjectShortcut = newProjectShortcutLabels(mac);
   const viewModeShortcut = viewModeShortcutLabels(mac);
   const syncShortcut = syncShortcutLabels(mac);
+  const searchShortcut = searchShortcutLabels(mac);
   const syncView = $derived(app.sync ? describeSync(app.sync, now) : null);
 
   /** The main pane shows the combined task view. */
@@ -94,6 +99,62 @@
       return { text: `Could not read this file: ${doc.message}`, alert: true };
     return { text: "", alert: false };
   });
+
+  /** The search palette is shown. */
+  let paletteOpen = $state(false);
+
+  // The palette belongs to the open workspace; it never comes back by itself.
+  $effect(() => {
+    if (app.phase.kind !== "ready") paletteOpen = false;
+  });
+
+  /** Commands the palette offers for what is shown now. */
+  const paletteCommands = $derived(
+    PALETTE_COMMANDS.filter((command) => {
+      switch (command.id) {
+        case "sync-now":
+          return app.sync !== null;
+        case "toggle-hide-done":
+          return showAll || showList;
+        case "switch-view":
+          return isTaskListPath(app.item);
+        default:
+          return true;
+      }
+    }),
+  );
+
+  function runCommand(id: PaletteCommandId) {
+    switch (id) {
+      case "new-note":
+        createNote();
+        return;
+      case "new-project":
+        newProjectRequest += 1;
+        return;
+      case "sync-now":
+        app.syncNow();
+        return;
+      case "toggle-hide-done":
+        app.toggleHideDone(showAll ? ALL_TASKS : app.item);
+        return;
+      case "switch-view":
+        void setViewMode(app.taskTextMode ? "list" : "text", "shortcut");
+        return;
+    }
+  }
+
+  /**
+   * Opens the palette with `Ctrl+K` / `Cmd+K` from anywhere, the note editor
+   * included, so it runs before the focused element sees the key. While the
+   * palette is open, the palette handles the key itself.
+   */
+  function handleKeydownCapture(event: KeyboardEvent) {
+    if (event.isComposing || !isSearchShortcut(event, mac) || paletteOpen) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (!event.repeat && app.phase.kind === "ready") paletteOpen = true;
+  }
 
   /** Bumped to open the new project field in the sidebar. */
   let newProjectRequest = $state(0);
@@ -241,6 +302,7 @@
   onblur={() => void app.flush()}
   onfocus={() => app.windowFocused()}
   onkeydown={handleKeydown}
+  onkeydowncapture={handleKeydownCapture}
 />
 
 <Toasts
@@ -267,6 +329,8 @@
       sync={syncView}
       onsync={() => app.syncNow()}
       {syncShortcut}
+      onsearch={() => (paletteOpen = true)}
+      {searchShortcut}
     />
     <ListPane
       title={listTitle(app.folder)}
@@ -322,6 +386,7 @@
       status={app.saveStatus}
       {now}
       focusRequest={app.editorFocusRequest}
+      reveal={app.editorReveal}
       onedit={(path, read) => app.edit(path, read)}
       pathChanges={app.editorChanges}
       onviewmode={isTaskListPath(app.item)
@@ -330,6 +395,16 @@
       viewShortcut={viewModeShortcut}
     />
   </div>
+  {#if paletteOpen}
+    <SearchPalette
+      search={(query) => app.search(query)}
+      revision={app.searchRevision}
+      commands={paletteCommands}
+      onopen={(result) => app.openSearchResult(result)}
+      onrun={runCommand}
+      onclose={() => (paletteOpen = false)}
+    />
+  {/if}
 {:else if app.phase.kind === "no-workspace"}
   <StartScreen
     title="Open a workspace"

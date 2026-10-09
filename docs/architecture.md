@@ -19,7 +19,7 @@ Most logic lives in `lib/core` as plain TypeScript with no platform dependencies
 
 ## Frontend structure
 
-The frontend is a single-page app built with Vite and Svelte 5 (no SvelteKit). `src/main.ts` loads the bundled fonts and global styles, then mounts `src/App.svelte`.
+The frontend is built with Vite and Svelte 5 (no SvelteKit) and has two pages: `index.html` for the main window, where `src/main.ts` loads the bundled fonts and global styles, then mounts `src/App.svelte`; and `capture.html` for the [quick capture](#quick-capture) window, where `src/capture.ts` mounts `src/lib/ui/Capture.svelte` with the same styles.
 
 | Path | Contents | May import |
 |---|---|---|
@@ -91,7 +91,7 @@ The rules live in `src/lib/core/workspace.ts` (`classifyPath`, `buildWorkspace`)
 - A **note**'s title is its first heading, or the file name.
 - A **task** is a Markdown checkbox (`- [ ]` / `- [x]`) in a task list. See [Tasks](#tasks) for how task lists are read and edited.
 
-The files are the source of truth. The search index and caches live in the app's data directory, never in the workspace.
+The files are the source of truth. The search index is kept in memory and never written to the workspace.
 
 ### Ignore patterns
 
@@ -133,7 +133,7 @@ All platform access goes through the `Storage` interface (`src/lib/storage/types
 
 ### Commands
 
-The Rust commands live in `src-tauri/src/commands.rs`. Each one runs its disk work on a blocking thread, so the UI never waits on I/O. Every command is listed in `src-tauri/build.rs` and granted explicitly in the window capability.
+The Rust commands live in `src-tauri/src/commands.rs`, except the quick capture relays, which live in `src-tauri/src/capture.rs`. Each one runs its disk work on a blocking thread, so the UI never waits on I/O. Every command is listed in `src-tauri/build.rs` and granted explicitly in the capability of the window that uses it: `capture_submit`, `capture_request_projects`, `capture_hide`, `capture_show` and `capture_set_height` to the quick capture window, all others to the main window.
 
 | Command | Arguments | Returns |
 |---|---|---|
@@ -149,6 +149,12 @@ The Rust commands live in `src-tauri/src/commands.rs`. Each one runs its disk wo
 | `git_status` | – | `GitStatus`, see [Git sync](#git-sync) |
 | `git_commit` | `message` | `{ commit, paths }` |
 | `git_sync` | – | `SyncResult` |
+| `capture_shortcut_status` | – | `{ registered, shortcut }`, see [Quick capture](#quick-capture) |
+| `capture_submit` | `payload`: `{ id, kind, text, project }` | –; emits `capture:submit` to the main window |
+| `capture_request_projects` | – | –; emits `capture:projects-request` to the main window |
+| `capture_hide` | – | –; hides the capture window |
+| `capture_show` | – | –; centers (best effort), shows and focuses the capture window, without emitting `capture:shown` |
+| `capture_set_height` | `height` (logical pixels) | –; resizes the capture window to 560 × `height`, clamped to 52–400 |
 
 `FileEntry` is `{ path, size, modified }`, with `modified` in milliseconds since the Unix epoch. `hash` is the lowercase hex SHA-256 of the file's bytes; the frontend only compares hashes and never computes them.
 
@@ -384,6 +390,61 @@ The view reads the **task index** (`src/lib/core/taskIndex.ts`): the parsed text
 
 `+ new project` in the sidebar (or `Ctrl+Shift+N`, `Cmd+Shift+N` on macOS) opens a name field. `Enter` creates the project, `Esc` or leaving the field cancels. The name is used as typed (trimmed) for the folder (`src/lib/core/projectNames.ts`): the [note name rules](#editing-and-autosave) apply without adding `.md`, plus names starting with `_` (including `_archive`), `inbox`, `node_modules`, existing project names (ignoring case), names hidden by the ignore patterns, and names over 100 UTF-8 bytes are refused with the reason shown. The project is created by writing an empty `<name>/tasks.md` with `expectedHash: null`, so an existing list is never replaced. The new project is selected with its task list open and the "Add a task…" field focused.
 
+## Search
+
+`Ctrl+K` (`Cmd+K` on macOS) opens the search palette from anywhere, the note editor included; so does the search row at the top of the sidebar. Results update on every keystroke.
+
+The index (`src/lib/core/searchIndex.ts`, wrapping [MiniSearch](https://github.com/lucaong/minisearch)) holds three kinds of documents:
+
+| Kind | Indexed fields |
+|---|---|
+| Note | Title (weight 3), path without `.md` (1.5), full text (1). Notes over 256 KiB (UTF-8): title and path only. |
+| Task | The text of every task line of every task list, top-level and nested (1) |
+| Project | The project name (3) |
+
+- Words are runs of Unicode letters, digits and combining marks; spaces, `/`, `-`, `_` and `.` separate them. Case and diacritics are folded in the index and in queries, so `cafe` finds `Café`.
+- Every query word must match. The last characters of a word may be missing (prefix search), and words of four or more characters may contain a small typo. While every query word is shorter than three characters, only titles, paths and project names are searched, so the first keystrokes stay fast in a large workspace.
+- Results are grouped by kind, ordered by the best result of each kind. A note that matched in its text shows the text around the first match; opening it puts the cursor on that line when the title did not match.
+- An empty query lists the notes and task lists opened during this session (most recent first), then the projects.
+- Archived projects are not searched.
+
+The index is built in memory as the app reads files, never in a separate pass: the background summary reads index each note's text, opening a note re-indexes it, renames and deletions move or drop it, and task lists are re-indexed whenever the task index changes. A note saved while typing is queued and indexed when the app is idle (a search indexes anything still queued first), so autosave never pays for it. Tasks are keyed by their text and how many identical lines come before them, not by line number, so adding, editing or moving a task re-indexes only that task. Search covers whatever has been read so far; on a cold start it fills up in the background. Open results are refreshed when the indexed content changes.
+
+In the palette, `↑`/`↓` (or `Ctrl+N`/`Ctrl+P`) move, `Enter` opens and `Esc` closes and gives focus back to where it was. A note opens in the editor, a task opens its list with the task focused (done tasks are shown if they were hidden), a project opens its task list. Input starting with `>` lists commands (new note, new project, sync now, hide or show done tasks, switch list / text), filtered by plain substring; input starting with `#` is reserved for tags. The palette is a modal dialog with a combobox that controls the result listbox (`aria-activedescendant`); focus stays in its input.
+
+## Quick capture
+
+A global shortcut, `Ctrl+Alt+Space` (`Cmd+Alt+Space` on macOS), opens a small always-on-top window to add a task or a note without switching to Kaido. It works while the app runs, even when its window is not focused.
+
+| Key | Does |
+|---|---|
+| `Enter` | Adds the text as an open task at the end of the project's `tasks.md`, creating the file if there is none |
+| `Shift+Enter` | Creates a note named after the text (as for a note created from a task, numbered when the name is taken), containing `# <text>` |
+| `Tab` | Chooses the project: type to filter, `↑`/`↓`, `Enter` to choose, `Esc` to go back. The choice is kept until the app quits |
+| `Esc`, or leaving the window | Hides the window; typed text is kept for the next time |
+
+The project is `inbox` until another one is chosen. Without an open workspace the window says so and adds nothing.
+
+**Two windows.** The capture window (label `capture`, page `capture.html`, component `src/lib/ui/Capture.svelte`) is declared in `src-tauri/tauri.conf.json` and created hidden at startup, so showing it is instant. Closing it only hides it; when the main window closes, the app quits. The shortcut handler (`src-tauri/src/capture.rs`) shows, centers and focuses the window, or hides it when it is already in front, and emits `capture:shown` to it each time the shortcut shows it.
+
+**Single writer.** The capture window never touches the disk. It sends what was typed to the main window, which writes it through the same paths as edits made there (task list sessions and the task index, create-only writes for new files, the search index, the sync scheduler) without changing what the main window shows, and answers with the outcome. The capture window hides as soon as the text is sent. Each capture has an id and waits for its own answer; several can be in flight. If a capture fails, or no answer comes within 5 seconds, the window shows itself again with the reason (through `capture_show`, which does not emit `capture:shown`, so nothing is reset). The text is never lost: it goes back into the input when that is empty, otherwise it is held in a row below with a **restore** button (`↑` in an empty input does the same; restoring while the input has text holds that text instead). A capture that timed out may still be added: when its success answer arrives late, its text is dropped from the input (unless it was edited) or from the held row, and the window says it was added. Failures are shown only in the capture window; the main window shows a toast for each successful capture.
+
+The main window remembers the ids of the last 100 captures it handled and answers a capture delivered again with the first answer, without writing it twice. A capture that was written while another workspace was being opened is answered as added, naming the workspace it went to.
+
+| Event | From → to | Payload |
+|---|---|---|
+| `capture:shown` | Rust → capture | – |
+| `capture:projects-request` | capture → main, via `capture_request_projects` | `{}` |
+| `capture:projects` | main → capture | `{ projects, workspaceOpen }`, the inbox first |
+| `capture:submit` | capture → main, via `capture_submit` | `{ id, kind: "task" \| "note", text, project }` |
+| `capture:result` | main → capture | `{ id, ok, message }` |
+
+The capture window cannot emit events itself: it calls `capture_submit` and `capture_request_projects`, which emit to the main window only. Each of these commands, as well as `capture_hide`, `capture_show` and `capture_set_height`, refuses calls from any window other than `capture`. `capture_submit` checks the payload before relaying it: `id` is 1 to 64 ASCII letters, digits or dashes; `text` is not blank and at most 16 KiB; `project` is 1 to 255 bytes without `/`, `\` or NUL. A rejected payload returns an `InvalidPath` error (`TooLarge` for long text) and is not relayed. The main window answers with `emitTo("capture", …)`.
+
+Payloads are validated with valibot on arrival; malformed ones are dropped. Both sides are reached through `src/lib/storage` (`CaptureChannel` for the capture window, `CaptureHost` for the main window, with Tauri and in-memory implementations).
+
+**Shortcut registration.** If the shortcut cannot be registered (usually another app uses it), the failure is logged and the app works on without it. The main window asks `capture_shortcut_status` once at startup and shows a toast if the shortcut is unavailable. On Linux, global shortcuts depend on the desktop: under a pure Wayland session they may not fire at all.
+
 ## Git sync
 
 The workspace is stored in a git repository the user owns. The Rust side (`src-tauri/src/git.rs`, `sync.rs`) runs the `git` installed on the system; the frontend decides when to commit and sync.
@@ -553,7 +614,7 @@ The webview runs with a strict Content Security Policy, defined in `src-tauri/ta
 
 **Inline styles.** Svelte and Vite in development, and the editor at runtime, inject `<style>` elements. By default Tauri adds hashes and nonces to the CSP, which would make browsers ignore `'unsafe-inline'`. Setting `dangerousDisableAssetCspModification: ["style-src"]` turns that off for `style-src` only, so inline styles work. This exception applies to styles only and must never be extended to `script-src`.
 
-**Capabilities.** The main window has a single capability (`src-tauri/capabilities/default.json`) granting `core:default` and one `allow-<command>` permission per app command (generated from the list in `src-tauri/build.rs`). The folder picker runs on the Rust side, so the webview gets no dialog or filesystem plugin permissions. New permissions are added only when a feature needs them, scoped as narrowly as possible. See [File access rules](#file-access-rules) for what the file commands accept.
+**Capabilities.** The main window has a single capability (`src-tauri/capabilities/default.json`) granting `core:default` and one `allow-<command>` permission per app command it uses (permissions are generated from the list in `src-tauri/build.rs`). The quick capture window has its own capability (`src-tauri/capabilities/capture.json`) with only what it needs: listening to events (`core:event:allow-listen`, `core:event:allow-unlisten`) and calling `capture_submit`, `capture_request_projects`, `capture_hide`, `capture_show` and `capture_set_height`, which act on hard-coded targets. It has no window or emit permissions, so it cannot act on the main window or send it arbitrary events, and the main window is not granted those five commands. The folder picker runs on the Rust side, so the webview gets no dialog or filesystem plugin permissions. New permissions are added only when a feature needs them, scoped as narrowly as possible. See [File access rules](#file-access-rules) for what the file commands accept.
 
 ## Performance budget
 
@@ -567,4 +628,4 @@ Kaido should feel instant. These targets guide implementation choices:
 | Search across 10k notes | < 50 ms |
 | Saving, toggling a task | immediate, never a spinner |
 
-In practice: optimistic UI, a persisted index loaded at startup, virtualized lists, and all git and filesystem work off the UI thread.
+In practice: optimistic UI, an in-memory search index fed by the reads the app does anyway, virtualized lists, and all git and filesystem work off the UI thread.

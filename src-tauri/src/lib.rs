@@ -1,3 +1,4 @@
+mod capture;
 mod commands;
 mod error;
 mod fs_ops;
@@ -15,13 +16,22 @@ mod watcher;
 pub fn run() {
     use tauri::Manager;
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
+    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
+
+    builder
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             app.manage(settings::SettingsDir(config_dir));
+            #[cfg(desktop)]
+            let registered = capture::register_shortcut(app.handle());
+            #[cfg(not(desktop))]
+            let registered = false;
+            app.manage(capture::ShortcutStatus::new(registered));
             Ok(())
         })
+        .on_window_event(capture::on_window_event)
         .manage(state::AppState::default())
         .manage(git::GitOptions::default())
         .manage(sync::SyncControl::default())

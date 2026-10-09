@@ -59,6 +59,18 @@ describe("NoteEditor", () => {
     document.body.replaceChildren();
   });
 
+  it("moves the cursor to a line without reporting an edit", () => {
+    const { editor, onEdit } = create();
+    editor.show("a.md", "one\r\ntwo\r\nthree");
+    editor.revealLine(2);
+    expect(editor.view.state.selection.main.head).toBe(8);
+    editor.revealLine(99);
+    expect(editor.view.state.selection.main.head).toBe(8);
+    editor.revealLine(-3);
+    expect(editor.view.state.selection.main.head).toBe(0);
+    expect(onEdit).not.toHaveBeenCalled();
+  });
+
   it("shows a note and reports edits with a snapshot reader", () => {
     const { editor, onEdit } = create();
     expect(editor.path).toBeNull();

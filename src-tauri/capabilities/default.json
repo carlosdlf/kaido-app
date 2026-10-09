@@ -17,6 +17,7 @@
     "allow-write-settings",
     "allow-git-status",
     "allow-git-commit",
-    "allow-git-sync"
+    "allow-git-sync",
+    "allow-capture-shortcut-status"
   ]
 }

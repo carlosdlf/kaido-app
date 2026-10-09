@@ -21,6 +21,22 @@
         "center": true,
         "visible": true,
         "backgroundColor": "#0D0E10"
+      },
+      {
+        "label": "capture",
+        "title": "Quick capture",
+        "url": "capture.html",
+        "width": 560,
+        "height": 52,
+        "center": true,
+        "visible": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "backgroundColor": "#0D0E10"
       }
     ],
     "security": {

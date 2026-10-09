@@ -698,3 +698,148 @@ describe("AppShell note actions", () => {
     );
   });
 });
+
+describe("AppShell search palette", () => {
+  const palette = () => screen.queryByRole("dialog", { name: "Search and commands" });
+  const combobox = () => screen.getByRole("combobox");
+
+  it("opens with Ctrl+K from the editor and gives focus back on Escape", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready();
+    await user.click(list().getByRole("button", { name: /reading-list\.md/ }));
+    await app.settled();
+    textbox().focus();
+    const event = createEvent.keyDown(textbox(), { key: "k", ctrlKey: true });
+    fireEvent(textbox(), event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(palette()).toBeInTheDocument();
+    expect(combobox()).toHaveFocus();
+    // The editor never saw the key.
+    expect(editorText().state.doc.toString()).toBe("# Reading list\n\nArticles to read.");
+
+    await user.keyboard("{Escape}");
+    expect(palette()).not.toBeInTheDocument();
+    expect(textbox()).toHaveFocus();
+  });
+
+  it("does not come back by itself after the workspace was closed", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready();
+    await user.keyboard("{Control>}k{/Control}");
+    expect(palette()).toBeInTheDocument();
+    await app.openWorkspace("/missing");
+    expect(app.phase.kind).toBe("error");
+    await app.openWorkspace(ROOT);
+    await app.settled();
+    await screen.findByRole("navigation", { name: "Workspace" });
+    expect(palette()).not.toBeInTheDocument();
+  });
+
+  it("refreshes its results when the workspace content changes", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready();
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(combobox(), "zebra");
+    expect(screen.queryAllByRole("option")).toEqual([]);
+    app.addTask("inbox/tasks.md", "feed the zebra", "end");
+    await waitFor(() =>
+      expect(screen.getAllByRole("option")[0]).toHaveTextContent("feed the zebra"),
+    );
+    expect(combobox()).toHaveFocus();
+  });
+
+  it("ignores held keys and other modifiers", async () => {
+    await ready();
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true, repeat: true });
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true, shiftKey: true });
+    expect(palette()).not.toBeInTheDocument();
+  });
+
+  it("opens from the sidebar search button", async () => {
+    const user = userEvent.setup();
+    await ready();
+    const button = screen.getByRole("button", { name: /search or command/ });
+    expect(button).toHaveAttribute("aria-keyshortcuts", "Control+K");
+    await user.click(button);
+    expect(combobox()).toHaveFocus();
+  });
+
+  it("opens a note found by its text at the matching line", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready();
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(combobox(), "rotate keys");
+    expect(screen.getAllByRole("option")[0]).toHaveTextContent("Deploy");
+    await user.keyboard("{Enter}");
+    await app.settled();
+    expect(palette()).not.toBeInTheDocument();
+    expect(app.item).toBe("api-payments/deploy.md");
+    await waitFor(() => expect(textbox()).toHaveFocus());
+    const view = editorText();
+    await waitFor(() =>
+      expect(view.state.doc.lineAt(view.state.selection.main.head).number).toBe(17),
+    );
+  });
+
+  it("opens a task in its list", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready();
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(combobox(), "timeouts");
+    await user.keyboard("{Enter}");
+    await app.settled();
+    await waitFor(() =>
+      expect(tasksPane().getByRole("checkbox", { name: "check timeouts" })).toHaveFocus(),
+    );
+  });
+
+  it("runs commands typed after >", async () => {
+    const user = userEvent.setup();
+    const { app, storage } = await ready();
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(combobox(), ">");
+    const labels = screen.getAllByRole("option").map((option) => option.textContent?.trim());
+    expect(labels).toEqual([
+      "New note",
+      "New project",
+      "Sync now",
+      "Hide or show done tasks",
+      "Switch list / text",
+    ]);
+    await user.type(combobox(), "hide");
+    await user.keyboard("{Enter}");
+    expect(app.hideDone.has("inbox/tasks.md")).toBe(true);
+
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(combobox(), ">switch");
+    await user.keyboard("{Enter}");
+    expect(app.taskTextMode).toBe(true);
+
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(combobox(), ">new note");
+    await user.keyboard("{Enter}");
+    await app.settled();
+    expect(await fileText(storage, "inbox/untitled.md")).toBe("");
+
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(combobox(), ">new project");
+    await user.keyboard("{Enter}");
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "New project name" })).toHaveFocus(),
+    );
+  });
+
+  it("syncs, and hides list commands outside task lists", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready();
+    await user.click(list().getByRole("button", { name: /reading-list\.md/ }));
+    const syncNow = vi.spyOn(app, "syncNow");
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(combobox(), ">");
+    const labels = screen.getAllByRole("option").map((option) => option.textContent?.trim());
+    expect(labels).toEqual(["New note", "New project", "Sync now"]);
+    await user.type(combobox(), "sync");
+    await user.keyboard("{Enter}");
+    expect(syncNow).toHaveBeenCalled();
+  });
+});

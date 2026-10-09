@@ -42,6 +42,10 @@
     onsync?: () => void;
     /** The sync shortcut, for assistive technology and the tooltip. */
     syncShortcut?: { aria: string; hint: string };
+    /** Opens the search palette. */
+    onsearch?: () => void;
+    /** The search shortcut, for assistive technology and as a visible hint. */
+    searchShortcut?: { aria: string; hint: string };
   }
 
   let {
@@ -59,6 +63,8 @@
     sync = null,
     onsync,
     syncShortcut,
+    onsearch,
+    searchShortcut = { aria: "Control+K", hint: "^K" },
   }: Props = $props();
 
   const SYNC_ICONS = {
@@ -188,10 +194,16 @@
 <aside class="sidebar" aria-label="Sidebar">
   <div class="brand"><span class="prompt" aria-hidden="true">❯</span>kaido</div>
 
-  <button type="button" class="search" aria-keyshortcuts="Control+K">
+  <button
+    type="button"
+    class="search"
+    aria-keyshortcuts={searchShortcut.aria}
+    aria-haspopup="dialog"
+    onclick={() => onsearch?.()}
+  >
     <span class="slash" aria-hidden="true">/</span>
     <span class="search-label">search or command</span>
-    <kbd aria-hidden="true">^K</kbd>
+    <kbd aria-hidden="true">{searchShortcut.hint}</kbd>
   </button>
 
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->

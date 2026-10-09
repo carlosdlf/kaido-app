@@ -23,6 +23,17 @@
  * edits: the open list's session, or one created on demand from the index
  * for the All tasks view, dropped again once everything is on disk.
  *
+ * The search index is fed from the same reads and edits: every note text
+ * that becomes known (background reads, opened notes, saves) is indexed,
+ * renames and deletes move or drop it, and task lists are indexed again
+ * whenever the task index is published. Archived projects are left out.
+ * Notes saved while typing are indexed when the app is idle, never on the
+ * input path.
+ *
+ * Quick capture asks the main window to add a task or create a note; it is
+ * written through the same sessions and model updates as edits made here,
+ * without changing what is shown.
+ *
  * Once a workspace is loaded, a `SyncScheduler` commits changes (the app's
  * own writes and changes reported by the watcher) and syncs with the
  * upstream in the background. It stops when another workspace opens or the
@@ -44,6 +55,7 @@ import { newNoteFolder, newNotePath } from "$lib/core/newNote";
 import { nextAfterRemoval, renamedPath, validateNoteName } from "$lib/core/noteNames";
 import { projectTasksPath, validateProjectName } from "$lib/core/projectNames";
 import { linkedNote, noteLink, noteNameFromTask, textWithoutLinks } from "$lib/core/taskLinks";
+import { serializeTask } from "$lib/core/tasks";
 import * as taskOps from "$lib/core/taskDocument";
 import type {
   InsertPosition,
@@ -61,6 +73,8 @@ import {
 } from "$lib/core/syncScheduler";
 import { conflictsKeptMessage } from "$lib/core/syncStatus";
 import { NO_TASK_DOCS, TaskIndex, type TaskDocs } from "$lib/core/taskIndex";
+import { SearchIndex, type SearchResult } from "$lib/core/searchIndex";
+import { LruCache } from "$lib/core/lru";
 import {
   ALL_TASKS,
   fallbackSummary,
@@ -74,6 +88,7 @@ import {
 } from "$lib/core/views";
 import {
   applyChange,
+  ARCHIVE_DIR,
   buildWorkspace,
   classifyPath,
   createPathFilter,
@@ -95,6 +110,9 @@ import {
   StorageError,
   toStorageError,
   trackWrites,
+  type CaptureHost,
+  type CaptureKind,
+  type CaptureProjects,
   type FileContents,
   type Storage,
   type Unsubscribe,
@@ -143,6 +161,13 @@ export type RenameOutcome =
   /** Renaming failed for another reason, already reported in a toast. */
   | { kind: "failed" };
 
+/** Asks the editor to show a line of a note, e.g. the first search match. */
+export interface EditorRevealRequest {
+  id: number;
+  path: string;
+  line: number;
+}
+
 /** Tells the editor that cached state moved to another path or must be dropped. */
 export type EditorPathChange =
   { kind: "rename"; from: string; to: string } | { kind: "forget"; path: string };
@@ -165,6 +190,8 @@ export interface AppStateOptions {
   defer?: (task: () => void) => void;
   /** Schedules publishing loaded summaries; called at most once per pending update. */
   schedule?: (task: () => void) => void;
+  /** Runs work that can wait until the app is idle, such as indexing saved notes for search. */
+  idle?: (task: () => void) => void;
   /** Files read in parallel while loading titles and counts. */
   concurrency?: number;
   /** Clock and timers for autosave. */
@@ -197,6 +224,12 @@ const WORKSPACE_CLOSED = "The workspace was closed.";
 
 function defaultDefer(task: () => void): void {
   setTimeout(task, 0);
+}
+
+function defaultIdle(task: () => void): void {
+  if (typeof requestIdleCallback === "function")
+    requestIdleCallback(() => task(), { timeout: 2_000 });
+  else setTimeout(task, 200);
 }
 
 function defaultSchedule(task: () => void): void {
@@ -318,6 +351,51 @@ export function createProjectFailedMessage(message: string): string {
   return `The project could not be created: ${message}`;
 }
 
+export const SHORTCUT_TAKEN = "Quick capture shortcut is in use by another app";
+export const OPEN_WORKSPACE_FIRST = "Open a workspace in Kaido first";
+export const NOTHING_TO_CAPTURE = "Type something to capture.";
+
+export function capturedTaskMessage(project: string): string {
+  return `Added to ${project}`;
+}
+
+export function capturedNoteMessage(path: string): string {
+  return `Note created: ${path}`;
+}
+
+/** A capture written to a workspace that was closed while it was being written. */
+export function capturedElsewhereMessage(message: string, root: string): string {
+  return `${message} (in ${root}, which is no longer open)`;
+}
+
+/** Captures remembered by id, so one delivered twice is answered without writing again. */
+export const HANDLED_CAPTURES = 100;
+
+export function missingProjectMessage(project: string): string {
+  return `The project ${project} no longer exists.`;
+}
+
+export function captureTaskFailedMessage(project: string, message: string): string {
+  return `The task could not be added to ${project}: ${message}`;
+}
+
+export const TASK_LIST_TOO_LARGE = "its task list is larger than 1 MiB.";
+export const TASK_LIST_HIDDEN = "its task list is hidden by the workspace ignore patterns.";
+export const TASK_LIST_UNAVAILABLE = "its task list could not be read.";
+export const TASK_LIST_APPEARED = "its task list was just created on disk. Try again.";
+
+/** What a capture did, as told to the capture window. */
+export interface CaptureOutcome {
+  ok: boolean;
+  message: string;
+}
+
+type NewNote =
+  | { kind: "written"; written: WrittenFile }
+  | { kind: "failed"; message: string }
+  /** The workspace changed meanwhile; nothing more to do. `written` if the note was created anyway. */
+  | { kind: "stale"; written?: WrittenFile };
+
 const GIT_ERROR_KINDS: Partial<Record<string, GitErrorKind>> = {
   GitUnavailable: "unavailable",
   GitPaused: "paused",
@@ -376,10 +454,15 @@ export class AppState {
   taskFocus: TaskFocusRequest | null = $state.raw(null);
   /** Git state of the open workspace, or `null` before syncing starts. */
   sync: SyncSnapshot | null = $state.raw(null);
+  /** The latest request for the editor to show a line, or `null`. */
+  editorReveal: EditorRevealRequest | null = $state.raw(null);
+  /** Bumped when search results may have changed, so an open search can run again. */
+  searchRevision: number = $state(0);
 
   readonly #storage: Storage;
   readonly #defer: (task: () => void) => void;
   readonly #schedule: (task: () => void) => void;
+  readonly #idle: (task: () => void) => void;
   readonly #concurrency: number;
   readonly #timers: Timers;
   readonly #saveDelay: number | undefined;
@@ -424,6 +507,10 @@ export class AppState {
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- private bookkeeping, never rendered
   readonly #creatingFromTask = new Set<string>();
   readonly #tasks = new TaskIndex();
+  readonly #search = new SearchIndex();
+  /** The workspace whose projects the search index has. */
+  #searchWorkspace: Workspace | null = null;
+  #revealId = 0;
   /** Edits made through task list sessions created on demand, to apply again after a conflict. */
   readonly #taskEdits = new WeakMap<SaveSession, ((doc: TaskDocument) => TaskEdit | null)[]>();
   #tasksChanged = false;
@@ -468,6 +555,7 @@ export class AppState {
     this.#syncOptions = options.sync;
     this.#defer = options.defer ?? defaultDefer;
     this.#schedule = options.schedule ?? defaultSchedule;
+    this.#idle = options.idle ?? defaultIdle;
     this.#concurrency = options.concurrency ?? 8;
     this.#timers = options.timers ?? systemTimers;
     this.#saveDelay = options.saveDelay;
@@ -556,6 +644,8 @@ export class AppState {
       this.#files = files;
       this.workspace = buildWorkspace(files, this.#config);
       this.#store.clear();
+      this.#search.clear();
+      this.#searchWorkspace = null;
       this.summaries = this.#store.view();
       this.#tasks.clear();
       this.#tasksChanged = false;
@@ -598,6 +688,7 @@ export class AppState {
     this.taskTextMode = false;
     // A pending focus request belongs to what was shown before.
     this.taskFocus = null;
+    if (path !== "" && path !== ALL_TASKS) this.#search.touch(path);
     if (path === ALL_TASKS) {
       // The All tasks view reads the task index; there is no document.
       this.#documentRequest += 1;
@@ -912,6 +1003,46 @@ export class AppState {
   }
 
   /**
+   * Searches notes, tasks and projects. An empty query lists the recently
+   * opened notes and lists, then the projects.
+   */
+  search(query: string): SearchResult[] {
+    if (this.phase.kind !== "ready") return [];
+    if (this.#searchWorkspace !== this.workspace) {
+      this.#searchWorkspace = this.workspace;
+      this.#search.setProjects(this.workspace.projects.map((project) => project.name));
+    }
+    return this.#search.search(query);
+  }
+
+  /**
+   * Opens a search result: a note in the editor (at the first match when
+   * only its text matched), a task focused in its list, or a project's
+   * task list.
+   */
+  openSearchResult(result: SearchResult): void {
+    if (this.phase.kind !== "ready") return;
+    switch (result.kind) {
+      case "note":
+        this.openNote(result.path);
+        if (result.line !== undefined && this.item === result.path) {
+          this.#revealId += 1;
+          this.editorReveal = { id: this.#revealId, path: result.path, line: result.line };
+        }
+        return;
+      case "task":
+        this.#openTask(result.path, result.line ?? 0, result.raw ?? "");
+        return;
+      case "list":
+        this.#openList(result.path);
+        return;
+      case "project":
+        this.#openProject(result.path);
+        return;
+    }
+  }
+
+  /**
    * Opens the note a task links to. A link to a note that does not exist
    * shows a toast offering to create it. Nothing happens without a link.
    */
@@ -963,6 +1094,31 @@ export class AppState {
     const folder = path.slice(0, path.lastIndexOf("/"));
     const stem = noteNameFromTask(task.text);
     const contents = `# ${textWithoutLinks(task.text) || stem}\n`;
+    const created = await this.#writeNewNote(folder, stem, contents);
+    if (created.kind === "stale") return;
+    if (created.kind === "failed") {
+      this.#toast(created.message);
+      return;
+    }
+    const written = created.written;
+    const suffix = noteLink(baseName(written.path));
+    // Found by its text again: the list may have changed while the note was written.
+    const linked = this.#editTasks(path, null, (current) => {
+      const at = taskOps.locateTask(current, ref);
+      const now = at === null ? null : taskOps.taskAt(current, at);
+      return now ? taskOps.editTaskText(current, ref, `${now.text} ${suffix}`) : null;
+    });
+    if (!linked) this.#toast(notLinkedMessage(baseName(written.path)));
+    this.#openCreated(written, contents, folder.split("/")[0] ?? INBOX);
+    this.editorFocusRequest += 1;
+  }
+
+  /**
+   * Creates `<folder>/<stem>.md` (or `<stem> 2.md`, … when taken) with
+   * `contents`, never replacing a file. A name taken on disk meanwhile
+   * moves on to the next one.
+   */
+  async #writeNewNote(folder: string, stem: string, contents: string): Promise<NewNote> {
     const generation = this.#generation;
     const isIgnored = createPathFilter(this.#config);
     const tried: string[] = [];
@@ -981,33 +1137,173 @@ export class AppState {
         stem,
       );
       if (candidate === null) break;
-      let written: WrittenFile;
       try {
-        written = await this.#storage.writeFile(candidate, contents, { expectedHash: null });
+        const written = await this.#storage.writeFile(candidate, contents, { expectedHash: null });
+        return generation === this.#generation
+          ? { kind: "written", written }
+          : { kind: "stale", written };
       } catch (error) {
-        if (generation !== this.#generation) return;
+        if (generation !== this.#generation) return { kind: "stale" };
         const storageError = toStorageError(error);
         if (storageError.kind === "Conflict") {
           tried.push(candidate.toLowerCase());
           continue;
         }
-        this.#toast(createNoteFailedMessage(storageError.message));
-        return;
+        return { kind: "failed", message: createNoteFailedMessage(storageError.message) };
       }
-      if (generation !== this.#generation) return;
-      const suffix = noteLink(baseName(written.path));
-      // Found by its text again: the list may have changed while the note was written.
-      const linked = this.#editTasks(path, null, (current) => {
-        const at = taskOps.locateTask(current, ref);
-        const now = at === null ? null : taskOps.taskAt(current, at);
-        return now ? taskOps.editTaskText(current, ref, `${now.text} ${suffix}`) : null;
-      });
-      if (!linked) this.#toast(notLinkedMessage(baseName(written.path)));
-      this.#openCreated(written, contents, folder.split("/")[0] ?? INBOX);
-      this.editorFocusRequest += 1;
-      return;
     }
-    if (generation === this.#generation) this.#toast(NO_FREE_NOTE_NAME);
+    if (generation !== this.#generation) return { kind: "stale" };
+    return { kind: "failed", message: NO_FREE_NOTE_NAME };
+  }
+
+  /**
+   * Connects quick capture: captures sent by the capture window are written
+   * and answered, and its requests for the project list are answered. Says
+   * once if the capture shortcut could not be registered.
+   */
+  connectCapture(host: CaptureHost): Unsubscribe {
+    let stopped = false;
+    const stops: Unsubscribe[] = [];
+    const keep = (subscription: Promise<Unsubscribe>) => {
+      subscription
+        .then((stop) => {
+          if (stopped) stop();
+          else stops.push(stop);
+        })
+        // Without the subscription quick capture does nothing; the app works on.
+        .catch(() => undefined);
+    };
+    // A capture delivered again gets the first answer instead of being written twice.
+    const handled = new LruCache<string, Promise<CaptureOutcome>>(HANDLED_CAPTURES);
+    keep(
+      host.onSubmit((submit) => {
+        let outcome = handled.get(submit.id);
+        if (!outcome) {
+          outcome = this.capture(submit.kind, submit.text, submit.project);
+          handled.set(submit.id, outcome);
+        }
+        void outcome.then((answer) =>
+          host.sendResult({ id: submit.id, ...answer }).catch(() => undefined),
+        );
+      }),
+    );
+    keep(
+      host.onProjectsRequest(() => {
+        host.sendProjects(this.captureProjects()).catch(() => undefined);
+      }),
+    );
+    host
+      .shortcutStatus()
+      .then((status) => {
+        if (!status.registered && !stopped) this.#toast(SHORTCUT_TAKEN);
+      })
+      .catch(() => undefined);
+    return () => {
+      stopped = true;
+      for (const stop of stops) stop();
+    };
+  }
+
+  /** The projects quick capture can add to, the inbox first. */
+  captureProjects(): CaptureProjects {
+    if (this.phase.kind !== "ready") return { projects: [], workspaceOpen: false };
+    return {
+      projects: this.workspace.projects.map((project) => project.name),
+      workspaceOpen: true,
+    };
+  }
+
+  /**
+   * Adds `text` as an open task at the end of a project's task list
+   * (creating the list if there is none), or creates a note named after it.
+   * The selection does not change; a toast tells what was done. When the
+   * workspace is closed while the capture is written, the answer says where
+   * it went.
+   */
+  async capture(kind: CaptureKind, text: string, project: string): Promise<CaptureOutcome> {
+    if (this.phase.kind !== "ready") return { ok: false, message: OPEN_WORKSPACE_FIRST };
+    if (taskOps.cleanTaskText(text) === "") return { ok: false, message: NOTHING_TO_CAPTURE };
+    const generation = this.#generation;
+    const root = this.phase.root;
+    return this.#serial(async (): Promise<CaptureOutcome> => {
+      if (generation !== this.#generation) return { ok: false, message: WORKSPACE_CLOSED };
+      if (!findProject(this.workspace, project)) {
+        return { ok: false, message: missingProjectMessage(project) };
+      }
+      const outcome =
+        kind === "task"
+          ? await this.#captureTask(project, text)
+          : await this.#captureNote(project, text);
+      if (generation === this.#generation) return outcome;
+      if (!outcome.ok) return { ok: false, message: WORKSPACE_CLOSED };
+      return { ok: true, message: capturedElsewhereMessage(outcome.message, root) };
+    });
+  }
+
+  async #captureTask(project: string, text: string): Promise<CaptureOutcome> {
+    const path = projectTasksPath(project);
+    const fail = (reason: string) => ({
+      ok: false,
+      message: captureTaskFailedMessage(project, reason),
+    });
+    if (classifyPath(path, createPathFilter(this.#config))?.kind !== "tasks") {
+      return fail(TASK_LIST_HIDDEN);
+    }
+    const generation = this.#generation;
+    const entry = this.#index.get(path);
+    if (!entry) {
+      const contents = `${serializeTask({ done: false, text: taskOps.cleanTaskText(text) })}\n`;
+      let written: WrittenFile;
+      try {
+        written = await this.#storage.writeFile(path, contents, { expectedHash: null });
+      } catch (error) {
+        const storageError = toStorageError(error);
+        // The watcher reports the new list soon; adding to it now could lose the task.
+        return fail(storageError.kind === "Conflict" ? TASK_LIST_APPEARED : storageError.message);
+      }
+      // Written, but to a workspace that is no longer open.
+      if (generation !== this.#generation)
+        return { ok: true, message: capturedTaskMessage(project) };
+      this.#addCreated(written, contents);
+      this.#tasks.set(path, contents, written.hash);
+      this.#publishTasks();
+    } else {
+      if (!this.#sessions.has(path) && !this.#tasks.get(path)) {
+        // Not read in the background yet.
+        if (entry.size > MAX_SUMMARY_BYTES) return fail(TASK_LIST_TOO_LARGE);
+        let file: FileContents;
+        try {
+          file = await this.#storage.readFile(path);
+        } catch (error) {
+          return fail(toStorageError(error).message);
+        }
+        if (generation !== this.#generation) return { ok: false, message: WORKSPACE_CLOSED };
+        if (!this.#sessions.has(path) && !this.#tasks.get(path)) {
+          this.#tasks.set(path, file.contents, file.hash);
+        }
+      }
+      const edit = this.#editTasks(path, null, (doc) => taskOps.insertTask(doc, text, "end"));
+      if (!edit) return fail(TASK_LIST_UNAVAILABLE);
+    }
+    const message = capturedTaskMessage(project);
+    this.#toast(message);
+    return { ok: true, message };
+  }
+
+  async #captureNote(project: string, text: string): Promise<CaptureOutcome> {
+    const stem = noteNameFromTask(text);
+    const contents = `# ${textWithoutLinks(text) || stem}\n`;
+    const created = await this.#writeNewNote(project, stem, contents);
+    if (created.kind === "stale") {
+      if (!created.written) return { ok: false, message: WORKSPACE_CLOSED };
+      return { ok: true, message: capturedNoteMessage(created.written.path) };
+    }
+    if (created.kind === "failed") return { ok: false, message: created.message };
+    const path = this.#addCreated(created.written, contents).path;
+    const message = capturedNoteMessage(path);
+    const id = this.#toast(message, "Open");
+    this.#toastActions.set(id, async () => this.openNote(path));
+    return { ok: true, message };
   }
 
   /** Runs a toast's action button: undo a delete, or create a missing note. */
@@ -1192,12 +1488,9 @@ export class AppState {
    * watcher's later report carries the same metadata, so it changes nothing.
    */
   #openCreated(written: WrittenFile, contents: string, folder: string): void {
-    const { hash, ...entry } = written;
+    const { hash } = written;
+    const entry = this.#addCreated(written, contents);
     const path = entry.path;
-    this.#files = [...this.#files.filter((file) => file.path !== path), entry];
-    this.workspace = buildWorkspace(this.#files, this.#config);
-    this.#store.set(path, summarizeFile(path, contents));
-    this.#schedulePublish();
 
     this.#leave(path);
     // A session left from a note deleted at this path is replaced.
@@ -1208,9 +1501,21 @@ export class AppState {
     this.#documentRequest += 1;
     this.folder = folder;
     this.item = path;
+    this.#search.touch(path);
     this.taskTextMode = false;
     this.document = { status: "ready", path, text: contents, modified: entry.modified };
     this.saveStatus = session.status;
+  }
+
+  /** Adds a file this app just created to the model and its summary, without opening it. */
+  #addCreated(written: WrittenFile, contents: string): FileEntry {
+    const entry: FileEntry = { path: written.path, size: written.size, modified: written.modified };
+    const path = entry.path;
+    this.#files = [...this.#files.filter((file) => file.path !== path), entry];
+    this.workspace = buildWorkspace(this.#files, this.#config);
+    this.#setSummary(path, contents);
+    this.#schedulePublish();
+    return entry;
   }
 
   /**
@@ -1239,7 +1544,7 @@ export class AppState {
     session.edit(() => text);
     this.#taskEdits.get(session)?.push(edit);
     const doc = this.#tasks.set(path, text, null);
-    this.#store.set(path, summarizeFile(path, text, doc));
+    this.#setSummary(path, text, doc);
     // The text editor shows this list: hand it the new text like a change from disk.
     if (path === this.item && this.taskTextMode) this.document = this.#ready(path, text);
     this.#publishTasks();
@@ -1285,7 +1590,7 @@ export class AppState {
     if (!isTaskListPath(path) || !this.#index.has(path)) return;
     const text = session.text;
     const doc = this.#tasks.set(path, text, session.dirty ? null : session.hash);
-    this.#store.set(path, summarizeFile(path, text, doc));
+    this.#setSummary(path, text, doc);
     this.#tasksChanged = true;
   }
 
@@ -1294,6 +1599,47 @@ export class AppState {
     this.#tasksChanged = true;
     this.#publishPending = true;
     this.#publish();
+  }
+
+  /** Shows a task list as tasks, focusing its first open task (or the new task input). */
+  #openList(path: string): void {
+    const role = classifyPath(path, createPathFilter(this.#config));
+    if (role?.kind !== "tasks" || role.archived || !this.#index.has(path)) return;
+    this.folder = role.project;
+    this.selectItem(path);
+    this.setTaskTextMode(false);
+    this.#focusFirstTask(path);
+  }
+
+  /** Shows a task in its list and focuses it, showing done tasks if it is done. */
+  #openTask(path: string, line: number, raw: string): void {
+    const role = classifyPath(path, createPathFilter(this.#config));
+    if (role?.kind !== "tasks" || role.archived || !this.#index.has(path)) return;
+    this.folder = role.project;
+    this.selectItem(path);
+    this.setTaskTextMode(false);
+    const doc = this.#currentTasks(path);
+    const at = doc ? taskOps.locateTask(doc, { line, raw }) : line;
+    if (at === null) {
+      this.#toast(TASK_CHANGED);
+      return;
+    }
+    const task = doc ? taskOps.taskAt(doc, at) : null;
+    if (task?.done && this.hideDone.has(path)) this.toggleHideDone(path);
+    this.#requestTaskFocus(path, at);
+  }
+
+  /** Selects a project and shows its task list, if it has one. */
+  #openProject(name: string): void {
+    if (!findProject(this.workspace, name)) return;
+    this.#select(name);
+    if (isTaskListPath(this.item)) this.#focusFirstTask(this.item);
+  }
+
+  #focusFirstTask(path: string): void {
+    const doc = this.#currentTasks(path);
+    const first = doc?.blocks.find((block) => !block.done) ?? doc?.blocks[0];
+    this.#requestTaskFocus(path, first ? first.line : null);
   }
 
   #requestTaskFocus(path: string, line: number | null): void {
@@ -1345,8 +1691,9 @@ export class AppState {
     this.#files = [...this.#files.filter((file) => file.path !== from && file.path !== to), entry];
     this.workspace = buildWorkspace(this.#files, this.#config);
     this.#store.retain((path) => path !== from);
+    this.#search.renameNote(from, to);
     if (session) {
-      this.#store.set(to, summarizeFile(to, session.text));
+      this.#setSummary(to, session.text);
     } else {
       // A title taken from the file name changes; read it again.
       if (summary) this.#store.set(to, summary);
@@ -1383,6 +1730,7 @@ export class AppState {
     this.#files = this.#files.filter((file) => file.path !== path);
     this.workspace = buildWorkspace(this.#files, this.#config);
     if (this.#store.retain((other) => other !== path)) this.#schedulePublish();
+    this.#search.removeNote(path);
     if (session) {
       session.dispose();
       if (this.#sessions.get(path) === session) this.#sessions.delete(path);
@@ -1672,7 +2020,7 @@ export class AppState {
     if (!this.#index.has(path)) return;
     // A task list shows its buffer, which may be ahead of what was saved.
     if (isTaskListPath(path)) this.#syncTasks(session);
-    else this.#store.set(path, summarizeFile(path, contents));
+    else this.#setSummary(path, contents, undefined, true);
     this.#schedulePublish();
   }
 
@@ -1742,10 +2090,10 @@ export class AppState {
       this.saveStatus = session.status;
       if (isTaskListPath(path)) {
         const doc = this.#tasks.set(path, file.contents, file.hash);
-        this.#store.set(path, summarizeFile(path, file.contents, doc));
+        this.#setSummary(path, file.contents, doc);
         this.#publishTasks();
       } else {
-        this.#store.set(path, summarizeFile(path, file.contents));
+        this.#setSummary(path, file.contents);
         this.#schedulePublish();
       }
     } catch (error) {
@@ -1791,6 +2139,7 @@ export class AppState {
     if (path === this.item && doc?.path === path && doc.status !== "error") return;
     if (entry.size > MAX_SUMMARY_BYTES) {
       this.#store.set(path, fallbackSummary(path));
+      if (this.#searchable(path)) this.#search.upsertNote(path, null);
       // A list that grew too large is no longer kept parsed; All tasks says so.
       if (!this.#sessions.has(path) && this.#tasks.delete(path)) this.#tasksChanged = true;
       this.#schedulePublish();
@@ -1808,12 +2157,34 @@ export class AppState {
       // A list with a session is kept current by it, edits included.
       if (this.#sessions.has(path)) return;
       const doc = this.#tasks.set(path, file.contents, file.hash);
-      this.#store.set(path, summarizeFile(path, file.contents, doc));
+      this.#setSummary(path, file.contents, doc);
       this.#tasksChanged = true;
     } else {
-      this.#store.set(path, summarizeFile(path, file.contents));
+      this.#setSummary(path, file.contents);
     }
     this.#schedulePublish();
+  }
+
+  /**
+   * Sets a file's list summary and, for a note, indexes its text for search,
+   * right away or (`later`) when the app is idle.
+   */
+  #setSummary(path: string, text: string, doc?: TaskDocument, later = false): void {
+    this.#store.set(path, summarizeFile(path, text, doc));
+    if (isTaskListPath(path) || !this.#searchable(path)) return;
+    if (!later) this.#search.upsertNote(path, text);
+    else if (this.#search.queueNote(path, text)) {
+      this.#idle(() => {
+        if (this.#search.queuedCount === 0) return;
+        this.#search.flushQueued();
+        this.searchRevision += 1;
+      });
+    }
+  }
+
+  /** Archived projects are not searched. */
+  #searchable(path: string): boolean {
+    return !path.startsWith(`${ARCHIVE_DIR}/`);
   }
 
   #schedulePublish(): void {
@@ -1826,9 +2197,11 @@ export class AppState {
     if (!this.#publishPending) return;
     this.#publishPending = false;
     this.summaries = this.#store.view();
+    this.searchRevision += 1;
     if (this.#tasksChanged) {
       this.#tasksChanged = false;
       this.taskDocs = this.#tasks.view();
+      this.#search.syncTaskLists(this.taskDocs, (path) => this.#searchable(path));
     }
   }
 
@@ -1894,6 +2267,7 @@ export class AppState {
 
     // Forget files that are gone or now ignored.
     if (this.#store.retain((path) => shown.has(path))) this.#schedulePublish();
+    this.#search.retainNotes((path) => shown.has(path));
     if (this.#tasks.retain((path) => shown.has(path))) {
       this.#tasksChanged = true;
       this.#schedulePublish();

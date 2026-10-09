@@ -32,6 +32,13 @@ export default defineConfig({
     target: process.env.TAURI_ENV_PLATFORM === "windows" ? "chrome105" : "safari15",
     minify: !process.env.TAURI_ENV_DEBUG,
     sourcemap: Boolean(process.env.TAURI_ENV_DEBUG),
+    rolldownOptions: {
+      // The main window and the quick capture window.
+      input: {
+        main: fileURLToPath(new URL("./index.html", import.meta.url)),
+        capture: fileURLToPath(new URL("./capture.html", import.meta.url)),
+      },
+    },
   },
   test: {
     projects: [
@@ -67,8 +74,9 @@ export default defineConfig({
         // Type-only declarations have no runtime code.
         "src/**/*.d.ts",
         "src/**/types.ts",
-        // Entry point: only mounts the app.
+        // Entry points: they only mount the app and the capture window.
         "src/main.ts",
+        "src/capture.ts",
       ],
       reporter: ["text", "html"],
       thresholds: {

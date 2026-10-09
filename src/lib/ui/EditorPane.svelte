@@ -3,7 +3,7 @@
   import { untrack } from "svelte";
   import { describeSaveStatus, type SaveStatus } from "$lib/core/saveMachine";
   import { splitPath } from "$lib/core/views";
-  import type { DocumentState, EditorPathChange } from "./appState.svelte";
+  import type { DocumentState, EditorPathChange, EditorRevealRequest } from "./appState.svelte";
   import { NoteEditor } from "./editor/noteEditor";
 
   interface Props {
@@ -14,6 +14,8 @@
     now: number;
     /** Each new value moves focus into the editor once it shows a note. */
     focusRequest: number;
+    /** Each new request moves the cursor to a line once its note is shown. */
+    reveal?: EditorRevealRequest | null;
     /** Called on every edit with a reader for the new text. */
     onedit: (path: string, read: () => string) => void;
     /** Renamed and deleted notes, in order; only new entries are applied. */
@@ -30,6 +32,7 @@
     status,
     now,
     focusRequest,
+    reveal = null,
     onedit,
     pathChanges = [],
     hidden = false,
@@ -84,6 +87,19 @@
     if (current?.status !== "ready" || current === shown) return;
     shown = current;
     editor.show(current.path, current.text);
+  });
+
+  /** The reveal request already handled; the initial one belongs to an earlier editor. */
+  let revealed = untrack(() => reveal?.id ?? 0);
+
+  // Declared after the effect that shows notes, so the line exists.
+  $effect(() => {
+    const request = reveal;
+    const current = doc;
+    if (!editor || !request || request.id === revealed) return;
+    if (current?.status !== "ready" || current.path !== request.path) return;
+    revealed = request.id;
+    editor.revealLine(request.line);
   });
 
   /** The focus request already handled; the initial value never steals focus. */

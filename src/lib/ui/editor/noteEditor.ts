@@ -186,6 +186,17 @@ export class NoteEditor {
     this.view.setState(this.#create("\n"));
   }
 
+  /** Puts the cursor at the start of a line (0-based, clamped) and scrolls it into view. */
+  revealLine(line: number): void {
+    const doc = this.view.state.doc;
+    const number = Math.min(Math.max(Math.floor(line) + 1, 1), doc.lines);
+    const position = doc.line(number).from;
+    this.view.dispatch({
+      selection: { anchor: position },
+      effects: EditorView.scrollIntoView(position, { y: "center" }),
+    });
+  }
+
   focus(): void {
     this.view.focus();
   }

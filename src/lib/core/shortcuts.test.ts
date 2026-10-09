@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  isSearchShortcut,
   isSyncShortcut,
   isViewModeShortcut,
+  searchShortcutLabels,
   syncShortcutLabels,
   viewModeShortcutLabels,
 } from "./shortcuts";
@@ -49,5 +51,22 @@ describe("sync shortcut", () => {
   it("has labels for assistive technology and hints", () => {
     expect(syncShortcutLabels(false)).toEqual({ aria: "Control+Shift+S", hint: "^⇧S" });
     expect(syncShortcutLabels(true)).toEqual({ aria: "Meta+Shift+S", hint: "⌘⇧S" });
+  });
+});
+
+describe("search shortcut", () => {
+  it("is Ctrl+K, or Cmd+K on macOS", () => {
+    expect(isSearchShortcut(press("k", { ctrlKey: true }), false)).toBe(true);
+    expect(isSearchShortcut(press("K", { metaKey: true }), true)).toBe(true);
+    expect(isSearchShortcut(press("k", { metaKey: true }), false)).toBe(false);
+    expect(isSearchShortcut(press("k", { ctrlKey: true }), true)).toBe(false);
+    expect(isSearchShortcut(press("k", { ctrlKey: true, shiftKey: true }), false)).toBe(false);
+    expect(isSearchShortcut(press("k", { ctrlKey: true, altKey: true }), false)).toBe(false);
+    expect(isSearchShortcut(press("j", { ctrlKey: true }), false)).toBe(false);
+  });
+
+  it("has labels for assistive technology and hints", () => {
+    expect(searchShortcutLabels(false)).toEqual({ aria: "Control+K", hint: "^K" });
+    expect(searchShortcutLabels(true)).toEqual({ aria: "Meta+K", hint: "⌘K" });
   });
 });

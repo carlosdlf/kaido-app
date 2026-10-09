@@ -14,6 +14,12 @@ const COMMANDS: &[&str] = &[
     "git_status",
     "git_commit",
     "git_sync",
+    "capture_shortcut_status",
+    "capture_submit",
+    "capture_request_projects",
+    "capture_hide",
+    "capture_show",
+    "capture_set_height",
 ];
 
 fn main() {
