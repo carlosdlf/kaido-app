@@ -19,7 +19,8 @@ export type SyncIcon =
   | "offline"
   | "paused"
   | "failed"
-  | "unavailable";
+  | "unavailable"
+  | "manual";
 
 /** `ok` success color, `busy` and `muted` secondary text, `warning` paused, `error` failures. */
 export type SyncTone = "ok" | "busy" | "muted" | "warning" | "error";
@@ -238,6 +239,18 @@ export function describeSync(snapshot: SyncSnapshot, now: number): SyncView {
   if (problem && problem.during !== "status") {
     const text = problem.during === "commit" ? "commit failed" : "sync failed";
     return { icon: "failed", tone: "error", text, details };
+  }
+
+  if (!snapshot.auto) {
+    return {
+      icon: "manual",
+      tone: "muted",
+      text: "auto-sync off",
+      details: [
+        "Automatic commits and syncs are off. Sync now commits and syncs once.",
+        ...details,
+      ],
+    };
   }
 
   if (snapshot.pending) {

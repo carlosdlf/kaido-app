@@ -14,4 +14,4 @@
   });
 </script>
 
-<AppShell {app} />
+<AppShell {app} captureAvailable={captureHost !== null} />

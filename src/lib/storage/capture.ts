@@ -39,7 +39,13 @@ export const CaptureProjectsSchema = v.object({
 });
 export const ShortcutStatusSchema = v.object({
   registered: v.boolean(),
-  shortcut: v.string(),
+  /** The shortcut that is (or should be) registered; `null` when it is turned off. */
+  shortcut: v.nullable(v.string()),
+});
+export const ShortcutChangeSchema = v.object({
+  registered: v.boolean(),
+  shortcut: v.nullable(v.string()),
+  message: v.nullish(v.string()),
 });
 
 export type CaptureKind = "task" | "note";
@@ -48,6 +54,17 @@ export type CaptureResult = v.InferOutput<typeof CaptureResultSchema>;
 export type CaptureProjects = v.InferOutput<typeof CaptureProjectsSchema>;
 /** Whether the global capture shortcut could be registered. */
 export type ShortcutStatus = v.InferOutput<typeof ShortcutStatusSchema>;
+/**
+ * The outcome of changing the capture shortcut. On success `shortcut` is
+ * the new one (`null` when turned off); on failure `registered` is false,
+ * `shortcut` is the one that was tried and the old one stays active.
+ */
+export interface ShortcutChange {
+  registered: boolean;
+  shortcut: string | null;
+  /** Why the new shortcut could not be registered. */
+  message?: string;
+}
 
 /** The capture window's side. */
 export interface CaptureChannel {
@@ -71,6 +88,11 @@ export interface CaptureHost {
   sendResult(result: CaptureResult): Promise<void>;
   sendProjects(projects: CaptureProjects): Promise<void>;
   shortcutStatus(): Promise<ShortcutStatus>;
+  /**
+   * Replaces the global capture shortcut (`null` turns it off). If the new
+   * one cannot be registered, the old one stays and `registered` is false.
+   */
+  setShortcut(accelerator: string | null): Promise<ShortcutChange>;
 }
 
 type Handlers<T> = Set<(value: T) => void>;
@@ -89,6 +111,8 @@ function deliver<T>(handlers: Handlers<T>, value: T): Promise<void> {
 
 export interface MemoryCaptureBusOptions {
   shortcut?: ShortcutStatus;
+  /** Shortcuts another app uses, so they cannot be registered. */
+  taken?: readonly string[];
 }
 
 /** Both sides of quick capture, connected in memory. Messages are delivered synchronously. */
@@ -98,6 +122,10 @@ export class MemoryCaptureBus {
   /** The capture window's height. */
   height: number | null = null;
   shortcut: ShortcutStatus;
+  /** Shortcuts another app uses. */
+  readonly taken: Set<string>;
+  /** Every shortcut change asked for, in order. */
+  readonly changes: (string | null)[] = [];
 
   readonly #shown: Handlers<void> = new Set();
   readonly #projects: Handlers<CaptureProjects> = new Set();
@@ -113,6 +141,7 @@ export class MemoryCaptureBus {
       registered: true,
       shortcut: "CommandOrControl+Alt+Space",
     };
+    this.taken = new Set(options.taken ?? []);
     this.channel = {
       onShown: (handler) => subscribe(this.#shown, handler),
       onProjects: (handler) => subscribe(this.#projects, handler),
@@ -138,7 +167,21 @@ export class MemoryCaptureBus {
       sendResult: (result) => deliver(this.#results, result),
       sendProjects: (projects) => deliver(this.#projects, projects),
       shortcutStatus: () => Promise.resolve(this.shortcut),
+      setShortcut: (accelerator) => Promise.resolve(this.#setShortcut(accelerator)),
     };
+  }
+
+  #setShortcut(accelerator: string | null): ShortcutChange {
+    this.changes.push(accelerator);
+    if (accelerator !== null && this.taken.has(accelerator)) {
+      return {
+        registered: false,
+        shortcut: accelerator,
+        message: `${accelerator} is already registered by another app`,
+      };
+    }
+    this.shortcut = { registered: accelerator !== null, shortcut: accelerator };
+    return { ...this.shortcut };
   }
 
   /** Shows the capture window, as the global shortcut does. */

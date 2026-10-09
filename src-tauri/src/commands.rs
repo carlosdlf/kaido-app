@@ -13,11 +13,13 @@ use tauri::ipc::{Invoke, InvokeBody, Request};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tauri_plugin_dialog::DialogExt;
 
-use crate::capture::ShortcutStatus;
+use crate::clone::{self, CloneControl, GitVersion};
 use crate::error::{AppError, AppResult};
 use crate::fs_ops::{self, FileContents, FileEntry, WriteCondition, WrittenFile};
 use crate::git::GitOptions;
-use crate::settings::{self, SettingsDir};
+use crate::settings::SettingsDir;
+use crate::setup::{self, ScaffoldResult, SetupResult, SetupStatus};
+use crate::shortcut::{ShortcutChange, ShortcutState, ShortcutStatus};
 use crate::state::{AppState, TreeLock};
 use crate::sync::{self, CommitResult, GitStatus, SyncControl, SyncResult};
 
@@ -40,7 +42,14 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         git_status,
         git_commit,
         git_sync,
+        git_version,
+        git_clone,
+        git_clone_cancel,
+        scaffold_workspace,
+        ensure_workspace_files,
+        workspace_setup_status,
         capture_shortcut_status,
+        set_capture_shortcut,
         crate::capture::capture_submit,
         crate::capture::capture_request_projects,
         crate::capture::capture_hide,
@@ -235,14 +244,17 @@ pub async fn delete_file(
 
 #[tauri::command]
 pub async fn read_settings(dir: State<'_, SettingsDir>) -> AppResult<Option<String>> {
-    let dir = dir.0.clone();
-    blocking(move || settings::read_settings(&dir)).await
+    let dir = dir.inner().clone();
+    blocking(move || dir.read()).await
 }
 
+/// Replaces the settings only if the file is still the version last read
+/// or written by the app; otherwise fails with `Conflict` (see
+/// [`SettingsDir::write`]).
 #[tauri::command]
 pub async fn write_settings(dir: State<'_, SettingsDir>, contents: String) -> AppResult<()> {
-    let dir = dir.0.clone();
-    blocking(move || settings::write_settings(&dir, &contents)).await
+    let dir = dir.inner().clone();
+    blocking(move || dir.write(&contents)).await
 }
 
 /// Status of the workspace's git repository. Takes no lock and never
@@ -286,11 +298,136 @@ pub async fn git_sync(
     .await
 }
 
-/// Whether the quick capture shortcut was registered at startup. The main
-/// window asks once it is ready, so a failure is never missed.
+/// Whether git can be run, and its version. Never fails.
 #[tauri::command]
-fn capture_shortcut_status(status: State<'_, ShortcutStatus>) -> ShortcutStatus {
-    status.inner().clone()
+pub async fn git_version(git: State<'_, GitOptions>) -> AppResult<GitVersion> {
+    let options = git.inner().clone();
+    blocking(move || Ok(clone::git_version(&options))).await
+}
+
+/// Clones `url` into the new folder `parent/name`; see [`clone::clone`].
+/// Does not open it.
+#[tauri::command]
+pub async fn git_clone(
+    state: State<'_, AppState>,
+    git: State<'_, GitOptions>,
+    control: State<'_, CloneControl>,
+    url: String,
+    parent: String,
+    name: String,
+) -> AppResult<OpenedWorkspace> {
+    let options = git.inner().clone();
+    let control = control.inner().clone();
+    let workspace = state.root().ok();
+    let root = blocking(move || {
+        clone::clone(
+            &options,
+            &control,
+            workspace.as_deref(),
+            &url,
+            &parent,
+            &name,
+        )
+    })
+    .await?;
+    let root = root
+        .into_os_string()
+        .into_string()
+        .map_err(|_| AppError::InvalidPath("the clone path is not valid UTF-8".into()))?;
+    Ok(OpenedWorkspace { root })
+}
+
+/// Cancels the clones in progress; each fails with `Cancelled`.
+#[tauri::command]
+pub fn git_clone_cancel(control: State<'_, CloneControl>) {
+    control.cancel_all();
+}
+
+/// Creates a new workspace in an empty or missing folder; see
+/// [`setup::scaffold_workspace`]. Does not open it.
+#[tauri::command]
+pub async fn scaffold_workspace(
+    state: State<'_, AppState>,
+    git: State<'_, GitOptions>,
+    control: State<'_, SyncControl>,
+    root: String,
+) -> AppResult<ScaffoldResult> {
+    let options = git.inner().clone();
+    let control = control.inner().clone();
+    let workspace = state.root().ok();
+    blocking(move || setup::scaffold_workspace(&options, &control, workspace.as_deref(), &root))
+        .await
+}
+
+/// Adds the missing `.gitattributes` and `.gitignore` lines to the open
+/// workspace, waiting like a file write while a sync rebases.
+#[tauri::command]
+pub async fn ensure_workspace_files(
+    state: State<'_, AppState>,
+    git: State<'_, GitOptions>,
+) -> AppResult<SetupResult> {
+    let options = git.inner().clone();
+    file_op(&state, move |root| {
+        setup::ensure_workspace_files(&options, root)
+    })
+    .await
+}
+
+/// Which setup files of the open workspace lack lines. Only reads.
+#[tauri::command]
+pub async fn workspace_setup_status(
+    state: State<'_, AppState>,
+    git: State<'_, GitOptions>,
+) -> AppResult<SetupStatus> {
+    let root = state.root()?;
+    let options = git.inner().clone();
+    blocking(move || setup::setup_status(&options, &root)).await
+}
+
+/// The quick capture shortcut in use (or that failed at startup).
+///
+/// Async so it never runs on the main thread: `set_capture_shortcut` holds
+/// the state while the shortcut plugin waits for the main thread.
+#[tauri::command]
+async fn capture_shortcut_status(status: State<'_, ShortcutState>) -> AppResult<ShortcutStatus> {
+    Ok(status.status())
+}
+
+/// Switches the quick capture shortcut (`null` disables it). The old one
+/// stays active if the new one cannot be registered.
+#[tauri::command]
+pub async fn set_capture_shortcut<R: Runtime>(
+    app: AppHandle<R>,
+    accelerator: Option<String>,
+) -> AppResult<ShortcutChange> {
+    blocking(move || {
+        let state = app.state::<ShortcutState>();
+        let mut status = state.lock();
+        Ok(change_shortcut(&app, &mut status, accelerator.as_deref()))
+    })
+    .await
+}
+
+#[cfg(desktop)]
+fn change_shortcut<R: Runtime>(
+    app: &AppHandle<R>,
+    status: &mut ShortcutStatus,
+    accelerator: Option<&str>,
+) -> ShortcutChange {
+    crate::shortcut::change_shortcut(&crate::shortcut::AppShortcuts(app), status, accelerator)
+}
+
+#[cfg(not(desktop))]
+fn change_shortcut<R: Runtime>(
+    _app: &AppHandle<R>,
+    _status: &mut ShortcutStatus,
+    accelerator: Option<&str>,
+) -> ShortcutChange {
+    ShortcutChange {
+        registered: false,
+        shortcut: accelerator.map(str::to_owned),
+        message: Some("global shortcuts are not available on this platform".into()),
+    }
 }
 
 #[cfg(test)]
@@ -317,8 +454,12 @@ mod tests {
             .manage(AppState::default())
             .manage(crate::git::test_env::options())
             .manage(SyncControl::default())
-            .manage(SettingsDir(settings_dir.path().join("config")))
-            .manage(ShortcutStatus::new(false))
+            .manage(SettingsDir::new(settings_dir.path().join("config")))
+            .manage(CloneControl::default())
+            .manage(ShortcutState::new(ShortcutStatus {
+                registered: false,
+                shortcut: Some(crate::shortcut::DEFAULT_SHORTCUT.into()),
+            }))
             .invoke_handler(handler())
             .build(mock_context(noop_assets()))
             .unwrap();
@@ -391,6 +532,187 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_changes_through_ipc_keep_the_old_one_on_failure() {
+        // The mock runtime has no global shortcut plugin, so every
+        // registration fails, like a shortcut taken by another app.
+        let (_app, webview, _settings) = app();
+        let args = serde_json::json!({ "accelerator": "Alt+Shift+K" });
+        let change = invoke(&webview, "set_capture_shortcut", args).unwrap();
+        assert_eq!(change["registered"], false);
+        assert_eq!(change["shortcut"], "Alt+Shift+K");
+        assert_eq!(
+            change["message"],
+            "could not register Alt+Shift+K: global shortcuts are not available"
+        );
+        let status = invoke(&webview, "capture_shortcut_status", serde_json::json!({}));
+        assert_eq!(
+            status.unwrap(),
+            serde_json::json!({
+                "registered": false,
+                "shortcut": "CommandOrControl+Alt+Space",
+            })
+        );
+        // Disabling always works.
+        let args = serde_json::json!({ "accelerator": null });
+        let change = invoke(&webview, "set_capture_shortcut", args).unwrap();
+        assert_eq!(
+            change,
+            serde_json::json!({ "registered": false, "shortcut": null, "message": null })
+        );
+        let status = invoke(&webview, "capture_shortcut_status", serde_json::json!({}));
+        assert_eq!(
+            status.unwrap(),
+            serde_json::json!({ "registered": false, "shortcut": null })
+        );
+    }
+
+    #[test]
+    fn git_version_through_ipc() {
+        let (_app, webview, _settings) = app();
+        let version = invoke(&webview, "git_version", serde_json::json!({})).unwrap();
+        assert_eq!(version["available"], true);
+        assert!(version["version"].is_string());
+    }
+
+    #[test]
+    fn scaffold_and_setup_through_ipc() {
+        let (_app, webview, _settings) = app();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        let root = base.join("notes");
+        let created = invoke(
+            &webview,
+            "scaffold_workspace",
+            serde_json::json!({ "root": root }),
+        )
+        .unwrap();
+        assert_eq!(created["root"], root.to_str().unwrap());
+        assert_eq!(created["git"], "initialized");
+        assert!(created["commit"].is_string());
+        assert!(created["gitError"].is_null());
+        assert_eq!(
+            created["created"],
+            serde_json::json!([
+                "inbox/tasks.md",
+                ".kaido/config.json",
+                ".gitattributes",
+                ".gitignore"
+            ])
+        );
+        assert_eq!(created["updated"], serde_json::json!([]));
+        let again = invoke(
+            &webview,
+            "scaffold_workspace",
+            serde_json::json!({ "root": root }),
+        );
+        assert_eq!(error_kind(again), "NotEmpty");
+
+        for cmd in ["ensure_workspace_files", "workspace_setup_status"] {
+            assert_eq!(
+                error_kind(invoke(&webview, cmd, serde_json::json!({}))),
+                "NoWorkspace"
+            );
+        }
+        let other = base.join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join(".gitignore"), "target/").unwrap();
+        invoke(
+            &webview,
+            "open_workspace",
+            serde_json::json!({ "path": other }),
+        )
+        .unwrap();
+        let status = invoke(&webview, "workspace_setup_status", serde_json::json!({})).unwrap();
+        assert_eq!(
+            status,
+            serde_json::json!({ "missing": [".gitattributes", ".gitignore"] })
+        );
+        let done = invoke(&webview, "ensure_workspace_files", serde_json::json!({})).unwrap();
+        assert_eq!(
+            done,
+            serde_json::json!({ "created": [".gitattributes"], "updated": [".gitignore"] })
+        );
+        let status = invoke(&webview, "workspace_setup_status", serde_json::json!({})).unwrap();
+        assert_eq!(status, serde_json::json!({ "missing": [] }));
+    }
+
+    #[test]
+    fn ensure_workspace_files_waits_for_a_rebase() {
+        let (app, webview, _settings) = app();
+        let dir = tempfile::tempdir().unwrap();
+        invoke(
+            &webview,
+            "open_workspace",
+            serde_json::json!({ "path": dir.path() }),
+        )
+        .unwrap();
+        let lock = app.state::<AppState>().current().unwrap().lock;
+        let guard = lock.tree.try_write().unwrap();
+        let worker = {
+            let webview = webview.clone();
+            std::thread::spawn(move || {
+                invoke(&webview, "ensure_workspace_files", serde_json::json!({}))
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!dir.path().join(".gitignore").exists());
+        drop(guard);
+        let done = worker.join().unwrap().unwrap();
+        assert_eq!(done["created"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn clone_through_ipc() {
+        use crate::git::test_env::git;
+        let (app, webview, _settings) = app();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        git(&base, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        let args = serde_json::json!({
+            "url": base.join("remote.git"), "parent": base, "name": "notes"
+        });
+        let cloned = invoke(&webview, "git_clone", args.clone()).unwrap();
+        assert_eq!(
+            cloned,
+            serde_json::json!({ "root": base.join("notes").to_str().unwrap() })
+        );
+        assert_eq!(error_kind(invoke(&webview, "git_clone", args)), "Conflict");
+        let args = serde_json::json!({ "url": "", "parent": base, "name": "x" });
+        assert_eq!(
+            error_kind(invoke(&webview, "git_clone", args)),
+            "InvalidPath"
+        );
+        assert_eq!(
+            invoke(&webview, "git_clone_cancel", serde_json::json!({})).unwrap(),
+            serde_json::Value::Null
+        );
+        assert!(!app.state::<CloneControl>().cancel_all());
+
+        // Nothing is created inside the open workspace.
+        let open = base.join("open");
+        std::fs::create_dir(&open).unwrap();
+        invoke(
+            &webview,
+            "open_workspace",
+            serde_json::json!({ "path": open }),
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "url": base.join("remote.git"), "parent": open, "name": "nested"
+        });
+        assert_eq!(
+            error_kind(invoke(&webview, "git_clone", args)),
+            "InvalidPath"
+        );
+        let args = serde_json::json!({ "root": open.join("nested") });
+        assert_eq!(
+            error_kind(invoke(&webview, "scaffold_workspace", args)),
+            "InvalidPath"
+        );
+        assert!(!open.join("nested").exists());
+    }
+
+    #[test]
     fn every_command_is_declared_and_granted() {
         let build = include_str!("../build.rs");
         let capability: serde_json::Value =
@@ -402,7 +724,14 @@ mod tests {
             "git_status",
             "git_commit",
             "git_sync",
+            "git_version",
+            "git_clone",
+            "git_clone_cancel",
+            "scaffold_workspace",
+            "ensure_workspace_files",
+            "workspace_setup_status",
             "capture_shortcut_status",
+            "set_capture_shortcut",
         ] {
             assert!(build.contains(&format!("\"{cmd}\"")), "{cmd}");
             let permission = format!("allow-{}", cmd.replace('_', "-"));
@@ -1012,8 +1341,18 @@ mod tests {
         let file = settings_dir
             .path()
             .join("config")
-            .join(settings::SETTINGS_FILE);
-        assert_eq!(std::fs::read_to_string(file).unwrap(), "{\"version\":1}");
+            .join(crate::settings::SETTINGS_FILE);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{\"version\":1}");
+
+        // Edited outside the app: the write is refused until read again.
+        std::fs::write(&file, "{\"version\":1,\"theme\":\"x\"}").unwrap();
+        let args = serde_json::json!({ "contents": "{\"version\":2}" });
+        let refused = invoke(&webview, "write_settings", args.clone()).unwrap_err();
+        assert_eq!(refused["kind"], "Conflict");
+        assert_eq!(refused["message"], crate::settings::CONFLICT_MESSAGE);
+        assert_eq!(read().unwrap(), "{\"version\":1,\"theme\":\"x\"}");
+        invoke(&webview, "write_settings", args).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{\"version\":2}");
     }
 
     #[test]
@@ -1021,7 +1360,7 @@ mod tests {
         let (_app, webview, settings_dir) = app();
         let config = settings_dir.path().join("config");
         std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(config.join(settings::SETTINGS_FILE), [0xff, 0xfe]).unwrap();
+        std::fs::write(config.join(crate::settings::SETTINGS_FILE), [0xff, 0xfe]).unwrap();
         let result = invoke(&webview, "read_settings", serde_json::json!({}));
         assert_eq!(error_kind(result), "InvalidUtf8");
     }

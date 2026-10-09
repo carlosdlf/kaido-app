@@ -18,6 +18,13 @@
     "allow-git-status",
     "allow-git-commit",
     "allow-git-sync",
-    "allow-capture-shortcut-status"
+    "allow-git-version",
+    "allow-git-clone",
+    "allow-git-clone-cancel",
+    "allow-scaffold-workspace",
+    "allow-ensure-workspace-files",
+    "allow-workspace-setup-status",
+    "allow-capture-shortcut-status",
+    "allow-set-capture-shortcut"
   ]
 }

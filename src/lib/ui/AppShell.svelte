@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import {
     ALL_TASKS,
     listItems,
@@ -13,9 +13,11 @@
   import { isNewProjectShortcut, newProjectShortcutLabels } from "$lib/core/projectNames";
   import {
     isSearchShortcut,
+    isSettingsShortcut,
     isSyncShortcut,
     isViewModeShortcut,
     searchShortcutLabels,
+    settingsShortcutLabels,
     syncShortcutLabels,
     viewModeShortcutLabels,
   } from "$lib/core/shortcuts";
@@ -25,7 +27,13 @@
   import { allTaskRows, taskRows, type RowOptions } from "$lib/core/taskRows";
   import { taskGroups } from "$lib/core/taskIndex";
   import { isTaskListPath } from "$lib/core/workspace";
+  import { EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN } from "$lib/config/settings";
+  import { sameAccelerator } from "$lib/core/accelerator";
+  import { folderName } from "$lib/core/workspaceLocation";
   import { oversizedTasksMessage, TASK_CHANGED, type AppState } from "./appState.svelte";
+  import SettingsDialog from "./SettingsDialog.svelte";
+  import SetupBanner from "./SetupBanner.svelte";
+  import { APP_VERSION } from "./version";
   import EditorPane from "./EditorPane.svelte";
   import ListPane from "./ListPane.svelte";
   import Sidebar from "./Sidebar.svelte";
@@ -36,7 +44,13 @@
   import SearchPalette from "./SearchPalette.svelte";
   import { isMac } from "./platform";
 
-  let { app }: { app: AppState } = $props();
+  interface Props {
+    app: AppState;
+    /** Quick capture can be configured (the desktop app). */
+    captureAvailable?: boolean;
+  }
+
+  let { app, captureAvailable = false }: Props = $props();
 
   /** Refreshed every minute so relative ages stay current. */
   let now = $state(Date.now());
@@ -48,9 +62,7 @@
 
   const entries = $derived(sidebarEntries(app.workspace, app.summaries));
   const items = $derived(listItems(app.workspace, app.folder, app.summaries));
-  const workspaceName = $derived(
-    app.phase.kind === "ready" ? (app.phase.root.split(/[\\/]/).filter(Boolean).pop() ?? "") : "",
-  );
+  const workspaceName = $derived(app.phase.kind === "ready" ? folderName(app.phase.root) : "");
 
   const COPY_FAILED = "The path could not be copied to the clipboard.";
 
@@ -60,6 +72,79 @@
   const viewModeShortcut = viewModeShortcutLabels(mac);
   const syncShortcut = syncShortcutLabels(mac);
   const searchShortcut = searchShortcutLabels(mac);
+  const settingsShortcut = settingsShortcutLabels(mac);
+
+  // The editor and task views follow the font size setting; the chrome keeps its size.
+  $effect(() => {
+    document.documentElement.style.setProperty(
+      "--font-size-editor",
+      `${app.settings.editorFontSize}px`,
+    );
+  });
+
+  /** The settings dialog is shown. */
+  let settingsOpen = $state(false);
+  /** Where focus goes when the settings dialog closes. */
+  let settingsReturn: HTMLElement | null = $state.raw(null);
+  /** The start screen is shown over an open workspace, to switch to another one. */
+  let switching = $state(false);
+  const showStart = $derived(
+    app.phase.kind === "ready" ? switching : app.phase.kind !== "starting",
+  );
+
+  // Opening a workspace ends switching; the start screen checks for git each time it shows.
+  $effect(() => {
+    if (app.phase.kind === "loading") switching = false;
+  });
+  $effect(() => {
+    if (showStart) untrack(() => void app.checkGit());
+  });
+
+  const startView = $derived.by(() => {
+    switch (app.phase.kind) {
+      case "loading":
+        return { title: "Opening workspace", message: app.phase.path, error: false, busy: true };
+      case "error":
+        return {
+          title: "Could not open the workspace",
+          message: app.phase.message,
+          error: true,
+          busy: false,
+        };
+      case "ready":
+        return { title: "Switch workspace", message: "", error: false, busy: false };
+      default:
+        return {
+          title: "Open a workspace",
+          message:
+            "Choose a folder for your notes and tasks. It can be an existing git repository or an empty folder.",
+          error: false,
+          busy: false,
+        };
+    }
+  });
+
+  const shortcutUnavailable = $derived(
+    app.settings.captureShortcut !== null &&
+      app.captureShortcut !== null &&
+      !(
+        app.captureShortcut.registered &&
+        sameAccelerator(app.captureShortcut.shortcut, app.settings.captureShortcut)
+      ),
+  );
+
+  /** The focused element, if any besides the page itself. */
+  function focusedElement(): HTMLElement | null {
+    const active = document.activeElement;
+    return active instanceof HTMLElement && active !== document.body ? active : null;
+  }
+
+  /** Opens settings; focus returns to `returnTo` when they close. */
+  function openSettings(returnTo = focusedElement()) {
+    if (app.phase.kind === "loading") return;
+    settingsReturn = returnTo;
+    settingsOpen = true;
+  }
   const syncView = $derived(app.sync ? describeSync(app.sync, now) : null);
 
   /** The main pane shows the combined task view. */
@@ -102,6 +187,14 @@
 
   /** The search palette is shown. */
   let paletteOpen = $state(false);
+  /** What had focus before the palette opened, for commands that replace it. */
+  let paletteReturn: HTMLElement | null = null;
+
+  function openPalette() {
+    if (app.phase.kind !== "ready") return;
+    paletteReturn = focusedElement();
+    paletteOpen = true;
+  }
 
   // The palette belongs to the open workspace; it never comes back by itself.
   $effect(() => {
@@ -141,6 +234,10 @@
       case "switch-view":
         void setViewMode(app.taskTextMode ? "list" : "text", "shortcut");
         return;
+      case "settings":
+        // Focus goes back to where it was before the palette, not to the palette.
+        openSettings(paletteReturn);
+        return;
     }
   }
 
@@ -150,10 +247,22 @@
    * palette is open, the palette handles the key itself.
    */
   function handleKeydownCapture(event: KeyboardEvent) {
-    if (event.isComposing || !isSearchShortcut(event, mac) || paletteOpen) return;
+    // The settings dialog handles its own keys, such as a shortcut being recorded.
+    if (event.isComposing || settingsOpen) return;
+    if (isSettingsShortcut(event, mac)) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!event.repeat) {
+        const returnTo = paletteOpen ? paletteReturn : focusedElement();
+        paletteOpen = false;
+        openSettings(returnTo);
+      }
+      return;
+    }
+    if (!isSearchShortcut(event, mac) || paletteOpen) return;
     event.preventDefault();
     event.stopPropagation();
-    if (!event.repeat && app.phase.kind === "ready") paletteOpen = true;
+    if (!event.repeat) openPalette();
   }
 
   /** Bumped to open the new project field in the sidebar. */
@@ -312,7 +421,7 @@
   onfocusexit={focusExit}
 />
 
-{#if app.phase.kind === "ready"}
+{#if !showStart && app.phase.kind === "ready"}
   <div class="shell" bind:this={shell}>
     <Sidebar
       {entries}
@@ -329,9 +438,20 @@
       sync={syncView}
       onsync={() => app.syncNow()}
       {syncShortcut}
-      onsearch={() => (paletteOpen = true)}
+      onsearch={openPalette}
       {searchShortcut}
+      onsettings={() => openSettings()}
+      {settingsShortcut}
     />
+    {#if app.setupBanner}
+      <div class="banner">
+        <SetupBanner
+          onsetup={() => app.setUpWorkspace()}
+          ondismiss={() => app.dismissSetup()}
+          onfocusexit={() => (listFocus += 1)}
+        />
+      </div>
+    {/if}
     <ListPane
       title={listTitle(app.folder)}
       summary={listSummary(app.workspace, app.folder, app.summaries)}
@@ -405,31 +525,76 @@
       onclose={() => (paletteOpen = false)}
     />
   {/if}
-{:else if app.phase.kind === "no-workspace"}
+{:else if showStart}
   <StartScreen
-    title="Open a workspace"
-    message="Choose a folder for your notes and tasks. It can be an existing git repository or an empty folder."
+    title={startView.title}
+    message={startView.message}
+    error={startView.error}
+    busy={startView.busy}
+    git={app.gitInfo}
+    recents={app.settings.recentWorkspaces}
+    missing={app.missingWorkspaces}
+    current={app.phase.kind === "ready" ? app.phase.root : null}
     onpick={pick}
+    onopenrecent={(path) => void app.openWorkspace(path)}
+    onremoverecent={(path) => app.removeRecentWorkspace(path)}
+    onpickfolder={() => app.pickFolder()}
+    oncreate={(parent, name) => app.createWorkspace(parent, name)}
+    onclone={(url, parent, name) => app.cloneWorkspace(url, parent, name)}
+    oncancelclone={() => void app.cancelClone()}
+    onback={() => (switching = false)}
   />
-{:else if app.phase.kind === "loading"}
-  <StartScreen title="Opening workspace" message={app.phase.path} busy onpick={pick} />
-{:else if app.phase.kind === "error"}
-  <StartScreen
-    title="Could not open the workspace"
-    message={app.phase.message}
-    error
-    onpick={pick}
+{/if}
+
+{#if settingsOpen}
+  <SettingsDialog
+    returnFocus={settingsReturn}
+    workspace={app.phase.kind === "ready" ? app.phase.root : null}
+    setupMissing={app.setupMissing}
+    fontSize={app.settings.editorFontSize}
+    fontMin={EDITOR_FONT_SIZE_MIN}
+    fontMax={EDITOR_FONT_SIZE_MAX}
+    autoSync={app.settings.autoSync}
+    shortcut={app.settings.captureShortcut}
+    {shortcutUnavailable}
+    {captureAvailable}
+    version={APP_VERSION}
+    onswitch={() => {
+      settingsOpen = false;
+      switching = true;
+    }}
+    onsetup={() => app.setUpWorkspace()}
+    onfontsize={(size) => app.setEditorFontSize(size)}
+    onautosync={(on) => app.setAutoSync(on)}
+    onshortcut={(accelerator) => app.setCaptureShortcut(accelerator)}
+    oncopy={(text) => copyText(text, "Copied the link")}
+    onclose={() => (settingsOpen = false)}
   />
 {/if}
 
 <style>
   .shell {
     display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
     grid-template-columns:
       minmax(200px, var(--sidebar-width))
       minmax(220px, var(--list-width))
       minmax(0, 1fr);
     height: 100%;
     overflow: hidden;
+  }
+
+  /* The setup banner sits above the list and the main pane; the sidebar spans both rows. */
+  .shell > :global(*) {
+    grid-row: 2;
+  }
+
+  .shell > :global(:first-child) {
+    grid-row: 1 / -1;
+  }
+
+  .shell > .banner {
+    grid-row: 1;
+    grid-column: 2 / -1;
   }
 </style>

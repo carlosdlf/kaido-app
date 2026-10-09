@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { contentHash } from "./contentHash";
+import { StorageError } from "./errors";
 import { MemoryStorage } from "./MemoryStorage";
 
 function storage(options: ConstructorParameters<typeof MemoryStorage>[0] = {}) {
@@ -156,6 +157,33 @@ describe("MemoryStorage", () => {
     await store.writeSettings("{}");
     await expect(store.readSettings()).resolves.toBe("{}");
     await expect(storage().readSettings()).resolves.toBeNull();
+  });
+
+  it("only replaces the settings it last read or wrote", async () => {
+    const store = storage({ settings: '{"version":1}' });
+    // Never read: an existing file is not replaced, a missing one is created.
+    await expect(store.writeSettings("{}")).rejects.toMatchObject({ kind: "Conflict" });
+    expect(store.settings).toBe('{"version":1}');
+    const fresh = storage();
+    await fresh.writeSettings("{}");
+    expect(fresh.settings).toBe("{}");
+
+    await store.readSettings();
+    await store.writeSettings("a");
+    await store.writeSettings("b");
+    store.setExternalSettings("outside");
+    await expect(store.writeSettings("c")).rejects.toMatchObject({ kind: "Conflict" });
+    expect(store.settings).toBe("outside");
+    await store.readSettings();
+    await store.writeSettings("c");
+    expect(store.settings).toBe("c");
+
+    // A deleted file counts as changed too.
+    store.setExternalSettings(null);
+    await expect(store.writeSettings("d")).rejects.toMatchObject({ kind: "Conflict" });
+    await store.readSettings();
+    await store.writeSettings("d");
+    expect(store.settings).toBe("d");
   });
 
   it("returns the configured folder pick", async () => {
@@ -362,5 +390,112 @@ describe("MemoryStorage.deleteFile", () => {
     await store.deleteFile("a.md", contentHash("x"));
     await Promise.resolve();
     expect(listener).not.toHaveBeenCalled();
+  });
+});
+
+describe("MemoryStorage onboarding", () => {
+  it("reports git", async () => {
+    await expect(new MemoryStorage().gitVersion()).resolves.toEqual({
+      available: true,
+      version: "2.43.0",
+    });
+    await expect(
+      new MemoryStorage({ git: { unavailable: "git-missing" } }).gitVersion(),
+    ).resolves.toEqual({ available: false, version: null });
+  });
+
+  it("scaffolds empty or new folders only", async () => {
+    const storage = new MemoryStorage({ folders: { "/full": { "a.md": "" }, "/empty": {} } });
+    await expect(storage.scaffoldWorkspace("/new")).resolves.toEqual({
+      root: "/new",
+      created: [".gitattributes", ".gitignore", ".kaido/config.json", "inbox/tasks.md"],
+      updated: [],
+      git: "initialized",
+      commit: "0000000",
+      gitError: null,
+    });
+    await expect(storage.scaffoldWorkspace("/empty")).resolves.toMatchObject({ updated: [] });
+    await expect(storage.scaffoldWorkspace("/full")).rejects.toMatchObject({ kind: "NotEmpty" });
+    await expect(
+      new MemoryStorage({ git: { unavailable: "git-missing" } }).scaffoldWorkspace("/n"),
+    ).resolves.toMatchObject({ git: "git-missing", commit: null });
+    await storage.openWorkspace("/new");
+    await expect(storage.workspaceSetupStatus()).resolves.toEqual({ missing: [] });
+    await expect(storage.listFiles()).resolves.toEqual([
+      expect.objectContaining({ path: "inbox/tasks.md" }),
+    ]);
+    await expect(storage.readFile(".kaido/config.json")).resolves.toMatchObject({
+      contents: '{ "version": 1, "ignore": [] }\n',
+    });
+  });
+
+  it("adds missing setup lines without touching the rest", async () => {
+    const storage = new MemoryStorage({
+      folders: { "/w": { ".gitattributes": "*.md text", ".gitignore": ".Trash-*\n" } },
+    });
+    await storage.openWorkspace("/w");
+    await expect(storage.workspaceSetupStatus()).resolves.toEqual({
+      missing: [".gitattributes", ".gitignore"],
+    });
+    await expect(storage.ensureWorkspaceFiles()).resolves.toEqual({
+      created: [],
+      updated: [".gitattributes", ".gitignore"],
+    });
+    const files = storage.folders.get("/w");
+    expect(files?.get(".gitattributes")?.contents).toBe("*.md text\ntasks.md merge=union\n");
+    expect(files?.get(".gitignore")?.contents).toBe(".Trash-*\n.kaido-*.tmp\n");
+    await expect(storage.ensureWorkspaceFiles()).resolves.toEqual({ created: [], updated: [] });
+    await expect(storage.workspaceSetupStatus()).resolves.toEqual({ missing: [] });
+  });
+
+  it("clones known repositories into new folders", async () => {
+    const storage = new MemoryStorage({
+      folders: { "/p/taken": {} },
+      remotes: { "https://h/notes.git": { "inbox/tasks.md": "- [ ] a\n" } },
+    });
+    await expect(storage.cloneRepository("https://h/notes.git", "/p", "notes")).resolves.toEqual({
+      root: "/p/notes",
+    });
+    expect(storage.folders.get("/p/notes")?.get("inbox/tasks.md")?.contents).toBe("- [ ] a\n");
+    await expect(
+      storage.cloneRepository("https://h/notes.git", "/p", "taken"),
+    ).rejects.toMatchObject({ kind: "Conflict" });
+    await expect(storage.cloneRepository("https://h/x.git", "/p", "x")).rejects.toMatchObject({
+      kind: "GitFailed",
+    });
+    storage.cloneError = new StorageError("GitAuth", "denied");
+    await expect(storage.cloneRepository("https://h/notes.git", "/p", "n2")).rejects.toMatchObject({
+      kind: "GitAuth",
+    });
+    await expect(storage.cloneRepository("https://h/notes.git", "/p", "n2")).resolves.toEqual({
+      root: "/p/n2",
+    });
+  });
+
+  it("holds a clone until it is released or cancelled", async () => {
+    const storage = new MemoryStorage({ remotes: { u: {} } });
+    storage.holdClone = true;
+    const first = storage.cloneRepository("u", "/p", "a");
+    storage.releaseClone();
+    await expect(first).resolves.toEqual({ root: "/p/a" });
+    storage.holdClone = true;
+    const second = storage.cloneRepository("u", "/p", "b");
+    await storage.cancelClone();
+    await expect(second).rejects.toMatchObject({ kind: "Cancelled" });
+    expect(storage.folders.has("/p/b")).toBe(false);
+    await expect(storage.cancelClone()).resolves.toBeUndefined();
+    storage.releaseClone();
+  });
+
+  it("reports settings changed by another program", async () => {
+    const storage = new MemoryStorage();
+    const listener = vi.fn();
+    const stop = await storage.watchSettings(listener);
+    storage.setExternalSettings('{"version":1}');
+    expect(listener).toHaveBeenCalledTimes(1);
+    await expect(storage.readSettings()).resolves.toBe('{"version":1}');
+    stop();
+    storage.setExternalSettings(null);
+    expect(listener).toHaveBeenCalledTimes(1);
   });
 });

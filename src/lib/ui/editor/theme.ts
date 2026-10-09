@@ -159,20 +159,20 @@ const editorTheme = EditorView.theme(
     },
     ".cm-md-code": {
       fontFamily: "var(--font-ui)",
-      fontSize: "var(--font-size-ui)",
+      fontSize: "var(--font-size-editor-mono)",
       color: "var(--color-text)",
     },
     ".cm-md-codeblock": {
       backgroundColor: "var(--color-surface-raised)",
       fontFamily: "var(--font-ui)",
-      fontSize: "var(--font-size-ui)",
+      fontSize: "var(--font-size-editor-mono)",
       color: "var(--color-text)",
       paddingInline: "var(--space-16)",
     },
     // Same font and size as code, so aligned columns line up.
     ".cm-md-table": {
       fontFamily: "var(--font-ui)",
-      fontSize: "var(--font-size-ui)",
+      fontSize: "var(--font-size-editor-mono)",
     },
     ".cm-code-keyword": {
       color: "var(--color-heading)",

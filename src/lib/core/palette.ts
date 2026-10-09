@@ -19,7 +19,7 @@ export function paletteMode(input: string): PaletteMode {
 }
 
 export type PaletteCommandId =
-  "new-note" | "new-project" | "sync-now" | "toggle-hide-done" | "switch-view";
+  "new-note" | "new-project" | "sync-now" | "toggle-hide-done" | "switch-view" | "settings";
 
 export interface PaletteCommand {
   id: PaletteCommandId;
@@ -33,6 +33,7 @@ export const PALETTE_COMMANDS: readonly PaletteCommand[] = [
   { id: "sync-now", label: "Sync now" },
   { id: "toggle-hide-done", label: "Hide or show done tasks" },
   { id: "switch-view", label: "Switch list / text" },
+  { id: "settings", label: "Settings" },
 ];
 
 /** Commands whose label contains `query`, ignoring case. */

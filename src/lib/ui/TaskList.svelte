@@ -769,6 +769,8 @@
     display: flex;
     flex-direction: column;
     max-width: var(--note-max-width);
+    /* Follows the editor font size setting. */
+    font-size: var(--font-size-editor-mono);
     padding: var(--space-16) 0 var(--space-8);
   }
 
@@ -784,7 +786,7 @@
   .heading h3 {
     padding: var(--space-20) var(--space-24) var(--space-6);
     color: var(--color-heading);
-    font-size: var(--font-size-ui);
+    font-size: var(--font-size-editor-mono);
     font-weight: var(--font-weight-semibold);
   }
 

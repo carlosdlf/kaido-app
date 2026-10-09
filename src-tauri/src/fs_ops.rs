@@ -248,18 +248,14 @@ pub fn read_file(root: &Path, rel: &str) -> AppResult<FileContents> {
 
 /// Reads a file of at most [`MAX_FILE_SIZE`] bytes and decodes it as UTF-8,
 /// reporting errors with `label`.
-pub fn read_text(path: &Path, label: &str) -> AppResult<String> {
-    decode_utf8(read_bytes(path, label)?, label)
-}
-
-fn decode_utf8(bytes: Vec<u8>, label: &str) -> AppResult<String> {
+pub fn decode_utf8(bytes: Vec<u8>, label: &str) -> AppResult<String> {
     String::from_utf8(bytes)
         .map_err(|_| AppError::InvalidUtf8(format!("{label} is not valid UTF-8 text")))
 }
 
 /// Reads a file of at most [`MAX_FILE_SIZE`] bytes, reporting errors with
 /// `label`.
-fn read_bytes(path: &Path, label: &str) -> AppResult<Vec<u8>> {
+pub fn read_bytes(path: &Path, label: &str) -> AppResult<Vec<u8>> {
     let io_err = |e: io::Error| AppError::from_io(&e, "read", label);
     let file = fs::File::open(path).map_err(io_err)?;
     if file.metadata().map_err(io_err)?.len() > MAX_FILE_SIZE {

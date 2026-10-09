@@ -26,6 +26,8 @@ use crate::error::{AppError, AppResult};
 pub const LOCAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout of commands that talk to a remote (`fetch`, `push`).
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
+/// Timeout of `git clone`, which may download a whole repository.
+pub const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
 /// After this long a command that writes to the repository is asked to stop
 /// (`SIGTERM` on Unix; elsewhere it is waited for without a limit).
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -55,6 +57,8 @@ pub struct GitOptions {
     pub local_timeout: Duration,
     /// See [`NETWORK_TIMEOUT`].
     pub network_timeout: Duration,
+    /// See [`CLONE_TIMEOUT`].
+    pub clone_timeout: Duration,
     /// See [`WRITE_TIMEOUT`].
     pub write_timeout: Duration,
     /// See [`INDEX_LOCK_RECHECK`].
@@ -69,6 +73,7 @@ impl Default for GitOptions {
             env_remove: Vec::new(),
             local_timeout: LOCAL_TIMEOUT,
             network_timeout: NETWORK_TIMEOUT,
+            clone_timeout: CLONE_TIMEOUT,
             write_timeout: WRITE_TIMEOUT,
             index_lock_recheck: INDEX_LOCK_RECHECK,
         }
@@ -251,6 +256,10 @@ impl Git {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        // A network command asked to stop before it started never starts.
+        if self.stopping(mode) {
+            return Err(stopped());
+        }
         let mut cmd = self.command(mode, args);
         let mut child = spawn(&mut cmd).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -259,6 +268,7 @@ impl Git {
                 AppError::GitFailed(format!("could not run git: {e}"))
             }
         })?;
+        let tree = ProcessTree::attach(&child);
         let timeout = self.timeout(mode);
         let deadline = Instant::now() + timeout;
         let stdout = child.stdout.take().map(read_all);
@@ -272,12 +282,12 @@ impl Git {
                 Ok(Some(status)) => break status,
                 Ok(None) => {}
                 Err(e) => {
-                    kill(&mut child);
+                    kill(&mut child, &tree);
                     return Err(AppError::GitFailed(format!("could not wait for git: {e}")));
                 }
             }
             if self.stopping(mode) {
-                kill(&mut child);
+                kill(&mut child, &tree);
                 return Err(stopped());
             }
             if Instant::now() >= deadline {
@@ -288,7 +298,7 @@ impl Git {
                         timeout.as_secs()
                     )));
                 }
-                kill(&mut child);
+                kill(&mut child, &tree);
                 return Err(timed_out());
             }
             std::thread::sleep(poll);
@@ -317,7 +327,7 @@ impl Git {
                 (stdout.unwrap_or_default(), stderr.unwrap_or_default())
             }
             _ => {
-                kill(&mut child);
+                kill(&mut child, &tree);
                 return Err(timed_out());
             }
         };
@@ -441,19 +451,125 @@ fn terminate(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Kills a reading or network command with its process group.
-fn kill(child: &mut Child) {
-    #[cfg(unix)]
-    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
-        // SAFETY: `kill` has no memory-safety preconditions. The group id is
-        // the pid of our own child, which has not been reaped yet (we only
-        // reap it below), so the group cannot belong to anyone else.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
+/// Kills a reading or network command with every process it started, then
+/// reaps it.
+///
+/// Only the thread that owns `child` calls this, before reaping it, so the
+/// process (and on Unix its group) cannot have been replaced by an
+/// unrelated one with the same id.
+fn kill(child: &mut Child, tree: &ProcessTree) {
+    tree.kill(child);
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// The processes started for one git command: git and every helper it runs
+/// (`ssh`, `git-remote-https`, credential helpers, hooks).
+///
+/// On Unix git leads its own process group ([`detach`]), so the group is
+/// killed. On Windows there are no process groups, and `git.exe` is often a
+/// launcher that starts the real git, so killing it alone would leave the
+/// clone running. The command is put into a job object right after it
+/// starts and the whole job is terminated; processes started by members of
+/// a job belong to it too, also after their parent exited. If the job
+/// cannot be set up, `taskkill /T /F` ends the process tree instead.
+#[cfg(unix)]
+struct ProcessTree;
+
+#[cfg(unix)]
+impl ProcessTree {
+    fn attach(_child: &Child) -> Self {
+        Self
+    }
+
+    fn kill(&self, child: &Child) {
+        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: `kill` has no memory-safety preconditions. The group
+            // id is the pid of our own child, which has not been reaped yet,
+            // so the group cannot belong to anyone else.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ProcessTree {
+    job: Option<windows_sys::Win32::Foundation::HANDLE>,
+}
+
+#[cfg(windows)]
+impl ProcessTree {
+    fn attach(child: &Child) -> Self {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        // SAFETY: plain Win32 calls. The job handle is owned by the result
+        // and closed in `Drop`; the process handle belongs to `child`, which
+        // outlives this call.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return Self { job: None };
+            }
+            if AssignProcessToJobObject(job, child.as_raw_handle() as _) == 0 {
+                CloseHandle(job);
+                return Self { job: None };
+            }
+            Self { job: Some(job) }
+        }
+    }
+
+    fn kill(&self, child: &Child) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        if let Some(job) = self.job {
+            // SAFETY: `job` is a valid job handle owned by `self`.
+            if unsafe { TerminateJobObject(job, 1) } != 0 {
+                return;
+            }
+        }
+        let system_root =
+            std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
+        let mut taskkill = Command::new(
+            PathBuf::from(system_root)
+                .join("System32")
+                .join("taskkill.exe"),
+        );
+        taskkill
+            .args(["/T", "/F", "/PID"])
+            .arg(child.id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        detach(&mut taskkill);
+        let _ = taskkill.status();
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        if let Some(job) = self.job.take() {
+            // SAFETY: `job` is a valid handle owned by `self`. Closing it
+            // does not end the processes in the job.
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(job);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct ProcessTree;
+
+#[cfg(not(any(unix, windows)))]
+impl ProcessTree {
+    fn attach(_child: &Child) -> Self {
+        Self
+    }
+
+    fn kill(&self, _child: &Child) {}
 }
 
 /// Stderr fragments (lowercase) that mean the remote refused our

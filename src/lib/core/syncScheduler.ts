@@ -19,6 +19,9 @@
  * - Pending autosaves are flushed before every commit and sync.
  * - A sync the backend deferred because of uncommitted changes is tried
  *   again (commit, then sync) after the commit delay, a few times at most.
+ * - With automatic syncing off, nothing is committed or synced on its own:
+ *   start and window focus only read the status, no timer is armed, and
+ *   "Sync now" commits and syncs once.
  *
  * Timers and git access are passed in, so the whole flow can be tested with
  * fakes. Nothing here awaits on an input path: `changed()`, `focus()` and
@@ -88,6 +91,8 @@ export interface SyncSnapshot {
   halted: boolean;
   /** The last sync was deferred: local changes are not committed and pushed yet. */
   pending: boolean;
+  /** Changes are committed and synced automatically; otherwise only on "Sync now". */
+  auto: boolean;
 }
 
 export interface SyncEvents {
@@ -105,6 +110,8 @@ export interface SyncSchedulerOptions {
   focusSyncAge?: number;
   backoffDelays?: readonly number[];
   pausedRetryDelays?: readonly number[];
+  /** Commit and sync automatically (default). Off: only "Sync now" does. */
+  auto?: boolean;
 }
 
 type RunKind = "status" | "commit" | "sync";
@@ -171,6 +178,7 @@ export class SyncScheduler {
     retryIn: null,
     halted: false,
     pending: false,
+    auto: true,
   };
 
   #running: Promise<void> | null = null;
@@ -194,6 +202,7 @@ export class SyncScheduler {
   #started = false;
   #suspended = false;
   #stopped = false;
+  #auto: boolean;
 
   constructor(options: SyncSchedulerOptions) {
     this.#io = options.io;
@@ -204,6 +213,8 @@ export class SyncScheduler {
     this.#focusSyncAge = options.focusSyncAge ?? FOCUS_SYNC_AGE_MS;
     this.#backoffDelays = options.backoffDelays ?? BACKOFF_DELAYS_MS;
     this.#pausedRetryDelays = options.pausedRetryDelays ?? PAUSED_RETRY_DELAYS_MS;
+    this.#auto = options.auto ?? true;
+    this.#snapshot = { ...this.#snapshot, auto: this.#auto };
   }
 
   get snapshot(): SyncSnapshot {
@@ -222,9 +233,30 @@ export class SyncScheduler {
     this.#request({ kind: "sync", trigger: "auto" });
   }
 
+  /**
+   * Turns automatic committing and syncing on or off. Turning it on commits
+   * and syncs what is pending; turning it off cancels every timer.
+   */
+  setAuto(on: boolean): void {
+    if (this.#stopped || on === this.#auto) return;
+    this.#auto = on;
+    if (on) {
+      this.#update({ auto: true });
+      if (this.#started) this.#request({ kind: "sync", trigger: "auto" });
+      return;
+    }
+    this.#clear("commit");
+    this.#clear("interval");
+    this.#clear("retry");
+    this.#clear("defer");
+    this.#failures = 0;
+    this.#deferrals = 0;
+    this.#update({ auto: false, retryIn: null });
+  }
+
   /** A file changed: commit once changes stop for a while. */
   changed(): void {
-    if (this.#stopped) return;
+    if (this.#stopped || !this.#auto) return;
     this.#clear("commit");
     this.#commitTimer = this.#timers.setTimeout(() => {
       this.#commitTimer = null;
@@ -319,8 +351,11 @@ export class SyncScheduler {
     else this.#retryTimer = null;
   }
 
-  #request(request: Request): void {
+  #request(input: Request): void {
     if (this.#stopped) return;
+    // Without automatic syncing only "Sync now" commits or syncs.
+    const request: Request =
+      this.#auto || input.trigger === "manual" ? input : { kind: "status", trigger: input.trigger };
     if (this.#running || this.#suspended) {
       this.#next = merge(this.#next, request);
       return;
@@ -439,7 +474,7 @@ export class SyncScheduler {
 
   #fail(outcome: { kind: GitErrorKind; message: string }, during: SyncProblem["during"]): void {
     const problem: SyncProblem = { kind: outcome.kind, message: outcome.message, during };
-    if (outcome.kind === "network" && during === "sync") {
+    if (outcome.kind === "network" && during === "sync" && this.#auto) {
       const index = Math.min(this.#failures, this.#backoffDelays.length - 1);
       const delay = this.#backoffDelays[index] ?? SYNC_INTERVAL_MS;
       this.#failures += 1;
@@ -468,6 +503,7 @@ export class SyncScheduler {
 
   /** Checks again soon whether the pause that kept changes from a commit is over. */
   #retryPausedCommit(): void {
+    if (!this.#auto) return;
     const index = Math.min(this.#pausedRetries, this.#pausedRetryDelays.length - 1);
     const delay = this.#pausedRetryDelays[index] ?? this.#commitDelay;
     this.#pausedRetries += 1;
@@ -481,7 +517,7 @@ export class SyncScheduler {
   /** Commits and syncs again soon, unless commits are stopped or this keeps happening. */
   #retryDeferred(): void {
     this.#clear("defer");
-    if (this.#commitHalted || this.#deferrals >= MAX_DEFERRED_RETRIES) return;
+    if (!this.#auto || this.#commitHalted || this.#deferrals >= MAX_DEFERRED_RETRIES) return;
     this.#deferrals += 1;
     this.#deferTimer = this.#timers.setTimeout(() => {
       this.#deferTimer = null;
@@ -491,7 +527,7 @@ export class SyncScheduler {
 
   #armInterval(): void {
     this.#clear("interval");
-    if (this.#stopped) return;
+    if (this.#stopped || !this.#auto) return;
     this.#intervalTimer = this.#timers.setTimeout(() => {
       this.#intervalTimer = null;
       this.#request({ kind: "sync", trigger: "auto" });

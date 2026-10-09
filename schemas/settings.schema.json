@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/carlosdlf/kaido-app/blob/main/schemas/settings.schema.json",
+  "title": "Kaido device settings",
+  "description": "settings.json in the app config directory. Settings of this device; never synced. Fields with invalid values fall back to their defaults when Kaido starts, and keep their current value when the file is changed while Kaido runs.",
+  "type": "object",
+  "properties": {
+    "version": {
+      "description": "Format version of this file.",
+      "type": "integer",
+      "const": 1
+    },
+    "workspace": {
+      "description": "Absolute path of the last opened workspace, reopened on start.",
+      "type": "string",
+      "minLength": 1
+    },
+    "recentWorkspaces": {
+      "description": "Recently opened workspaces, most recent first, shown on the start screen. Only the first 5 are used; extra entries are ignored.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "default": []
+    },
+    "editorFontSize": {
+      "description": "Text size of the note editor and the task views, in pixels.",
+      "type": "integer",
+      "minimum": 12,
+      "maximum": 20,
+      "default": 15
+    },
+    "autoSync": {
+      "description": "Commit and sync with git in the background. When false, only Sync now commits and syncs.",
+      "type": "boolean",
+      "default": true
+    },
+    "captureShortcut": {
+      "description": "Global shortcut that opens quick capture, as an accelerator such as \"CommandOrControl+Alt+Space\". null turns it off.",
+      "type": ["string", "null"],
+      "default": "CommandOrControl+Alt+Space"
+    },
+    "hideDone": {
+      "description": "Per workspace root, the task lists whose done tasks are hidden (workspace-relative paths; \"~/all-tasks\" for the All tasks view). Only the last 20 workspaces, and the last 200 lists of each, are used; extra entries are ignored.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "type": "string" }
+      },
+      "default": {}
+    },
+    "dismissedSetup": {
+      "description": "Workspace roots where the suggestion to add .gitattributes and .gitignore lines was dismissed. Only the last 50 are used; extra entries are ignored.",
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    }
+  },
+  "required": ["version"]
+}

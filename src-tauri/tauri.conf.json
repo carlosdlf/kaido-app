@@ -71,7 +71,11 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["deb", "appimage", "nsis", "msi", "app", "dmg"],
+    "category": "DeveloperTool",
+    "publisher": "Kaido contributors",
+    "shortDescription": "Notes and tasks for developers, stored as Markdown in your own git repo.",
+    "longDescription": "Kaido keeps notes and to-do lists organized by project as plain Markdown files in a folder you choose, and syncs them through your own git repository in the background. No account, no server: your editor, your git, your files.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

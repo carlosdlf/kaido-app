@@ -57,4 +57,27 @@ describe("MemoryCaptureBus", () => {
       taken,
     );
   });
+
+  it("changes the shortcut unless another app uses it", async () => {
+    const bus = new MemoryCaptureBus({ taken: ["Alt+X"] });
+    await expect(bus.host.setShortcut("Alt+K")).resolves.toEqual({
+      registered: true,
+      shortcut: "Alt+K",
+    });
+    await expect(bus.host.setShortcut("Alt+X")).resolves.toEqual({
+      registered: false,
+      shortcut: "Alt+X",
+      message: "Alt+X is already registered by another app",
+    });
+    await expect(bus.host.shortcutStatus()).resolves.toEqual({
+      registered: true,
+      shortcut: "Alt+K",
+    });
+    await expect(bus.host.setShortcut(null)).resolves.toEqual({
+      registered: false,
+      shortcut: null,
+    });
+    await expect(bus.host.shortcutStatus()).resolves.toEqual({ registered: false, shortcut: null });
+    expect(bus.changes).toEqual(["Alt+K", "Alt+X", null]);
+  });
 });

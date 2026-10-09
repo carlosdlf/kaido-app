@@ -38,8 +38,8 @@ Kaido is a small, fast desktop app for the notes and task lists you keep while y
 
 | | |
 |---|---|
-| ✅ Available | Open any folder as a workspace · projects and notes from your folder structure · Markdown editor with autosave · new notes (`Ctrl+N`) and projects (`Ctrl+Shift+N`) · rename and delete with undo · table editing · task lists with keyboard shortcuts, subtasks, detail and done tasks kept in place · notes linked from tasks · **All tasks** view across projects · picks up changes made by other editors · background git sync with both versions kept on conflicts · search with `Ctrl+K` · global quick-capture shortcut |
-| 🚧 Next | First-run setup, settings and installable releases |
+| ✅ Available | Open any folder as a workspace · projects and notes from your folder structure · Markdown editor with autosave · new notes (`Ctrl+N`) and projects (`Ctrl+Shift+N`) · rename and delete with undo · table editing · task lists with keyboard shortcuts, subtasks, detail and done tasks kept in place · notes linked from tasks · **All tasks** view across projects · picks up changes made by other editors · background git sync with both versions kept on conflicts · search with `Ctrl+K` · global quick-capture shortcut · start screen to open, create or clone a workspace · settings (`Ctrl+,`) |
+| 🚧 Next | First installable release |
 | 🗺️ Planned | Tags · links between notes and per-note history · due dates and reminders · a CLI · web and mobile apps |
 
 ## How it works
@@ -76,6 +76,18 @@ You can open any existing folder. Kaido reads it like this:
   ```
 
 Kaido picks up changes you make with other editors while it is running.
+
+## Install
+
+Download the installer for your system from the [releases page](https://github.com/carlosdlf/kaido-app/releases). You need `git` installed to sync; without it Kaido still works, but only on this device.
+
+The builds are not code-signed yet, so your system warns you the first time you open Kaido:
+
+- **macOS** (`.dmg`): drag Kaido to Applications. The first time, right-click (or Control-click) Kaido in Applications and choose **Open**, then **Open** again in the dialog. After that it opens normally.
+- **Windows** (`.exe` installer or `.msi`): if Microsoft Defender SmartScreen shows "Windows protected your PC", click **More info**, then **Run anyway**.
+- **Linux**: install the `.deb` package (Debian, Ubuntu and derivatives) with `sudo apt install ./Kaido_*.deb`, or make the `.AppImage` executable (`chmod +x Kaido_*.AppImage`) and run it.
+
+On first start, open a folder you already have, create a new workspace, or clone your notes repository from its URL. Settings are explained in [docs/configuration.md](docs/configuration.md).
 
 ## Building from source
 

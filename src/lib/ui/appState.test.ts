@@ -153,18 +153,35 @@ describe("AppState workspace picking", () => {
     });
     await app.pickWorkspace();
     expect(app.phase.kind).toBe("ready");
+    await app.settingsSaved();
     expect(JSON.parse(storage.settings ?? "")).toEqual({
       version: 1,
       workspace: ROOT,
+      recentWorkspaces: [ROOT],
       theme: "dark",
     });
   });
 
   it("does not rewrite settings that already point to the workspace", async () => {
-    const { storage, app } = setup();
+    const { storage, app } = setup({
+      settings: JSON.stringify({ version: 1, workspace: ROOT, recentWorkspaces: [ROOT, "/b"] }),
+    });
     const write = vi.spyOn(storage, "writeSettings");
     await app.start();
+    await app.settingsSaved();
     expect(write).not.toHaveBeenCalled();
+  });
+
+  it("adds the reopened workspace to the recent ones", async () => {
+    const { storage, app } = setup({
+      settings: JSON.stringify({ version: 1, workspace: ROOT, recentWorkspaces: ["/b", ROOT] }),
+    });
+    await app.start();
+    await app.settingsSaved();
+    expect(JSON.parse(storage.settings ?? "")).toMatchObject({
+      workspace: ROOT,
+      recentWorkspaces: [ROOT, "/b"],
+    });
   });
 
   it("never overwrites settings it could not parse, and says why", async () => {
@@ -187,9 +204,11 @@ describe("AppState workspace picking", () => {
       pick: ROOT,
     });
     await app.pickWorkspace();
+    await app.settingsSaved();
     expect(JSON.parse(storage.settings ?? "")).toEqual({
       version: 1,
       workspace: ROOT,
+      recentWorkspaces: [ROOT],
       theme: "dark",
     });
   });

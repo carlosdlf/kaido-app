@@ -31,6 +31,12 @@ pub enum AppError {
     TooLarge(String),
     #[error("{0}")]
     Conflict(String),
+    /// A folder that had to be empty (or missing) has files in it.
+    #[error("{0}")]
+    NotEmpty(String),
+    /// The user cancelled a long-running operation.
+    #[error("{0}")]
+    Cancelled(String),
     #[error("superseded by a newer request to open a workspace")]
     Superseded,
     #[error("{0}")]
@@ -69,6 +75,8 @@ impl AppError {
             AppError::PermissionDenied(_) => "PermissionDenied",
             AppError::TooLarge(_) => "TooLarge",
             AppError::Conflict(_) => "Conflict",
+            AppError::NotEmpty(_) => "NotEmpty",
+            AppError::Cancelled(_) => "Cancelled",
             AppError::Superseded => "Superseded",
             AppError::Io(_) => "Io",
             AppError::GitUnavailable(_) => "GitUnavailable",
@@ -151,6 +159,8 @@ mod tests {
             ),
             (AppError::TooLarge(String::new()), "TooLarge"),
             (AppError::Conflict(String::new()), "Conflict"),
+            (AppError::NotEmpty(String::new()), "NotEmpty"),
+            (AppError::Cancelled(String::new()), "Cancelled"),
             (AppError::Superseded, "Superseded"),
             (AppError::Io(String::new()), "Io"),
             (AppError::GitUnavailable(String::new()), "GitUnavailable"),

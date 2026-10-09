@@ -21,12 +21,17 @@ export interface WorkspaceConfig {
   ignore: string[];
 }
 
+/** Valibot schemas of the fields, shared with the JSON Schema parity test. */
+export const workspaceConfigSchemas = {
+  ignore: v.array(v.string()),
+};
+
 export const workspaceConfigFormat: ConfigFormat<WorkspaceConfig> = {
   name: WORKSPACE_CONFIG_PATH,
   version: WORKSPACE_CONFIG_VERSION,
   defaults: () => ({ version: WORKSPACE_CONFIG_VERSION, ignore: [] }),
   fields: {
-    ignore: field(v.array(v.string()), "a list of strings"),
+    ignore: field(workspaceConfigSchemas.ignore, "a list of strings"),
   },
 };
 

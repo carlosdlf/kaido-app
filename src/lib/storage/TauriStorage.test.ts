@@ -8,7 +8,8 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ onCloseRequested }) }));
 
-const { CHANGE_EVENT, TauriStorage, writeFileArgs } = await import("./TauriStorage");
+const { CHANGE_EVENT, SETTINGS_EVENT, TauriStorage, writeFileArgs } =
+  await import("./TauriStorage");
 
 const repoStatus = {
   state: "ready",
@@ -51,10 +52,89 @@ describe("TauriStorage", () => {
     expect(invoke).toHaveBeenCalledWith(command, commandArgs);
   });
 
+  it.each([
+    ["gitVersion", [], "git_version", undefined, { available: true, version: "2.43.0" }],
+    ["gitVersion", [], "git_version", undefined, { available: false, version: null }],
+    [
+      "scaffoldWorkspace",
+      ["/n"],
+      "scaffold_workspace",
+      { root: "/n" },
+      {
+        root: "/n",
+        created: ["inbox/tasks.md"],
+        updated: [],
+        git: "failed",
+        commit: null,
+        gitError: "git init failed",
+      },
+    ],
+    ["workspaceSetupStatus", [], "workspace_setup_status", undefined, { missing: [".gitignore"] }],
+    [
+      "ensureWorkspaceFiles",
+      [],
+      "ensure_workspace_files",
+      undefined,
+      { created: [], updated: [".gitignore"] },
+    ],
+    [
+      "cloneRepository",
+      ["https://h/r.git", "/p", "r"],
+      "git_clone",
+      { url: "https://h/r.git", parent: "/p", name: "r" },
+      { root: "/p/r" },
+    ],
+  ] as const)("%s calls %s", async (method, args, command, commandArgs, response) => {
+    invoke.mockResolvedValue(response);
+    const fn = storage[method] as (...input: readonly string[]) => Promise<unknown>;
+    await expect(fn.apply(storage, [...args])).resolves.toEqual(response);
+    expect(invoke).toHaveBeenCalledWith(command, commandArgs);
+  });
+
+  it("rejects unexpected onboarding responses", async () => {
+    invoke.mockResolvedValue({ root: "/n", created: [], updated: [], git: "maybe" });
+    await expect(storage.scaffoldWorkspace("/n")).rejects.toMatchObject({ kind: "Io" });
+    invoke.mockResolvedValue({ available: "yes" });
+    await expect(storage.gitVersion()).rejects.toMatchObject({ kind: "Io" });
+    invoke.mockResolvedValue({ created: "x" });
+    await expect(storage.ensureWorkspaceFiles()).rejects.toMatchObject({ kind: "Io" });
+    invoke.mockResolvedValue({});
+    await expect(storage.workspaceSetupStatus()).rejects.toMatchObject({ kind: "Io" });
+  });
+
+  it("cancels a clone and reports clone errors with their message", async () => {
+    invoke.mockResolvedValue(null);
+    await expect(storage.cancelClone()).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("git_clone_cancel", undefined);
+    invoke.mockRejectedValue({ kind: "GitAuth", message: "git clone failed: denied" });
+    await expect(storage.cloneRepository("u", "/p", "r")).rejects.toMatchObject({
+      kind: "GitAuth",
+      message: "git clone failed: denied",
+    });
+  });
+
+  it("forwards settings changes", async () => {
+    const unlisten = vi.fn();
+    listen.mockResolvedValue(unlisten);
+    const listener = vi.fn();
+    const stop = await storage.watchSettings(listener);
+    expect(listen).toHaveBeenCalledWith(SETTINGS_EVENT, expect.any(Function));
+    const handler = listen.mock.calls[0]?.[1] as (event: { payload: unknown }) => void;
+    handler({ payload: null });
+    expect(listener).toHaveBeenCalledTimes(1);
+    stop();
+    expect(unlisten).toHaveBeenCalled();
+    listen.mockRejectedValue(new Error("no event system"));
+    await expect(storage.watchSettings(listener)).rejects.toMatchObject({ kind: "Io" });
+  });
+
   it("writes settings", async () => {
     invoke.mockResolvedValue(null);
     await expect(storage.writeSettings("{}")).resolves.toBeUndefined();
     expect(invoke).toHaveBeenCalledWith("write_settings", { contents: "{}" });
+    // A file changed since it was last read is refused, not overwritten.
+    invoke.mockRejectedValueOnce({ kind: "Conflict", message: "settings.json changed" });
+    await expect(storage.writeSettings("{}")).rejects.toMatchObject({ kind: "Conflict" });
   });
 
   it("deletes files with the expected hash", async () => {

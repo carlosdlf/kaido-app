@@ -10,6 +10,8 @@
   import CloudOff from "@lucide/svelte/icons/cloud-off";
   import HardDrive from "@lucide/svelte/icons/hard-drive";
   import RefreshCw from "@lucide/svelte/icons/refresh-cw";
+  import RefreshCwOff from "@lucide/svelte/icons/refresh-cw-off";
+  import Settings from "@lucide/svelte/icons/settings";
   import TriangleAlert from "@lucide/svelte/icons/triangle-alert";
   import CloudUpload from "@lucide/svelte/icons/cloud-upload";
   import { syncAnnouncement, type SyncIcon, type SyncView } from "$lib/core/syncStatus";
@@ -46,6 +48,10 @@
     onsearch?: () => void;
     /** The search shortcut, for assistive technology and as a visible hint. */
     searchShortcut?: { aria: string; hint: string };
+    /** Opens the settings. */
+    onsettings?: () => void;
+    /** The settings shortcut, for assistive technology and the tooltip. */
+    settingsShortcut?: { aria: string; hint: string };
   }
 
   let {
@@ -65,6 +71,8 @@
     syncShortcut,
     onsearch,
     searchShortcut = { aria: "Control+K", hint: "^K" },
+    onsettings,
+    settingsShortcut,
   }: Props = $props();
 
   const SYNC_ICONS = {
@@ -77,6 +85,7 @@
     paused: CirclePause,
     failed: TriangleAlert,
     unavailable: CircleSlash,
+    manual: RefreshCwOff,
   } satisfies Record<SyncIcon, unknown>;
 
   const SyncGlyph = $derived(sync ? SYNC_ICONS[sync.icon] : null);
@@ -326,6 +335,19 @@
       </details>
     {/if}
     <div class="status">
+      {#if onsettings}
+        <button
+          type="button"
+          class="settings"
+          aria-label="Settings"
+          aria-haspopup="dialog"
+          aria-keyshortcuts={settingsShortcut?.aria}
+          title={settingsShortcut ? `Settings (${settingsShortcut.hint})` : "Settings"}
+          onclick={onsettings}
+        >
+          <Settings aria-hidden="true" />
+        </button>
+      {/if}
       <span class="workspace" title={workspaceName}>~/{workspaceName}</span>
       {#if sync && SyncGlyph}
         <button
@@ -513,7 +535,21 @@
     gap: var(--space-8);
   }
 
+  .settings {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    padding: 0 var(--space-2);
+    border-radius: var(--radius-sm);
+    color: var(--color-muted);
+  }
+
+  .settings:hover {
+    color: var(--color-text);
+  }
+
   .workspace {
+    flex: 1;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;

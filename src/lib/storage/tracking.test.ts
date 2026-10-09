@@ -57,5 +57,23 @@ describe("trackWrites", () => {
     await expect(storage.gitStatus()).resolves.toMatchObject({ state: "ready" });
     await expect(storage.gitCommit("x")).resolves.toEqual({ commit: null, paths: [] });
     await expect(storage.gitSync()).rejects.toMatchObject({ kind: "GitFailed" });
+    const settingsListener = vi.fn();
+    await storage.watchSettings(settingsListener);
+    inner.setExternalSettings("{}");
+    expect(settingsListener).toHaveBeenCalled();
+    await expect(storage.gitVersion()).resolves.toEqual({ available: true, version: "2.43.0" });
+    await expect(storage.workspaceSetupStatus()).resolves.toEqual({
+      missing: [".gitattributes", ".gitignore"],
+    });
+    await expect(storage.ensureWorkspaceFiles()).resolves.toEqual({
+      created: [".gitattributes", ".gitignore"],
+      updated: [],
+    });
+    await expect(storage.scaffoldWorkspace("/new")).resolves.toMatchObject({ root: "/new" });
+    inner.remotes.set("https://h/r.git", { "a.md": "a" });
+    await expect(storage.cloneRepository("https://h/r.git", "/p", "r")).resolves.toEqual({
+      root: "/p/r",
+    });
+    await expect(storage.cancelClone()).resolves.toBeUndefined();
   });
 });

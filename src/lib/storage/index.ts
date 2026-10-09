@@ -19,6 +19,7 @@ export {
   type CaptureResult,
   type CaptureSubmit,
   type MemoryCaptureBusOptions,
+  type ShortcutChange,
   type ShortcutStatus,
 } from "./capture";
 export type * from "./types";

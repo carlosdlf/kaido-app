@@ -17,7 +17,18 @@ import {
   type FileEntry,
 } from "$lib/core/workspace";
 import type { CommitResult, GitStatus, SyncResult } from "$lib/core/git";
+import { joinPath } from "$lib/core/workspaceLocation";
+import { WORKSPACE_CONFIG_PATH } from "$lib/core/workspace";
 import { contentHash } from "./contentHash";
+import {
+  appendLines,
+  GITATTRIBUTES,
+  GITIGNORE,
+  hasUnionLine,
+  IGNORE_LINES,
+  missingIgnoreLines,
+  UNION_LINES,
+} from "./setupFiles";
 import { MemoryGit, type MemoryGitOptions } from "./MemoryGit";
 import { StorageError } from "./errors";
 import { checkNotePath, checkRenamePaths, checkStoragePath, MAX_FILE_BYTES } from "./paths";
@@ -25,7 +36,11 @@ import type {
   ChangeListener,
   CloseHandler,
   FileContents,
+  GitVersion,
   OpenedWorkspace,
+  ScaffoldResult,
+  SetupFiles,
+  SetupStatus,
   Storage,
   Unsubscribe,
   WriteOptions,
@@ -51,6 +66,8 @@ export interface MemoryStorageOptions {
   echoWrites?: boolean;
   /** The fake git repository; by default the folder is not a repository. */
   git?: MemoryGitOptions;
+  /** Repositories `cloneRepository` can clone, by URL, with their files. */
+  remotes?: Record<string, Record<string, string>>;
 }
 
 const encoder = new TextEncoder();
@@ -74,6 +91,19 @@ export class MemoryStorage implements Storage {
   /** Notes deleted with `deleteFile`, oldest first, like the system trash. */
   readonly trash: { path: string; contents: string }[] = [];
   readonly #listeners = new Set<ChangeListener>();
+  readonly #settingsListeners = new Set<() => void>();
+  /**
+   * The settings text last read or written through this storage, which is
+   * the only version `writeSettings` may replace; `undefined` before any.
+   */
+  #knownSettings: string | null | undefined = undefined;
+  /** Repositories that can be cloned, by URL. */
+  readonly remotes: Map<string, Record<string, string>>;
+  /** While set, clones wait until `releaseClone` or `cancelClone`. */
+  holdClone = false;
+  /** Fails the next clone with this error. */
+  cloneError: StorageError | null = null;
+  #heldClone: { resolve: () => void; reject: (error: StorageError) => void } | null = null;
   #closeHandler: CloseHandler | null = null;
   readonly #now: () => number;
   readonly #echoWrites: boolean;
@@ -85,6 +115,7 @@ export class MemoryStorage implements Storage {
     this.pick = options.pick ?? null;
     this.#now = options.now ?? Date.now;
     this.#echoWrites = options.echoWrites ?? true;
+    this.remotes = new Map(Object.entries(options.remotes ?? {}));
     this.git = new MemoryGit(
       {
         root: () => {
@@ -229,11 +260,124 @@ export class MemoryStorage implements Storage {
   }
 
   async readSettings(): Promise<string | null> {
+    this.#knownSettings = this.settings;
     return this.settings;
   }
 
+  /**
+   * Compare-and-swap like the desktop backend: refuses with `Conflict`,
+   * writing nothing, when the file changed since it was last read or
+   * written, or exists and was never read.
+   */
   async writeSettings(contents: string): Promise<void> {
+    const known = this.#knownSettings === undefined ? null : this.#knownSettings;
+    if (known !== this.settings) {
+      throw new StorageError(
+        "Conflict",
+        "settings.json changed since it was last read; read it again and retry",
+      );
+    }
     this.settings = contents;
+    this.#knownSettings = contents;
+  }
+
+  async watchSettings(listener: () => void): Promise<Unsubscribe> {
+    this.#settingsListeners.add(listener);
+    return () => {
+      this.#settingsListeners.delete(listener);
+    };
+  }
+
+  /** Changes the settings file behind the app's back, as another editor would. */
+  setExternalSettings(contents: string | null): void {
+    this.settings = contents;
+    for (const listener of [...this.#settingsListeners]) listener();
+  }
+
+  async gitVersion(): Promise<GitVersion> {
+    return this.git.unavailable === "git-missing"
+      ? { available: false, version: null }
+      : { available: true, version: this.git.gitVersion };
+  }
+
+  async scaffoldWorkspace(root: string): Promise<ScaffoldResult> {
+    const existing = this.folders.get(root);
+    if (existing && existing.size > 0) {
+      throw new StorageError("NotEmpty", "The folder is not empty. Choose an empty folder.");
+    }
+    const files: Record<string, string> = {
+      "inbox/tasks.md": "",
+      [WORKSPACE_CONFIG_PATH]: '{ "version": 1, "ignore": [] }\n',
+      [GITATTRIBUTES]: appendLines(null, UNION_LINES),
+      [GITIGNORE]: appendLines(null, IGNORE_LINES),
+    };
+    this.addFolder(root, files);
+    const git = this.git.unavailable === "git-missing" ? "git-missing" : "initialized";
+    return {
+      root,
+      created: Object.keys(files).sort(),
+      updated: [],
+      git,
+      commit: git === "initialized" ? "0000000" : null,
+      gitError: null,
+    };
+  }
+
+  async workspaceSetupStatus(): Promise<SetupStatus> {
+    const files = this.#files();
+    const missing: string[] = [];
+    if (!hasUnionLine(files.get(GITATTRIBUTES)?.contents ?? null)) missing.push(GITATTRIBUTES);
+    if (missingIgnoreLines(files.get(GITIGNORE)?.contents ?? null).length > 0) {
+      missing.push(GITIGNORE);
+    }
+    return { missing };
+  }
+
+  async ensureWorkspaceFiles(): Promise<SetupFiles> {
+    const files = this.#files();
+    const result: SetupFiles = { created: [], updated: [] };
+    const add = (path: string, lines: readonly string[]) => {
+      if (lines.length === 0) return;
+      const current = files.get(path)?.contents ?? null;
+      files.set(path, { contents: appendLines(current, lines), modified: this.#now() });
+      (current === null ? result.created : result.updated).push(path);
+    };
+    const attributes = files.get(GITATTRIBUTES)?.contents ?? null;
+    add(GITATTRIBUTES, hasUnionLine(attributes) ? [] : UNION_LINES);
+    add(GITIGNORE, missingIgnoreLines(files.get(GITIGNORE)?.contents ?? null));
+    return result;
+  }
+
+  async cloneRepository(url: string, parent: string, name: string): Promise<OpenedWorkspace> {
+    const root = joinPath(parent, name);
+    if (this.holdClone) {
+      await new Promise<void>((resolve, reject) => (this.#heldClone = { resolve, reject }));
+    }
+    const error = this.cloneError;
+    this.cloneError = null;
+    if (error) throw error;
+    if (this.folders.has(root)) {
+      throw new StorageError("Conflict", `${name} already exists in the chosen folder.`);
+    }
+    const files = this.remotes.get(url);
+    if (!files) {
+      throw new StorageError("GitFailed", `git clone failed: repository '${url}' does not exist`);
+    }
+    this.addFolder(root, files);
+    return { root };
+  }
+
+  /** Lets a clone held by `holdClone` finish. */
+  releaseClone(): void {
+    this.holdClone = false;
+    this.#heldClone?.resolve();
+    this.#heldClone = null;
+  }
+
+  async cancelClone(): Promise<void> {
+    this.holdClone = false;
+    this.#heldClone?.reject(new StorageError("Cancelled", "Cloning was cancelled."));
+    this.#heldClone = null;
   }
 
   gitStatus(): Promise<GitStatus> {

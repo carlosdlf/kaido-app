@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { undo } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
 import { describe, expect, it, vi } from "vitest";
-import { MemoryStorage, StorageError } from "$lib/storage";
+import { MemoryStorage, StorageError, type MemoryGitOptions } from "$lib/storage";
 import { AppState } from "./appState.svelte";
 import AppShell from "./AppShell.svelte";
 
@@ -38,10 +38,16 @@ const files: Record<string, string> = {
 };
 
 function setup(
-  options: { settings?: string | null; pick?: string | null; files?: Record<string, string> } = {},
+  options: {
+    settings?: string | null;
+    pick?: string | null;
+    files?: Record<string, string>;
+    git?: MemoryGitOptions;
+  } = {},
 ) {
   const storage = new MemoryStorage({
     folders: { [ROOT]: { ...(options.files ?? files) } },
+    ...(options.git ? { git: options.git } : {}),
     settings:
       options.settings === undefined
         ? JSON.stringify({ version: 1, workspace: ROOT })
@@ -805,6 +811,7 @@ describe("AppShell search palette", () => {
       "Sync now",
       "Hide or show done tasks",
       "Switch list / text",
+      "Settings",
     ]);
     await user.type(combobox(), "hide");
     await user.keyboard("{Enter}");
@@ -837,9 +844,202 @@ describe("AppShell search palette", () => {
     await user.keyboard("{Control>}k{/Control}");
     await user.type(combobox(), ">");
     const labels = screen.getAllByRole("option").map((option) => option.textContent?.trim());
-    expect(labels).toEqual(["New note", "New project", "Sync now"]);
+    expect(labels).toEqual(["New note", "New project", "Sync now", "Settings"]);
     await user.type(combobox(), "sync");
     await user.keyboard("{Enter}");
     expect(syncNow).toHaveBeenCalled();
+  });
+});
+
+describe("AppShell settings", () => {
+  const settingsDialog = () => screen.getByRole("dialog", { name: "Settings" });
+
+  it("opens with Ctrl+, from the editor, the gear and the palette", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready();
+    app.selectItem("inbox/reading-list.md");
+    await app.settled();
+    textbox().focus();
+    await user.keyboard("{Control>},{/Control}");
+    expect(settingsDialog()).toBeInTheDocument();
+    // Global shortcuts wait while the dialog is open.
+    await user.keyboard("{Control>}k{/Control}");
+    expect(screen.queryByRole("combobox")).toBeNull();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(textbox()).toHaveFocus();
+
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    expect(settingsDialog()).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Close settings" }));
+
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(screen.getByRole("combobox"), ">settings");
+    await user.keyboard("{Enter}");
+    expect(settingsDialog()).toBeInTheDocument();
+  });
+
+  it("closes with Escape after stepping the font size to the end of the range", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready();
+    app.setEditorFontSize(19);
+    await user.keyboard("{Control>},{/Control}");
+    const larger = screen.getByRole("button", { name: "Larger text" });
+    larger.focus();
+    await user.keyboard("{Enter}");
+    expect(app.settings.editorFontSize).toBe(20);
+    expect(larger).toHaveFocus();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("gives focus back to what had it before the palette opened Settings", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready();
+    app.selectItem("inbox/reading-list.md");
+    await app.settled();
+    const item = list().getByRole("button", { name: /reading-list/ });
+    item.focus();
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(screen.getByRole("combobox"), ">settings");
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(item).toHaveFocus();
+  });
+
+  it("gives focus back to what had it before the palette when Ctrl+, replaces it", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready();
+    app.selectItem("inbox/reading-list.md");
+    await app.settled();
+    const item = list().getByRole("button", { name: /reading-list/ });
+    item.focus();
+    await user.keyboard("{Control>}k{/Control}");
+    await user.keyboard("{Control>},{/Control}");
+    expect(screen.queryByRole("combobox")).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(item).toHaveFocus();
+  });
+
+  it("applies the font size to the editor and task views", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready();
+    expect(document.documentElement.style.getPropertyValue("--font-size-editor")).toBe("15px");
+    await user.keyboard("{Control>},{/Control}");
+    await user.click(screen.getByRole("button", { name: "Larger text" }));
+    expect(app.settings.editorFontSize).toBe(16);
+    await waitFor(() =>
+      expect(document.documentElement.style.getPropertyValue("--font-size-editor")).toBe("16px"),
+    );
+  });
+
+  it("turns auto-sync off and shows it in the sidebar", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready({ git: { unavailable: null, upstream: "origin/main" } });
+    await app.syncIdle();
+    await user.keyboard("{Control>},{/Control}");
+    await user.click(screen.getByRole("switch", { name: "Auto-sync" }));
+    await user.keyboard("{Escape}");
+    expect(
+      await screen.findByRole("button", { name: /Sync now, auto-sync off/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("switches to the start screen with the recent workspaces and back", async () => {
+    const user = userEvent.setup();
+    await ready();
+    await user.keyboard("{Control>},{/Control}");
+    await user.click(screen.getByRole("button", { name: "Switch…" }));
+    expect(screen.getByRole("heading", { name: "Switch workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Recent workspaces" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "← back to notes" }));
+    expect(nav().getByRole("button", { name: /inbox/ })).toBeInTheDocument();
+  });
+
+  it("opens a recent workspace from the start screen", async () => {
+    const user = userEvent.setup();
+    const { app, storage } = await ready();
+    storage.addFolder("/home/me/other", { "inbox/tasks.md": "- [ ] other\n" });
+    await app.openWorkspace("/home/me/other");
+    await app.settled();
+    await user.keyboard("{Control>},{/Control}");
+    await user.click(screen.getByRole("button", { name: "Switch…" }));
+    await user.click(screen.getByRole("button", { name: /^notes/ }));
+    await app.settled();
+    expect(app.phase).toEqual({ kind: "ready", root: ROOT });
+    expect(nav().getByRole("button", { name: /inbox/ })).toBeInTheDocument();
+  });
+
+  it("offers to set up the folder and remembers Not now", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready();
+    const banner = await screen.findByRole("group", { name: "Set up this folder for Kaido?" });
+    expect(banner).toHaveAccessibleDescription(
+      "Adds .gitattributes and .gitignore lines so task lists merge cleanly.",
+    );
+    await user.click(within(banner).getByRole("button", { name: "Not now" }));
+    expect(screen.queryByRole("group", { name: "Set up this folder for Kaido?" })).toBeNull();
+    expect(app.deviceSettings.dismissedSetup).toEqual([ROOT]);
+  });
+
+  it("sets up the folder from the banner", async () => {
+    const user = userEvent.setup();
+    const { storage } = await ready();
+    const banner = await screen.findByRole("group", { name: "Set up this folder for Kaido?" });
+    await user.click(within(banner).getByRole("button", { name: "Set up" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("group", { name: "Set up this folder for Kaido?" })).toBeNull(),
+    );
+    expect(storage.folders.get(ROOT)?.has(".gitattributes")).toBe(true);
+  });
+
+  it("gives focus back when the banner goes away after Not now", async () => {
+    const user = userEvent.setup();
+    await ready();
+    const banner = await screen.findByRole("group", { name: "Set up this folder for Kaido?" });
+    const item = list().getByRole("button", { name: /reading-list/ });
+    item.focus();
+    within(banner).getByRole("button", { name: "Not now" }).focus();
+    await user.keyboard("{Enter}");
+    await waitFor(() =>
+      expect(screen.queryByRole("group", { name: "Set up this folder for Kaido?" })).toBeNull(),
+    );
+    expect(item).toHaveFocus();
+  });
+
+  it("moves focus to the list when the banner goes away after Set up", async () => {
+    const user = userEvent.setup();
+    await ready();
+    const banner = await screen.findByRole("group", { name: "Set up this folder for Kaido?" });
+    const setUp = within(banner).getByRole("button", { name: "Set up" });
+    (document.activeElement as HTMLElement | null)?.blur();
+    setUp.focus();
+    await user.keyboard("{Enter}");
+    await waitFor(() =>
+      expect(screen.queryByRole("group", { name: "Set up this folder for Kaido?" })).toBeNull(),
+    );
+    const region = screen.getByRole("region", { name: (name) => name !== "Notifications" });
+    await waitFor(() => expect(region.contains(document.activeElement)).toBe(true));
+  });
+
+  it("leaves focus alone when the banner goes away while focus is elsewhere", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready();
+    await screen.findByRole("group", { name: "Set up this folder for Kaido?" });
+    await user.keyboard("{Control>},{/Control}");
+    await user.click(screen.getByRole("button", { name: "Set up git files" }));
+    await waitFor(() => expect(app.setupBanner).toBe(false));
+    expect(screen.getByRole("dialog", { name: "Settings" }).contains(document.activeElement)).toBe(
+      true,
+    );
+  });
+
+  it("shows the git line on the start screen", async () => {
+    const { app } = setup({ settings: null });
+    await app.start();
+    expect(await screen.findByText("git 2.43.0 found")).toBeInTheDocument();
   });
 });

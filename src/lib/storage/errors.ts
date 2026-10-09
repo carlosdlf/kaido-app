@@ -11,6 +11,8 @@ export const STORAGE_ERROR_KINDS = [
   "Superseded",
   "PermissionDenied",
   "Conflict",
+  "NotEmpty",
+  "Cancelled",
   "Io",
   "GitUnavailable",
   "GitPaused",
@@ -37,12 +39,16 @@ const SerializedError = v.object({
   kind: v.picklist(STORAGE_ERROR_KINDS),
   message: v.string(),
 });
+/** An error of a kind this version does not know still carries a readable message. */
+const UnknownKindError = v.object({ kind: v.string(), message: v.string() });
 
 /** Normalizes anything thrown by a storage backend into a `StorageError`. */
 export function toStorageError(error: unknown): StorageError {
   if (error instanceof StorageError) return error;
   const parsed = v.safeParse(SerializedError, error);
   if (parsed.success) return new StorageError(parsed.output.kind, parsed.output.message);
+  const unknownKind = v.safeParse(UnknownKindError, error);
+  if (unknownKind.success) return new StorageError("Io", unknownKind.output.message);
   if (error instanceof Error) return new StorageError("Io", error.message);
   return new StorageError("Io", typeof error === "string" ? error : "Unknown storage error");
 }

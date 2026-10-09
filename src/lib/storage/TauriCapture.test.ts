@@ -134,5 +134,30 @@ describe("TauriCaptureHost", () => {
     await expect(host.shortcutStatus()).rejects.toMatchObject({ kind: "Io" });
     invoke.mockRejectedValue({ kind: "Io", message: "unknown command" });
     await expect(host.shortcutStatus()).rejects.toMatchObject({ kind: "Io" });
+    invoke.mockResolvedValue({ registered: false, shortcut: null });
+    await expect(host.shortcutStatus()).resolves.toEqual({ registered: false, shortcut: null });
+  });
+
+  it("changes the shortcut", async () => {
+    invoke.mockResolvedValue({ registered: true, shortcut: "Alt+K" });
+    await expect(host.setShortcut("Alt+K")).resolves.toEqual({
+      registered: true,
+      shortcut: "Alt+K",
+    });
+    expect(invoke).toHaveBeenCalledWith("set_capture_shortcut", { accelerator: "Alt+K" });
+    invoke.mockResolvedValue({ registered: false, shortcut: null, message: null });
+    await expect(host.setShortcut(null)).resolves.toEqual({ registered: false, shortcut: null });
+    expect(invoke).toHaveBeenLastCalledWith("set_capture_shortcut", { accelerator: null });
+    invoke.mockResolvedValue({ registered: true, shortcut: "Alt+J", message: "in use" });
+    await expect(host.setShortcut("Alt+K")).resolves.toEqual({
+      registered: true,
+      shortcut: "Alt+J",
+      message: "in use",
+    });
+    invoke.mockResolvedValue({ registered: true });
+    await expect(host.setShortcut("Alt+K")).rejects.toMatchObject({
+      kind: "Io",
+      message: "Unexpected response from set_capture_shortcut.",
+    });
   });
 });

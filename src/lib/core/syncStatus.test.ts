@@ -42,6 +42,7 @@ function snapshot(patch: Partial<SyncSnapshot> = {}): SyncSnapshot {
     retryIn: null,
     halted: false,
     pending: false,
+    auto: true,
     ...patch,
   };
 }
@@ -58,6 +59,14 @@ describe("describeSync", () => {
     ["synced", {}, "synced · 2m ago", "synced", "ok"],
     ["synced just now", { lastSync: NOW - 5_000 }, "synced · just now", "synced", "ok"],
     ["not synced yet", { lastSync: null }, "not synced yet", "synced", "muted"],
+    ["auto-sync off", { auto: false }, "auto-sync off", "manual", "muted"],
+    [
+      "auto-sync off with changes pending",
+      { auto: false, pending: true },
+      "auto-sync off",
+      "manual",
+      "muted",
+    ],
     ["checking", { status: null }, "checking git…", "checking", "muted"],
     ["syncing", { activity: "syncing" }, "syncing…", "syncing", "busy"],
     [

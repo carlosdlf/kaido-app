@@ -25,12 +25,19 @@ describe("toStorageError", () => {
     "GitNetwork",
     "GitAuth",
     "GitFailed",
+    "NotEmpty",
+    "Cancelled",
   ])("knows the %s kind", (kind) => {
     expect(toStorageError({ kind, message: "x" }).kind).toBe(kind);
   });
 
   it("treats unknown kinds and other values as I/O errors", () => {
     expect(toStorageError({ kind: "Weird", message: "x" }).kind).toBe("Io");
+    // A kind added to the backend later keeps its message.
+    expect(toStorageError({ kind: "Unheard", message: "Something new." })).toMatchObject({
+      kind: "Io",
+      message: "Something new.",
+    });
     expect(toStorageError(new Error("boom"))).toMatchObject({ kind: "Io", message: "boom" });
     expect(toStorageError("plain text")).toMatchObject({ kind: "Io", message: "plain text" });
     expect(toStorageError(42)).toMatchObject({ kind: "Io", message: "Unknown storage error" });

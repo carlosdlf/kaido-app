@@ -38,6 +38,12 @@
  * own writes and changes reported by the watcher) and syncs with the
  * upstream in the background. It stops when another workspace opens or the
  * app closes, after pending saves are written; no sync starts while closing.
+ *
+ * Device settings are read on start and saved in the background whenever
+ * the app changes one, as a patch of the changed field on top of the file
+ * as last read; changes made to the file by another program are read again
+ * and applied. New workspaces are created or cloned through
+ * storage before they are opened like any other folder.
  */
 
 import {
@@ -103,7 +109,25 @@ import {
   type Workspace,
 } from "$lib/core/workspace";
 import type { ConfigWarning, ParseResult } from "$lib/config/parse";
-import { parseSettings, serializeSettings, type DeviceSettings } from "$lib/config/settings";
+import {
+  ALL_TASKS_KEY,
+  EDITOR_FONT_SIZE_MAX,
+  EDITOR_FONT_SIZE_MIN,
+  effectiveSettings,
+  hideDoneOf,
+  isOpenedWorkspace,
+  parseSettings,
+  reloadSettings,
+  serializeSettings,
+  withDismissedSetup,
+  withHideDone,
+  withOpenedWorkspace,
+  withoutRecentWorkspace,
+  type DeviceSettings,
+  type EffectiveSettings,
+} from "$lib/config/settings";
+import { sameAccelerator } from "$lib/core/accelerator";
+import { folderNameProblem, joinPath } from "$lib/core/workspaceLocation";
 import { parseWorkspaceConfig, type WorkspaceConfig } from "$lib/config/workspaceConfig";
 import {
   isStorageError,
@@ -114,6 +138,10 @@ import {
   type CaptureKind,
   type CaptureProjects,
   type FileContents,
+  type GitVersion,
+  type ScaffoldResult,
+  type ShortcutChange,
+  type ShortcutStatus,
   type Storage,
   type Unsubscribe,
   type WrittenFile,
@@ -417,11 +445,79 @@ async function gitOutcome<T>(work: () => Promise<T>): Promise<GitOutcome<T>> {
   }
 }
 
+/** Whether a shortcut change registered `wanted` (or turned the shortcut off for `null`). */
+function shortcutApplied(change: ShortcutChange, wanted: string | null): boolean {
+  if (wanted === null) return !change.registered;
+  return change.registered && sameAccelerator(change.shortcut, wanted);
+}
+
+function toStatus(change: ShortcutChange): ShortcutStatus {
+  return { registered: change.registered, shortcut: change.shortcut };
+}
+
+function withPath(paths: ReadonlySet<string>, path: string): ReadonlySet<string> {
+  return new Set([...paths, path]);
+}
+
+function withoutPath(paths: ReadonlySet<string>, path: string): ReadonlySet<string> {
+  return new Set([...paths].filter((item) => item !== path));
+}
+
 /** Actions that are refused once while edits cannot be saved. */
 type UnsafeAction = "close" | "switch";
 
 const SETTINGS_NOT_SAVED =
   "settings.json was left unchanged, so this workspace will not be reopened next time. Fix or remove the file to let Kaido save it.";
+
+export const SETTINGS_CHANGES_NOT_SAVED =
+  "settings.json was left unchanged, so changed settings are not saved. Fix or remove the file to let Kaido save it.";
+
+export const SETTINGS_INVALID =
+  "Some settings could not be read; defaults are used for them. See the settings warnings.";
+
+export const SETTINGS_CHANGED_INVALID =
+  "Some changed settings could not be read; their current values are kept. See the settings warnings.";
+
+export const SETTINGS_KEEP_CHANGING = "Could not save settings: settings.json keeps changing";
+
+/** Writes retried after settings.json changed since it was last read. */
+export const SETTINGS_WRITE_RETRIES = 3;
+
+/** A change the app makes to the device settings, applied field by field. */
+type SettingsPatch = (settings: DeviceSettings) => DeviceSettings;
+
+/** Adds warnings whose message is not there yet. */
+function withWarnings(warnings: ConfigWarning[], added: ConfigWarning[]): ConfigWarning[] {
+  const messages = new Set(warnings.map((warning) => warning.message));
+  return [...warnings, ...added.filter((warning) => !messages.has(warning.message))];
+}
+
+export const SHORTCUT_IN_USE = "That shortcut is in use by another app";
+export const CAPTURE_UNAVAILABLE = "Quick capture is not available in this window.";
+
+export function setupDoneMessage(paths: readonly string[]): string {
+  return paths.length === 0 ? "Nothing to set up" : `Set up ${paths.join(" and ")}`;
+}
+
+export function setupFailedMessage(message: string): string {
+  return `The setup files could not be updated: ${message}`;
+}
+
+export const CLONE_CANCELLED = "Cloning was cancelled.";
+
+export function gitSetupFailedMessage(message: string): string {
+  return `The workspace was created, but git could not be set up: ${message}`;
+}
+export const ENTER_URL = "Enter the URL of a git repository.";
+export const CHOOSE_FOLDER = "Choose a folder for it first.";
+
+/** The outcome of the folder picker, for forms that show errors next to it. */
+export type PickedFolder =
+  { kind: "picked"; path: string } | { kind: "cancelled" } | { kind: "failed"; message: string };
+
+/** Creating or cloning a workspace: opened (or being opened), refused with a reason, or cancelled. */
+export type NewWorkspaceOutcome =
+  { kind: "opened" } | { kind: "invalid"; message: string } | { kind: "cancelled" };
 
 export class AppState {
   phase: Phase = $state({ kind: "starting" });
@@ -458,6 +554,25 @@ export class AppState {
   editorReveal: EditorRevealRequest | null = $state.raw(null);
   /** Bumped when search results may have changed, so an open search can run again. */
   searchRevision: number = $state(0);
+  /** Device settings as stored (without defaults). */
+  deviceSettings: DeviceSettings = $state.raw(parseSettings(null).value);
+  /** Device settings with defaults filled in. */
+  readonly settings: EffectiveSettings = $derived(effectiveSettings(this.deviceSettings));
+  /** Recent workspaces that were not found when last opened. */
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- replaced, never mutated
+  missingWorkspaces: ReadonlySet<string> = $state.raw(new Set());
+  /** Whether git is installed, once checked. */
+  gitInfo: GitVersion | null = $state.raw(null);
+  /** Setup files the open workspace lacks lines in, or `null` until checked. */
+  setupMissing: readonly string[] | null = $state.raw(null);
+  /** The setup banner is shown: lines are missing and it was not dismissed here. */
+  readonly setupBanner: boolean = $derived(
+    this.phase.kind === "ready" &&
+      (this.setupMissing?.length ?? 0) > 0 &&
+      !(this.deviceSettings.dismissedSetup ?? []).includes(this.phase.root),
+  );
+  /** The quick capture shortcut as registered, or `null` when unknown. */
+  captureShortcut: ShortcutStatus | null = $state.raw(null);
 
   readonly #storage: Storage;
   readonly #defer: (task: () => void) => void;
@@ -515,8 +630,22 @@ export class AppState {
   readonly #taskEdits = new WeakMap<SaveSession, ((doc: TaskDocument) => TaskEdit | null)[]>();
   #tasksChanged = false;
   #taskFocusId = 0;
-  #settings: ParseResult<DeviceSettings> = parseSettings(null);
+  /** The settings file as last read or written: the base app changes are patched onto. */
+  #settingsFile: ParseResult<DeviceSettings> = parseSettings(null);
   #settingsWarnings: ConfigWarning[] = [];
+  #configWarnings: ConfigWarning[] = [];
+  /** The settings file's text as last read or written, to skip reports of the app's own writes. */
+  #settingsText: string | null = null;
+  #settingsLoaded = false;
+  /** Settings writes and reloads, one at a time and in order. */
+  #settingsWork: Promise<void> = Promise.resolve();
+  /** Changes shown already but not written yet, applied again over a reloaded file. */
+  #pendingSettings: SettingsPatch[] = [];
+  #stopSettingsWatch: Unsubscribe | null = null;
+  #captureHost: CaptureHost | null = null;
+  /** Capture shortcut checks and changes, one at a time. */
+  #shortcutWork: Promise<unknown> = Promise.resolve();
+  #cloneCancelled = false;
   #config: WorkspaceConfig = parseWorkspaceConfig(null).value;
   #files: FileEntry[] = [];
   /** Every shown file by path, rebuilt with the model. */
@@ -565,18 +694,25 @@ export class AppState {
   /** Reads device settings and reopens the last workspace, if any. */
   async start(): Promise<void> {
     this.#watchClose();
+    this.#watchSettings();
     try {
-      this.#settings = parseSettings(await this.#storage.readSettings());
-      this.#settingsWarnings = this.#settings.warnings;
+      const text = await this.#storage.readSettings();
+      this.#settingsText = text;
+      this.#settingsFile = parseSettings(text);
+      this.#settingsWarnings = this.#settingsFile.warnings;
     } catch (error) {
       // Without readable settings, start fresh but never overwrite the file.
-      this.#settings = { ...parseSettings(null), writable: false };
+      this.#settingsFile = { ...parseSettings(null), writable: false };
       this.#settingsWarnings = [
         { field: "", message: `settings.json: ${toStorageError(error).message}` },
       ];
     }
+    this.deviceSettings = this.#settingsFile.value;
+    this.#settingsLoaded = true;
     this.warnings = this.#settingsWarnings;
-    const path = this.#settings.value.workspace;
+    if (this.#settingsWarnings.length > 0) this.#toast(SETTINGS_INVALID);
+    void this.#syncCaptureShortcut(true);
+    const path = this.deviceSettings.workspace;
     if (path === undefined) this.phase = { kind: "no-workspace" };
     else await this.openWorkspace(path);
   }
@@ -620,6 +756,7 @@ export class AppState {
     let finishInitialLoad: () => void = () => undefined;
     this.#changes = new Promise((resolve) => (finishInitialLoad = resolve));
     this.phase = { kind: "loading", path };
+    this.setupMissing = null;
     try {
       // Pending saves must land in the workspace they belong to, and git
       // must be done with it before the backend switches.
@@ -651,7 +788,7 @@ export class AppState {
       this.#tasksChanged = false;
       this.taskDocs = this.#tasks.view();
       // eslint-disable-next-line svelte/prefer-svelte-reactivity -- replaced, never mutated
-      this.hideDone = new Set();
+      this.hideDone = new Set(this.#hideDoneKeys(root));
       this.notice = null;
       this.#select(INBOX);
       this.phase = { kind: "ready", root };
@@ -660,6 +797,7 @@ export class AppState {
         this.#defer(() => {
           this.#enqueue([...this.#index.keys()], generation);
           this.#startSync(generation);
+          void this.#checkSetup(generation);
           resolve();
         });
       });
@@ -668,6 +806,10 @@ export class AppState {
       if (generation !== this.#generation || toStorageError(error).kind === "Superseded") return;
       this.#unwatch?.();
       this.#unwatch = null;
+      const kind = toStorageError(error).kind;
+      if (kind === "NotFound" || kind === "NotADirectory") {
+        this.missingWorkspaces = withPath(this.missingWorkspaces, path);
+      }
       this.phase = { kind: "error", message: openErrorMessage(error, path) };
     } finally {
       finishInitialLoad();
@@ -986,6 +1128,10 @@ export class AppState {
     const next = new Set(this.hideDone);
     if (!next.delete(key)) next.add(key);
     this.hideDone = next;
+    if (this.phase.kind !== "ready") return;
+    const keys = [...next].map((item) => (item === ALL_TASKS ? ALL_TASKS_KEY : item));
+    const root = this.phase.root;
+    this.#updateSettings((settings) => withHideDone(settings, root, keys));
   }
 
   /** Whether `path` is a note shown in the workspace. */
@@ -1192,14 +1338,11 @@ export class AppState {
         host.sendProjects(this.captureProjects()).catch(() => undefined);
       }),
     );
-    host
-      .shortcutStatus()
-      .then((status) => {
-        if (!status.registered && !stopped) this.#toast(SHORTCUT_TAKEN);
-      })
-      .catch(() => undefined);
+    this.#captureHost = host;
+    void this.#syncCaptureShortcut(true);
     return () => {
       stopped = true;
+      if (this.#captureHost === host) this.#captureHost = null;
       for (const stop of stops) stop();
     };
   }
@@ -1376,6 +1519,159 @@ export class AppState {
     this.#scheduler?.syncNow();
   }
 
+  /** Checks whether git is installed, for the start screen. */
+  async checkGit(): Promise<void> {
+    try {
+      this.gitInfo = await this.#storage.gitVersion();
+    } catch {
+      // Unknown; the start screen leaves the git line out.
+      this.gitInfo = null;
+    }
+  }
+
+  /** Asks for a folder without opening it, e.g. where to create or clone a workspace. */
+  async pickFolder(): Promise<PickedFolder> {
+    try {
+      const path = await this.#storage.pickWorkspaceFolder();
+      return path === null ? { kind: "cancelled" } : { kind: "picked", path };
+    } catch (error) {
+      return { kind: "failed", message: toStorageError(error).message };
+    }
+  }
+
+  /**
+   * Creates a new workspace in `<parent>/<name>` (a new or empty folder):
+   * the inbox, the workspace config, the git setup files and a repository
+   * when git is available. Then opens it.
+   */
+  async createWorkspace(parent: string, name: string): Promise<NewWorkspaceOutcome> {
+    if (parent === "") return { kind: "invalid", message: CHOOSE_FOLDER };
+    const problem = folderNameProblem(name);
+    if (problem !== null) return { kind: "invalid", message: problem };
+    let created: ScaffoldResult;
+    try {
+      created = await this.#storage.scaffoldWorkspace(joinPath(parent, name));
+    } catch (error) {
+      return { kind: "invalid", message: toStorageError(error).message };
+    }
+    await this.openWorkspace(created.root);
+    // The files are there; git can be set up later, so this never blocks.
+    if (created.gitError !== null) this.#toast(gitSetupFailedMessage(created.gitError));
+    return { kind: "opened" };
+  }
+
+  /** Clones `url` into `<parent>/<name>` and opens it. */
+  async cloneWorkspace(url: string, parent: string, name: string): Promise<NewWorkspaceOutcome> {
+    const trimmed = url.trim();
+    if (trimmed === "") return { kind: "invalid", message: ENTER_URL };
+    if (parent === "") return { kind: "invalid", message: CHOOSE_FOLDER };
+    const problem = folderNameProblem(name);
+    if (problem !== null) return { kind: "invalid", message: problem };
+    this.#cloneCancelled = false;
+    let root: string;
+    try {
+      root = (await this.#storage.cloneRepository(trimmed, parent, name)).root;
+    } catch (error) {
+      const storageError = toStorageError(error);
+      if (this.#cloneCancelled || storageError.kind === "Cancelled") return { kind: "cancelled" };
+      return { kind: "invalid", message: storageError.message };
+    }
+    await this.openWorkspace(root);
+    return { kind: "opened" };
+  }
+
+  /** Stops a running clone. */
+  async cancelClone(): Promise<void> {
+    this.#cloneCancelled = true;
+    try {
+      await this.#storage.cancelClone();
+    } catch {
+      // The clone ends on its own; it is reported as it ends.
+    }
+  }
+
+  /** Forgets a recent workspace. */
+  removeRecentWorkspace(path: string): void {
+    this.#updateSettings((settings) => withoutRecentWorkspace(settings, path));
+    if (this.missingWorkspaces.has(path)) {
+      this.missingWorkspaces = withoutPath(this.missingWorkspaces, path);
+    }
+  }
+
+  /**
+   * Adds the missing `.gitattributes` and `.gitignore` lines to the open
+   * workspace; the next automatic commit picks them up.
+   */
+  async setUpWorkspace(): Promise<void> {
+    if (this.phase.kind !== "ready") return;
+    const generation = this.#generation;
+    let changed: string[];
+    try {
+      const result = await this.#storage.ensureWorkspaceFiles();
+      changed = [...result.created, ...result.updated];
+    } catch (error) {
+      if (generation === this.#generation) {
+        this.#toast(setupFailedMessage(toStorageError(error).message));
+      }
+      return;
+    }
+    if (generation !== this.#generation) return;
+    this.setupMissing = [];
+    this.#toast(setupDoneMessage(changed));
+    // The watcher does not report these files.
+    if (changed.length > 0) this.#scheduler?.changed();
+  }
+
+  /** Hides the setup banner of the open workspace for good. */
+  dismissSetup(): void {
+    if (this.phase.kind !== "ready") return;
+    const root = this.phase.root;
+    this.#updateSettings((settings) => withDismissedSetup(settings, root));
+  }
+
+  /** Turns automatic committing and syncing on or off. */
+  setAutoSync(on: boolean): void {
+    if (on === this.settings.autoSync) return;
+    this.#updateSettings((settings) => ({ ...settings, autoSync: on }));
+    this.#scheduler?.setAuto(on);
+  }
+
+  /** Sets the editor and task view text size, kept within the allowed range. */
+  setEditorFontSize(size: number): void {
+    if (!Number.isFinite(size)) return;
+    const clamped = Math.min(
+      EDITOR_FONT_SIZE_MAX,
+      Math.max(EDITOR_FONT_SIZE_MIN, Math.round(size)),
+    );
+    if (clamped === this.settings.editorFontSize) return;
+    this.#updateSettings((settings) => ({ ...settings, editorFontSize: clamped }));
+  }
+
+  /**
+   * Replaces the quick capture shortcut (`null` turns it off). It is saved
+   * only once registered; otherwise the old one stays and the reason is
+   * returned.
+   */
+  async setCaptureShortcut(accelerator: string | null): Promise<string | null> {
+    const host = this.#captureHost;
+    if (!host) return CAPTURE_UNAVAILABLE;
+    const work = this.#shortcutWork.then(async (): Promise<string | null> => {
+      let change: ShortcutChange;
+      try {
+        change = await host.setShortcut(accelerator);
+      } catch (error) {
+        return toStorageError(error).message;
+      }
+      // On failure the previous shortcut stays registered and the settings unchanged.
+      if (!shortcutApplied(change, accelerator)) return SHORTCUT_IN_USE;
+      this.captureShortcut = toStatus(change);
+      this.#updateSettings((settings) => ({ ...settings, captureShortcut: accelerator }));
+      return null;
+    });
+    this.#shortcutWork = work.catch(() => undefined);
+    return work;
+  }
+
   /** The window got focus: refresh the git status and sync if it has been a while. */
   windowFocused(): void {
     this.#scheduler?.focus();
@@ -1423,6 +1719,8 @@ export class AppState {
     this.#unwatch = null;
     this.#stopCloseHandler?.();
     this.#stopCloseHandler = null;
+    this.#stopSettingsWatch?.();
+    this.#stopSettingsWatch = null;
     void this.#stopSync();
     void this.#closeSessions();
   }
@@ -1444,6 +1742,7 @@ export class AppState {
       },
       timers: this.#timers,
       ...this.#syncOptions,
+      auto: this.settings.autoSync,
       events: {
         changed: (snapshot) => {
           if (this.#scheduler === scheduler) this.sync = snapshot;
@@ -2046,26 +2345,204 @@ export class AppState {
 
   #applyConfig(loaded: LoadedConfig): void {
     this.#config = loaded.config;
+    this.#configWarnings = loaded.warnings;
     this.warnings = [...this.#settingsWarnings, ...loaded.warnings];
   }
 
   #rememberWorkspace(root: string): void {
-    const settings = this.#settings;
-    if (settings.value.workspace === root) return;
-    if (!settings.writable) {
-      if (this.#settingsWarnings.some((warning) => warning.message === SETTINGS_NOT_SAVED)) return;
-      const warning = { field: "", message: SETTINGS_NOT_SAVED };
-      this.#settingsWarnings = [...this.#settingsWarnings, warning];
-      this.warnings = [...this.warnings, warning];
+    if (this.missingWorkspaces.has(root)) {
+      this.missingWorkspaces = withoutPath(this.missingWorkspaces, root);
+    }
+    if (isOpenedWorkspace(this.deviceSettings, root)) return;
+    this.#updateSettings((settings) => withOpenedWorkspace(settings, root), SETTINGS_NOT_SAVED);
+  }
+
+  /**
+   * Applies a change to the device settings and saves it in the background,
+   * one write at a time. A file that must not be overwritten is left alone
+   * with a warning (`notSaved`), shown once.
+   */
+  #updateSettings(patch: SettingsPatch, notSaved = SETTINGS_CHANGES_NOT_SAVED): void {
+    this.deviceSettings = patch(this.deviceSettings);
+    if (!this.#settingsFile.writable) {
+      this.#warnNotSaved(notSaved);
       return;
     }
-    const value: DeviceSettings = { ...settings.value, workspace: root };
-    this.#settings = { ...settings, value };
+    this.#pendingSettings.push(patch);
     // Saving settings must never hold up the UI.
-    this.#storage.writeSettings(serializeSettings(value, settings)).catch((error) => {
-      const message = `settings.json: ${toStorageError(error).message}`;
-      this.warnings = [...this.warnings, { field: "", message }];
+    this.#queueSettingsWork(async () => {
+      try {
+        await this.#saveSettings(patch, notSaved);
+      } finally {
+        this.#pendingSettings = this.#pendingSettings.filter((pending) => pending !== patch);
+      }
     });
+  }
+
+  #queueSettingsWork(work: () => Promise<void>): void {
+    this.#settingsWork = this.#settingsWork.then(work).catch((error: unknown) => {
+      const message = `settings.json: ${toStorageError(error).message}`;
+      this.warnings = withWarnings(this.warnings, [{ field: "", message }]);
+    });
+  }
+
+  #warnNotSaved(notSaved: string): void {
+    if (this.#settingsWarnings.some((warning) => warning.message === notSaved)) return;
+    const warning = { field: "", message: notSaved };
+    this.#settingsWarnings = [...this.#settingsWarnings, warning];
+    this.warnings = [...this.warnings, warning];
+  }
+
+  /**
+   * Writes `patch` on top of the file as last read. When the file changed
+   * since then, it is read and applied again and the patch retried on top
+   * of it, so changes made by another program are never overwritten.
+   */
+  async #saveSettings(patch: SettingsPatch, notSaved: string): Promise<void> {
+    for (let attempt = 0; ; attempt += 1) {
+      const file = this.#settingsFile;
+      if (!file.writable) {
+        this.#warnNotSaved(notSaved);
+        return;
+      }
+      const text = serializeSettings(patch(file.value), file);
+      try {
+        await this.#storage.writeSettings(text);
+      } catch (error) {
+        if (!isStorageError(toStorageError(error), "Conflict")) throw error;
+        if (attempt >= SETTINGS_WRITE_RETRIES) {
+          this.#toast(SETTINGS_KEEP_CHANGING);
+          return;
+        }
+        // Without a fresh read the next attempt would fail the same way.
+        if (!(await this.#readSettingsAgain())) return;
+        continue;
+      }
+      this.#settingsText = text;
+      this.#settingsFile = parseSettings(text);
+      return;
+    }
+  }
+
+  /** Resolves when every settings write issued so far is done. */
+  settingsSaved(): Promise<void> {
+    return this.#settingsWork;
+  }
+
+  #watchSettings(): void {
+    if (this.#stopSettingsWatch) return;
+    this.#storage
+      .watchSettings(() => {
+        if (this.#disposed || !this.#settingsLoaded) return;
+        this.#queueSettingsWork(async () => {
+          if (!this.#disposed) await this.#readSettingsAgain();
+        });
+      })
+      .then((stop) => {
+        if (this.#disposed) stop();
+        else this.#stopSettingsWatch = stop;
+      })
+      // Without the hook, edits to the file apply on the next start.
+      .catch(() => undefined);
+  }
+
+  /**
+   * Reads the settings file again after another program changed it, and
+   * applies it. Returns whether it could be read.
+   */
+  async #readSettingsAgain(): Promise<boolean> {
+    let text: string | null;
+    try {
+      text = await this.#storage.readSettings();
+    } catch (error) {
+      const message = `settings.json: ${toStorageError(error).message}`;
+      this.warnings = withWarnings(this.warnings, [{ field: "", message }]);
+      return false;
+    }
+    if (this.#disposed) return false;
+    if (text === this.#settingsText) return true;
+    this.#settingsText = text;
+    const before = this.#settingsWarnings.map((warning) => warning.message);
+    const previous = this.settings;
+    const reloaded = reloadSettings(this.deviceSettings, text);
+    this.#settingsFile = reloaded.file;
+    // A file that cannot be used changes nothing: its warning joins the current ones.
+    this.#settingsWarnings = reloaded.file.writable
+      ? reloaded.warnings
+      : withWarnings(this.#settingsWarnings, reloaded.warnings);
+    // Changes not written yet stay applied; they are written on top of this file.
+    this.deviceSettings = this.#pendingSettings.reduce(
+      (settings, patch) => patch(settings),
+      reloaded.value,
+    );
+    this.warnings = [...this.#settingsWarnings, ...this.#configWarnings];
+    if (this.#settingsWarnings.some((warning) => !before.includes(warning.message))) {
+      this.#toast(SETTINGS_CHANGED_INVALID);
+    }
+    const next = this.settings;
+    if (next.autoSync !== previous.autoSync) this.#scheduler?.setAuto(next.autoSync);
+    if (!sameAccelerator(next.captureShortcut, previous.captureShortcut)) {
+      void this.#syncCaptureShortcut(false);
+    }
+    if (this.phase.kind === "ready") {
+      // eslint-disable-next-line svelte/prefer-svelte-reactivity -- replaced, never mutated
+      this.hideDone = new Set(this.#hideDoneKeys(this.phase.root));
+    }
+    return true;
+  }
+
+  /** The lists of `root` with done tasks hidden, as remembered (`ALL_TASKS` for All tasks). */
+  #hideDoneKeys(root: string): string[] {
+    return hideDoneOf(this.deviceSettings, root).map((key) =>
+      key === ALL_TASKS_KEY ? ALL_TASKS : key,
+    );
+  }
+
+  /**
+   * Makes the registered capture shortcut match the settings: asks what is
+   * registered and changes it when it differs. Says so when the shortcut
+   * cannot be registered; `initial` checks only run once both the settings
+   * and the capture host are there.
+   */
+  #syncCaptureShortcut(initial: boolean): Promise<unknown> {
+    const host = this.#captureHost;
+    if (!host || !this.#settingsLoaded) return Promise.resolve();
+    const work = this.#shortcutWork.then(async () => {
+      if (host !== this.#captureHost || this.#disposed) return;
+      const desired = this.settings.captureShortcut;
+      let status: ShortcutStatus;
+      let registered: boolean;
+      try {
+        status = await host.shortcutStatus();
+        registered = status.registered && sameAccelerator(status.shortcut, desired);
+        if (!sameAccelerator(status.shortcut, desired)) {
+          const change = await host.setShortcut(desired);
+          // On failure the previous shortcut stays registered.
+          if (shortcutApplied(change, desired)) status = toStatus(change);
+          registered = desired !== null && change.registered;
+        }
+      } catch {
+        // An older backend or no capture support: the app works on without it.
+        return;
+      }
+      if (host !== this.#captureHost || this.#disposed) return;
+      this.captureShortcut = status;
+      if (desired !== null && !registered) this.#toast(initial ? SHORTCUT_TAKEN : SHORTCUT_IN_USE);
+    });
+    this.#shortcutWork = work.catch(() => undefined);
+    return work;
+  }
+
+  /** Whether the setup files of the open workspace lack lines; never changes anything. */
+  async #checkSetup(generation: number): Promise<void> {
+    let missing: string[];
+    try {
+      missing = (await this.#storage.workspaceSetupStatus()).missing;
+    } catch {
+      // Unknown: offer nothing rather than something wrong.
+      return;
+    }
+    if (generation === this.#generation) this.setupMissing = missing;
   }
 
   async #loadDocument(path: string, generation: number): Promise<void> {

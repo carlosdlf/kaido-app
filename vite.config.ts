@@ -1,4 +1,5 @@
 /// <reference types="vitest/config" />
+import { readFileSync } from "node:fs";
 import { fileURLToPath, URL } from "node:url";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { svelteTesting } from "@testing-library/svelte/vite";
@@ -7,8 +8,16 @@ import { defineConfig } from "vite";
 // Set by the Tauri CLI when developing on a physical device.
 const host = process.env.TAURI_DEV_HOST;
 
+/** The app version, shown in the settings. */
+const packageJson = JSON.parse(
+  readFileSync(fileURLToPath(new URL("./package.json", import.meta.url)), "utf8"),
+) as { version: string };
+
 export default defineConfig({
   plugins: [svelte()],
+  define: {
+    __APP_VERSION__: JSON.stringify(packageJson.version),
+  },
   resolve: {
     alias: {
       $lib: fileURLToPath(new URL("./src/lib", import.meta.url)),

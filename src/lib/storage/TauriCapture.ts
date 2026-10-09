@@ -20,12 +20,14 @@ import {
   CaptureProjectsSchema,
   CaptureResultSchema,
   CaptureSubmitSchema,
+  ShortcutChangeSchema,
   ShortcutStatusSchema,
   type CaptureChannel,
   type CaptureHost,
   type CaptureProjects,
   type CaptureResult,
   type CaptureSubmit,
+  type ShortcutChange,
   type ShortcutStatus,
 } from "./capture";
 import { StorageError, toStorageError } from "./errors";
@@ -67,6 +69,23 @@ async function call(command: string, args?: Record<string, unknown>): Promise<vo
 }
 
 const Anything = v.unknown();
+
+/** Calls a command and validates its result. */
+async function query<T>(
+  schema: v.GenericSchema<unknown, T>,
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  let result: unknown;
+  try {
+    result = await (args === undefined ? invoke<unknown>(command) : invoke<unknown>(command, args));
+  } catch (error) {
+    throw toStorageError(error);
+  }
+  const parsed = v.safeParse(schema, result);
+  if (!parsed.success) throw new StorageError("Io", `Unexpected response from ${command}.`);
+  return parsed.output;
+}
 
 /** The capture window's side. */
 export class TauriCaptureChannel implements CaptureChannel {
@@ -123,17 +142,16 @@ export class TauriCaptureHost implements CaptureHost {
     return send(CAPTURE_WINDOW, CAPTURE_PROJECTS, projects);
   }
 
-  async shortcutStatus(): Promise<ShortcutStatus> {
-    let result: unknown;
-    try {
-      result = await invoke<unknown>("capture_shortcut_status");
-    } catch (error) {
-      throw toStorageError(error);
-    }
-    const parsed = v.safeParse(ShortcutStatusSchema, result);
-    if (!parsed.success) {
-      throw new StorageError("Io", "Unexpected response from capture_shortcut_status.");
-    }
-    return parsed.output;
+  shortcutStatus(): Promise<ShortcutStatus> {
+    return query(ShortcutStatusSchema, "capture_shortcut_status");
+  }
+
+  async setShortcut(accelerator: string | null): Promise<ShortcutChange> {
+    const { registered, shortcut, message } = await query(
+      ShortcutChangeSchema,
+      "set_capture_shortcut",
+      { accelerator },
+    );
+    return message == null ? { registered, shortcut } : { registered, shortcut, message };
   }
 }

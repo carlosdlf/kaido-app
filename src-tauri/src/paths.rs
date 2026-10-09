@@ -36,6 +36,41 @@ pub fn canonical_root(path: &str) -> AppResult<PathBuf> {
     Ok(root)
 }
 
+/// Whether `inner` is `outer` or inside it. Both must be canonical. Names
+/// are compared ignoring case on systems whose file systems usually do.
+fn is_within(inner: &Path, outer: &Path, ignore_case: bool) -> bool {
+    if !ignore_case {
+        return inner.starts_with(outer);
+    }
+    let fold = |path: &Path| -> Vec<String> {
+        path.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect()
+    };
+    fold(inner).starts_with(&fold(outer))
+}
+
+/// Refuses `dest`, the canonical folder for a new workspace or clone, when
+/// it is inside the open `workspace` (a repository inside the notes) or
+/// contains it.
+pub fn refuse_workspace_overlap(dest: &Path, workspace: Option<&Path>) -> AppResult<()> {
+    let Some(workspace) = workspace else {
+        return Ok(());
+    };
+    let ignore_case = cfg!(any(windows, target_os = "macos"));
+    if is_within(dest, workspace, ignore_case) {
+        return Err(AppError::InvalidPath(
+            "the destination is inside the open workspace; choose a folder outside it".into(),
+        ));
+    }
+    if is_within(workspace, dest, ignore_case) {
+        return Err(AppError::InvalidPath(
+            "the destination contains the open workspace; choose another folder".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validates a workspace-relative path and returns it as a relative `PathBuf`.
 ///
 /// Rejected: empty paths, NUL bytes, backslashes, absolute paths, empty
@@ -407,5 +442,45 @@ mod tests {
             assert_eq!(kind(result), "PermissionDenied");
             assert_eq!(kind(existing), "PermissionDenied");
         }
+    }
+
+    #[test]
+    fn destinations_must_not_overlap_the_open_workspace() {
+        let ws = Path::new("/home/me/notes");
+        let check = |dest: &str| refuse_workspace_overlap(Path::new(dest), Some(ws));
+        assert_eq!(check("/home/me/other"), Ok(()));
+        assert_eq!(check("/home/me/notes-2"), Ok(()));
+        assert_eq!(refuse_workspace_overlap(ws, None), Ok(()));
+        for inside in ["/home/me/notes", "/home/me/notes/sub", "/home/me/notes/a/b"] {
+            let err = check(inside).unwrap_err();
+            assert_eq!(err.kind(), "InvalidPath");
+            assert!(
+                err.to_string().contains("inside the open workspace"),
+                "{err}"
+            );
+        }
+        for outside in ["/home/me", "/home", "/"] {
+            let err = check(outside).unwrap_err();
+            assert_eq!(err.kind(), "InvalidPath");
+            assert!(
+                err.to_string().contains("contains the open workspace"),
+                "{err}"
+            );
+        }
+        assert!(is_within(
+            Path::new("/Home/Me/Notes/x"),
+            Path::new("/home/me/notes"),
+            true
+        ));
+        assert!(!is_within(
+            Path::new("/Home/Me/Notes/x"),
+            Path::new("/home/me/notes"),
+            false
+        ));
+        assert!(!is_within(
+            Path::new("/home/me/notesx"),
+            Path::new("/home/me/notes"),
+            true
+        ));
     }
 }

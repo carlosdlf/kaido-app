@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
+import type { KeyPress } from "./newNote";
 import {
   isSearchShortcut,
+  isSettingsShortcut,
   isSyncShortcut,
   isViewModeShortcut,
   searchShortcutLabels,
+  settingsShortcutLabels,
   syncShortcutLabels,
   viewModeShortcutLabels,
 } from "./shortcuts";
@@ -68,5 +71,31 @@ describe("search shortcut", () => {
   it("has labels for assistive technology and hints", () => {
     expect(searchShortcutLabels(false)).toEqual({ aria: "Control+K", hint: "^K" });
     expect(searchShortcutLabels(true)).toEqual({ aria: "Meta+K", hint: "⌘K" });
+  });
+});
+
+describe("settings shortcut", () => {
+  const key = (patch: Partial<KeyPress>): KeyPress => ({
+    key: ",",
+    ctrlKey: false,
+    metaKey: false,
+    altKey: false,
+    shiftKey: false,
+    ...patch,
+  });
+
+  it("is Ctrl+, elsewhere and Cmd+, on macOS", () => {
+    expect(isSettingsShortcut(key({ ctrlKey: true }), false)).toBe(true);
+    expect(isSettingsShortcut(key({ metaKey: true }), true)).toBe(true);
+    expect(isSettingsShortcut(key({ metaKey: true }), false)).toBe(false);
+    expect(isSettingsShortcut(key({ ctrlKey: true }), true)).toBe(false);
+    expect(isSettingsShortcut(key({ ctrlKey: true, shiftKey: true }), false)).toBe(false);
+    expect(isSettingsShortcut(key({ ctrlKey: true, altKey: true }), false)).toBe(false);
+    expect(isSettingsShortcut(key({ ctrlKey: true, key: "." }), false)).toBe(false);
+  });
+
+  it("has labels", () => {
+    expect(settingsShortcutLabels(true)).toEqual({ aria: "Meta+,", hint: "⌘," });
+    expect(settingsShortcutLabels(false)).toEqual({ aria: "Control+,", hint: "^," });
   });
 });

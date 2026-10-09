@@ -940,3 +940,138 @@ describe("SyncScheduler pauses", () => {
     expect(git.take()).toEqual(["status", "commit", "status"]);
   });
 });
+
+describe("SyncScheduler with automatic syncing off", () => {
+  function manual(configure: (git: FakeGit) => void = () => undefined) {
+    const git = new FakeGit();
+    configure(git);
+    const scheduler = new SyncScheduler({ io: git, timers, auto: false });
+    return { git, scheduler };
+  }
+
+  it("only reads the status on start and says so in the snapshot", async () => {
+    const { git, scheduler } = manual((git) => (git.repo.changed = ["inbox/a.md"]));
+    scheduler.start();
+    await scheduler.idle();
+    expect(git.take()).toEqual(["status"]);
+    expect(scheduler.snapshot.auto).toBe(false);
+    await advance(scheduler, SYNC_INTERVAL_MS * 2);
+    expect(git.take()).toEqual([]);
+  });
+
+  it("never commits after a change", async () => {
+    const { git, scheduler } = manual();
+    scheduler.start();
+    await scheduler.idle();
+    git.take();
+    git.repo.changed = ["inbox/a.md"];
+    scheduler.changed();
+    await advance(scheduler, COMMIT_DELAY_MS * 2);
+    expect(git.take()).toEqual([]);
+  });
+
+  it("reads the status on focus without syncing", async () => {
+    const { git, scheduler } = manual();
+    scheduler.start();
+    await scheduler.idle();
+    git.take();
+    vi.setSystemTime(Date.now() + FOCUS_SYNC_AGE_MS * 2);
+    scheduler.focus();
+    await scheduler.idle();
+    expect(git.take()).toEqual(["status"]);
+  });
+
+  it("commits and syncs once on Sync now", async () => {
+    const { git, scheduler } = manual((git) => (git.repo.changed = ["inbox/a.md"]));
+    scheduler.start();
+    await scheduler.idle();
+    git.take();
+    scheduler.syncNow();
+    await scheduler.idle();
+    expect(git.take()).toEqual(["status", "commit", "status", "sync", "status"]);
+    await advance(scheduler, SYNC_INTERVAL_MS * 2);
+    expect(git.take()).toEqual([]);
+  });
+
+  it("does not retry a network failure or a deferred sync by itself", async () => {
+    const { git, scheduler } = manual();
+    scheduler.start();
+    await scheduler.idle();
+    git.syncOverrides.push(network());
+    scheduler.syncNow();
+    await scheduler.idle();
+    expect(scheduler.snapshot.retryIn).toBeNull();
+    git.syncOverrides.push({
+      ok: true,
+      value: { pulled: 0, pushed: 0, changed: [], conflicts: [], deferred: true },
+    });
+    scheduler.syncNow();
+    await scheduler.idle();
+    git.take();
+    await advance(scheduler, BACKOFF_DELAYS_MS[0] ?? 0);
+    await advance(scheduler, COMMIT_DELAY_MS);
+    expect(git.take()).toEqual([]);
+  });
+
+  it("does not check again for changes a pause keeps from a commit", async () => {
+    const { git, scheduler } = manual((git) => {
+      git.repo = { ...git.repo, state: "paused", pausedReason: "no-identity", changed: ["a.md"] };
+    });
+    scheduler.start();
+    await scheduler.idle();
+    scheduler.syncNow();
+    await scheduler.idle();
+    git.take();
+    await advance(scheduler, (PAUSED_RETRY_DELAYS_MS[0] ?? 0) * 2);
+    expect(git.take()).toEqual([]);
+  });
+
+  it("commits and syncs pending changes when turned on", async () => {
+    const { git, scheduler } = manual((git) => (git.repo.changed = ["inbox/a.md"]));
+    scheduler.start();
+    await scheduler.idle();
+    git.take();
+    scheduler.setAuto(true);
+    scheduler.setAuto(true);
+    await scheduler.idle();
+    expect(git.take()).toEqual(["status", "commit", "status", "sync", "status"]);
+    expect(scheduler.snapshot.auto).toBe(true);
+    git.repo.changed = ["inbox/b.md"];
+    scheduler.changed();
+    await advance(scheduler, COMMIT_DELAY_MS);
+    expect(git.take()).toContain("commit");
+  });
+
+  it("cancels pending timers when turned off", async () => {
+    const { git, scheduler } = await started();
+    git.syncOverrides.push(network());
+    scheduler.syncNow();
+    await scheduler.idle();
+    expect(scheduler.snapshot.retryIn).not.toBeNull();
+    git.repo.changed = ["inbox/a.md"];
+    scheduler.changed();
+    scheduler.setAuto(false);
+    expect(scheduler.snapshot).toMatchObject({ auto: false, retryIn: null });
+    git.take();
+    await advance(scheduler, SYNC_INTERVAL_MS * 2);
+    expect(git.take()).toEqual([]);
+  });
+
+  it("turned on before start waits for start", async () => {
+    const { git, scheduler } = manual();
+    scheduler.setAuto(true);
+    await scheduler.idle();
+    expect(git.take()).toEqual([]);
+    scheduler.start();
+    await scheduler.idle();
+    expect(git.take()).toEqual(["status", "sync", "status"]);
+  });
+
+  it("ignores changes after stop", async () => {
+    const { git, scheduler } = manual();
+    await scheduler.stop();
+    scheduler.setAuto(true);
+    await scheduler.idle();
+    expect(git.take()).toEqual([]);
+  });
+});

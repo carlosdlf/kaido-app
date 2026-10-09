@@ -67,6 +67,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export interface ParseOptions {
+  /**
+   * The file is read again while the app runs and the caller keeps its
+   * current values where the file cannot be used; warnings say so instead
+   * of promising defaults.
+   */
+  keepCurrent?: boolean;
+}
+
 /**
  * Parses a configuration file. `text` is `null` when the file does not
  * exist, which silently yields the defaults.
@@ -74,8 +83,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function parseConfig<T extends { version: number }>(
   format: ConfigFormat<T>,
   text: string | null,
+  options: ParseOptions = {},
 ): ParseResult<T> {
   const defaults = format.defaults();
+  const fallbackAll = options.keepCurrent ? "keeping the current settings" : "using defaults";
+  const fallbackField = options.keepCurrent ? "keeping the current value" : "using the default";
   const result: ParseResult<T> = {
     value: defaults,
     warnings: [],
@@ -96,12 +108,12 @@ export function parseConfig<T extends { version: number }>(
   try {
     data = JSON.parse(text);
   } catch {
-    warn("", "not valid JSON; using defaults and leaving the file unchanged");
+    warn("", `not valid JSON; ${fallbackAll} and leaving the file unchanged`);
     result.writable = false;
     return result;
   }
   if (!isRecord(data)) {
-    warn("", "expected a JSON object; using defaults and leaving the file unchanged");
+    warn("", `expected a JSON object; ${fallbackAll} and leaving the file unchanged`);
     result.writable = false;
     return result;
   }
@@ -113,7 +125,7 @@ export function parseConfig<T extends { version: number }>(
   } else if (data["version"] > format.version) {
     warn(
       "version",
-      `written by a newer version of Kaido (${data["version"]}); using defaults and leaving the file unchanged`,
+      `written by a newer version of Kaido (${data["version"]}); ${fallbackAll} and leaving the file unchanged`,
     );
     result.writable = false;
     return result;
@@ -133,7 +145,7 @@ export function parseConfig<T extends { version: number }>(
       value[key] = parsed.value;
     } else {
       result.invalid[key] = input;
-      warn(key, `${parsed.message}; using the default`);
+      warn(key, `${parsed.message}; ${fallbackField}`);
     }
   }
   // Every known key was either parsed or left at its default, so `value`

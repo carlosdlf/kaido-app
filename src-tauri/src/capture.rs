@@ -1,4 +1,4 @@
-//! Quick capture: a global shortcut that toggles a small always-on-top
+//! Quick capture: a global shortcut (see `shortcut`) that toggles a small always-on-top
 //! window. The window itself is declared in `tauri.conf.json` (hidden at
 //! startup, so showing it is instant) and never touches the disk; it talks to
 //! the main window through the narrow `capture_*` commands below, which relay
@@ -18,8 +18,6 @@ use crate::error::{AppError, AppResult};
 pub const CAPTURE_WINDOW: &str = "capture";
 /// Label of the main window in `tauri.conf.json`.
 pub const MAIN_WINDOW: &str = "main";
-/// The global shortcut that toggles the capture window.
-pub const SHORTCUT: &str = "CommandOrControl+Alt+Space";
 /// Event emitted to the capture window every time it is shown.
 pub const SHOWN_EVENT: &str = "capture:shown";
 /// Event relayed to the main window with a [`CaptureSubmit`] payload.
@@ -178,24 +176,6 @@ pub fn capture_set_height<R: Runtime>(
         .map_err(|err| window_error("resize", err))
 }
 
-/// Whether the global shortcut could be registered. Managed as app state and
-/// returned by the `capture_shortcut_status` command, so the main window can
-/// ask once it is ready instead of racing a startup event.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ShortcutStatus {
-    pub registered: bool,
-    pub shortcut: String,
-}
-
-impl ShortcutStatus {
-    pub fn new(registered: bool) -> Self {
-        Self {
-            registered,
-            shortcut: SHORTCUT.to_owned(),
-        }
-    }
-}
-
 /// What a shortcut event does to the capture window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToggleAction {
@@ -301,27 +281,6 @@ pub fn handle_shortcut<R: Runtime>(app: &AppHandle<R>, pressed: bool) -> ToggleA
         None => {
             eprintln!("quick capture: the capture window does not exist");
             ToggleAction::Ignore
-        }
-    }
-}
-
-/// Registers the global shortcut and returns whether it worked. A failure
-/// (usually the shortcut is taken by another app, or the desktop does not
-/// allow global shortcuts) is logged and the app keeps running without it.
-#[cfg(desktop)]
-pub fn register_shortcut<R: Runtime>(app: &AppHandle<R>) -> bool {
-    use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
-
-    let result = app
-        .global_shortcut()
-        .on_shortcut(SHORTCUT, |app, _shortcut, event| {
-            handle_shortcut(app, event.state == ShortcutState::Pressed);
-        });
-    match result {
-        Ok(()) => true,
-        Err(err) => {
-            eprintln!("quick capture: could not register {SHORTCUT}: {err}");
-            false
         }
     }
 }
@@ -566,16 +525,6 @@ mod tests {
         };
         assert!(reveal(&window).is_err());
         assert_eq!(window.calls(), ["center", "show"]);
-    }
-
-    #[test]
-    fn status_names_the_shortcut() {
-        let status = serde_json::to_value(ShortcutStatus::new(false)).unwrap();
-        assert_eq!(
-            status,
-            serde_json::json!({ "registered": false, "shortcut": SHORTCUT })
-        );
-        assert!(ShortcutStatus::new(true).registered);
     }
 
     #[test]

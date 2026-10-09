@@ -121,6 +121,11 @@ All platform access goes through the `Storage` interface (`src/lib/storage/types
 | `renameFile(from, to)` | Renames a note within its folder without replacing another file; resolves to the `FileEntry` and `hash` of the file at `to` |
 | `deleteFile(path, expectedHash)` | Moves a note to the system trash, only if it still has `expectedHash`. The note is removed permanently only where no trash is available: on Linux, when the trash folders cannot be written (missing, no permission, read-only, full). On Windows and macOS a failed trash move is reported and the note is kept, as is any other trash failure on Linux. Notes over 8 MiB cannot be renamed or deleted, since no hash is handed out for them |
 | `readSettings()` / `writeSettings(contents)` | Reads or writes the raw device `settings.json` (`null` if missing) |
+| `watchSettings(listener)` | Subscribes to changes of `settings.json` made outside the app (`settings://changed`) |
+| `gitVersion()` | Whether git is installed, and its version |
+| `scaffoldWorkspace(root)` | Creates a new workspace in a new or empty folder, without opening it; see [Workspace creation and setup](#workspace-creation-and-setup) |
+| `workspaceSetupStatus()` / `ensureWorkspaceFiles()` | Reports or adds the missing `.gitattributes` and `.gitignore` lines of the open workspace |
+| `cloneRepository(url, parent, name)` / `cancelClone()` | Clones a repository into `parent/name`, without opening it, or stops a running clone |
 | `watch(listener)` | Subscribes to workspace changes, including the app's own writes |
 | `onCloseRequested(handler)` | Runs `handler` before the window closes; it resolves to `false` to keep the window open |
 
@@ -145,11 +150,18 @@ The Rust commands live in `src-tauri/src/commands.rs`, except the quick capture 
 | `rename_file` | `from`, `to` | `FileEntry` and `hash` of the file at `to` |
 | `delete_file` | `path`, `expectedHash` | – |
 | `read_settings` | – | `string \| null` |
-| `write_settings` | `contents` | – |
+| `write_settings` | `contents` | –; `Conflict` if the file changed since the app last read or wrote it, see [Settings writes](#settings-writes) |
 | `git_status` | – | `GitStatus`, see [Git sync](#git-sync) |
 | `git_commit` | `message` | `{ commit, paths }` |
 | `git_sync` | – | `SyncResult` |
+| `git_version` | – | `{ available, version }`; `version` is `null` when git is missing |
+| `scaffold_workspace` | `root` (absolute) | `{ root, created, updated, git, commit, gitError }`, see [Workspace creation and setup](#workspace-creation-and-setup) |
+| `ensure_workspace_files` | – | `{ created, updated }` for the open workspace |
+| `workspace_setup_status` | – | `{ missing }`: which of `.gitattributes` and `.gitignore` lack lines |
+| `git_clone` | `url`, `parent` (absolute), `name` | `{ root }`, the canonical path of the new clone |
+| `git_clone_cancel` | – | –; the running clone fails with `Cancelled` |
 | `capture_shortcut_status` | – | `{ registered, shortcut }`, see [Quick capture](#quick-capture) |
+| `set_capture_shortcut` | `accelerator` (`string \| null`) | `{ registered, shortcut, message }` |
 | `capture_submit` | `payload`: `{ id, kind, text, project }` | –; emits `capture:submit` to the main window |
 | `capture_request_projects` | – | –; emits `capture:projects-request` to the main window |
 | `capture_hide` | – | –; hides the capture window |
@@ -188,12 +200,14 @@ Errors cross the boundary as `{ kind, message }` and become a `StorageError` in 
 | `NotFound` | The file or folder does not exist |
 | `NotADirectory` | The workspace path, or a parent of the target, is not a folder |
 | `OutsideWorkspace` | The path resolves outside the workspace through a symlink |
-| `InvalidPath` | The path is malformed, or is not a note or the workspace config file |
+| `InvalidPath` | The path is malformed, or is not a note or the workspace config file; or a new workspace or clone destination is inside the open workspace or contains it |
 | `InvalidUtf8` | The file is not valid UTF-8 text |
 | `TooLarge` | The file or contents exceed 8 MiB |
 | `PermissionDenied` | The OS denied access, or the target file is read-only |
 | `Superseded` | A newer `open_workspace` call overtook this one |
-| `Conflict` | A conditional write found the file missing, present or changed (see [Conditional writes](#conditional-writes)) |
+| `Conflict` | A conditional write found the file missing, present or changed (see [Conditional writes](#conditional-writes)), `settings.json` changed since it was last read (see [Settings writes](#settings-writes)), or a clone destination already exists |
+| `NotEmpty` | `scaffold_workspace` was given a folder that has files in it |
+| `Cancelled` | The user cancelled the operation (`git_clone_cancel`) |
 | `Io` | Any other failure |
 | `GitUnavailable` | Git is not installed (`git-missing`) or the workspace is not in a repository (`not-a-repo`); the message is the reason |
 | `GitPaused` | The repository is in a state where the git command must not run; the message starts with the [paused reason](#status) or `pull-conflict` |
@@ -229,6 +243,16 @@ Enforced in `src-tauri/src/paths.rs` and `fs_ops.rs`, and mirrored by `MemorySto
 
 The device `settings.json` uses the same atomic write and 8 MiB read limit.
 
+### Settings writes
+
+`write_settings` is a compare-and-swap. The backend remembers the version of `settings.json` the app last saw: what the last `read_settings` returned (a missing file counts as a version; a file that is not valid UTF-8 counts too, so it can be replaced after the `InvalidUtf8` error) or what the last successful `write_settings` wrote. A write replaces the file only if it is still that version; otherwise it fails with `Conflict` (message: `settings.json changed since it was last read; read it again and retry`) and writes nothing. In detail:
+
+- last seen as missing: the write succeeds only if the file is still missing;
+- last seen with some contents: the write succeeds only if the file holds exactly those bytes (compared by SHA-256), so an outside edit, creation or deletion makes it fail;
+- nothing read or written yet: the write succeeds only if the file does not exist.
+
+On `Conflict` the frontend reads the file again, applies its change on top of what it read, and writes again. Noticing an outside change through `settings://changed` does not make a write allowed; only reading does. Reading, comparing and writing happen under one lock, so two writes from the app never interleave; an outside program writing between the comparison and the atomic rename can still be overwritten, which is the usual limit without OS file locks.
+
 ## File watcher
 
 The watcher (`src-tauri/src/watcher.rs`, `watch_tree.rs`) uses `notify` and runs on its own thread.
@@ -246,8 +270,24 @@ Settings are JSON with a `version` field for migrations. Parsing and validation 
 
 | File | Scope | Location | Fields |
 |---|---|---|---|
-| `settings.json` | This device, never synced | The OS app config directory | `workspace`: absolute path of the last opened workspace |
+| `settings.json` | This device, never synced | The OS app config directory | See [Device settings](#device-settings) |
 | `.kaido/config.json` | The workspace, synced with it | Inside the workspace | `ignore`: list of [ignore patterns](#ignore-patterns) |
+
+Both formats are described by JSON Schemas (draft 2020-12) in [`schemas/`](../schemas): `settings.schema.json` and `workspace-config.schema.json`. A test (`src/lib/config/schemas.test.ts`) checks that their fields, types, ranges, caps and defaults match the valibot formats the app parses with. The app never writes `$schema` into these files. User-facing documentation of the fields is in [configuration.md](configuration.md).
+
+### Device settings
+
+| Field | Type | Default | Does |
+|---|---|---|---|
+| `workspace` | absolute path | – | The last opened workspace, reopened on start |
+| `recentWorkspaces` | absolute paths, at most 5 | `[]` | Shown on the start screen, most recent first. Every successful open moves the workspace to the front |
+| `editorFontSize` | whole number, 12–20 | `15` | Text size of the note editor and the task views (`--font-size-editor`); the UI chrome keeps its size |
+| `autoSync` | boolean | `true` | Commit and sync in the background. Off: only **Sync now** commits and syncs |
+| `captureShortcut` | accelerator or `null` | `"CommandOrControl+Alt+Space"` | The [quick capture](#quick-capture) shortcut; `null` turns it off |
+| `hideDone` | object: workspace root → paths, at most 20 roots and 200 paths per root | `{}` | Task lists whose done tasks are hidden; All tasks is `~/all-tasks` |
+| `dismissedSetup` | workspace roots, at most 50 | `[]` | Workspaces where the setup banner was dismissed |
+
+Lists over their cap are cut when read (the oldest entries go) and repeated entries are dropped; this is not a warning. A value of the wrong type or out of range falls back to its default as described below, and one toast says that some settings could not be read; the sidebar lists the details.
 
 **Precedence.** Built-in defaults, then the workspace config, then device settings (`src/lib/config/resolve.ts`). Later layers win; missing values never override. Secrets are never stored in these files; they go to the OS keychain.
 
@@ -262,18 +302,22 @@ Settings are JSON with a `version` field for migrations. Parsing and validation 
 | Not valid JSON, not a JSON object, or a newer `version` | Defaults; a warning is shown and **the file is never overwritten** |
 | File unreadable (for example not UTF-8) | Defaults; a warning is shown and the file is never overwritten |
 
-If `settings.json` cannot be overwritten, the app still works but cannot remember the workspace, and says so.
+If `settings.json` cannot be overwritten, the app still works but cannot remember the workspace or changed settings, and says so.
+
+Changes from the app apply at once and are saved in the background, one write at a time and in order, so the last change wins. Each write is a patch: only the field that changed (for `hideDone`, only the open workspace's entry) is set on top of the file as last read, so unknown fields, invalid raw values and other fields keep what the file says. When `write_settings` returns `Conflict`, the file is read and applied again (as on hot reload), the patch is applied on top of it and the write is retried, at most 3 times; after that the change stays in the running app and a toast says "Could not save settings: settings.json keeps changing". Changes made by the app but not written yet stay applied when the file is reloaded in between. `hideDone` keeps the 20 most recently changed workspaces.
 
 **Hot reload.** When the watcher reports `.kaido/config.json` (created, changed or deleted), the frontend reads it again, applies the new ignore patterns and rebuilds the model. A rescan re-reads it as well.
+
+When `settings.json` changes outside the app (`settings://changed`), the frontend reads and parses it again (a text equal to what it last read or wrote is ignored) and applies it: font size, auto-sync (the running scheduler is switched), the recent workspaces, the dismissed setup banners, the hidden done tasks of the open workspace, and the capture shortcut (`set_capture_shortcut` is called only when it changed). `workspace` is not applied: editing it never switches the open workspace. Unlike on start, a reload never falls back to defaults: a field with an invalid value keeps its current value, and a file that is not valid JSON, not a JSON object or from a newer version keeps every current setting (and is not overwritten). Auto-sync is only turned on by an explicit `"autoSync": true`; removing the field while it is off keeps it off. New warnings show a toast ("Some changed settings could not be read; their current values are kept."). If the file cannot be read, the current settings stay and a warning is added.
 
 ## Startup flow
 
 `AppState` in `src/lib/ui/appState.svelte.ts` drives startup:
 
-1. Read `settings.json`. Without a saved workspace, show the "open a folder" screen.
+1. Subscribe to settings changes, then read `settings.json`. Without a saved workspace, show the [start screen](#start-screen).
 2. Open the workspace. Subscribe to change events **before** listing, so no change in between is missed.
 3. Read `.kaido/config.json` and list files in parallel, build the model and render. The first render needs only the listing.
-4. Save the opened workspace to `settings.json` in the background; a failure becomes a warning, never a blocking error.
+4. Save the opened workspace to `settings.json` (as `workspace` and first of `recentWorkspaces`) in the background; a failure becomes a warning, never a blocking error. Restore the workspace's hidden done tasks from `hideDone`.
 5. After the first render, read titles and open task counts in the background (**summaries**); task lists read this way also fill the [task index](#all-tasks):
    - task lists first (they drive the sidebar counts), then the selected project, then the rest;
    - up to 8 files at a time;
@@ -289,6 +333,32 @@ Change events are queued until the initial load finishes, then applied one at a 
 - If the open note is deleted it is shown as missing; a file over 8 MiB is shown as too large to open.
 
 Opening another workspace drops background work of the previous one (queued summary reads, change events still waiting). Unsaved edits are handled as described in [Editing and autosave](#editing-and-autosave).
+
+### Start screen
+
+Shown when no workspace is open (first run, a saved workspace that could not be opened) and on **Switch…** in the settings, where the open workspace keeps running behind it and **← back to** returns to it. Opening another workspace from there follows the usual switching rules.
+
+- A git line (`git_version`): `git 2.43.0 found`, or a warning that sync is off without git. It never blocks.
+- **Open folder…** (focused first) picks a folder and opens it.
+- **Create new…** opens a form: a location (folder picker) and a folder name (`notes`). `scaffold_workspace` creates `<location>/<name>`, then the returned `root` is opened. A folder that is not empty, a name the OS cannot use (`src/lib/core/workspaceLocation.ts`) and other failures are shown in the form, which keeps its values. When git could not be set up (`gitError`), the workspace opens anyway and a toast says why.
+- **Clone from URL…** opens a form: the URL, a location and a folder name, suggested from the URL's last segment without `.git` until the name is edited. While `git_clone` runs, the form shows `Cloning…` and a **Cancel** button (`Esc` does the same; `git_clone_cancel`). Errors (authentication, network, destination exists) are shown in the form with git's sanitized message; a cancelled clone says so. The clone is then opened like any folder.
+- **Recent workspaces** lists `recentWorkspaces`. A folder that could not be found when opened (`NotFound`, `NotADirectory`) is marked `not found` until it opens again; each entry has a remove button.
+
+### Setup banner
+
+After a workspace opens, `workspace_setup_status` is read in the background. If `.gitattributes` lacks the `merge=union` line for task lists or `.gitignore` lacks the app's entries, and the workspace is not in `dismissedSetup`, a banner above the list and main panes asks "Set up this folder for Kaido?". **Set up** runs `ensure_workspace_files` and the next automatic commit picks up the change; **Not now** adds the workspace to `dismissedSetup`. The user's repository is never changed without that click. The settings dialog offers the same as **Set up git files**, disabled when nothing is missing.
+
+### Settings dialog
+
+`Ctrl+,` (`Cmd+,`, also from the editor), the gear in the sidebar footer and the palette command `> Settings` open a modal dialog (`src/lib/ui/SettingsDialog.svelte`); `Esc`, the same shortcut, the close button or a click outside close it and give focus back. `Tab` stays inside it, and global shortcuts wait while it is open. Every change applies and is saved immediately:
+
+| Section | Controls |
+|---|---|
+| Workspace | The open folder, **Switch…**, **Set up git files** |
+| Editor | Font size, 12–20, with − / + buttons or typed |
+| Sync | **Auto-sync** switch |
+| Quick capture | The shortcut as keys and **Change**, which records the next key combination: at least one of `Ctrl`, `Alt`, `Cmd`/`Super` plus a key, read by physical key (`KeyboardEvent.code`); `Esc` cancels, `Backspace` turns the shortcut off. `Ctrl` (`Cmd` on macOS) is stored as `CommandOrControl` (`src/lib/core/accelerator.ts`). The new shortcut is saved only once `set_capture_shortcut` registered it; otherwise the old one stays and the dialog says "That shortcut is in use by another app" |
+| About | Version (from `package.json`), repository link (copied to the clipboard) and license |
 
 ## Editing and autosave
 
@@ -351,7 +421,7 @@ Every other line keeps its bytes and its own line break. Done tasks are never mo
 
 **Saving.** A task list uses the same `SaveSession` as a note: edits change the list's text and the view right away, and the session saves 500 ms later, immediately on switching items, leaving the window or closing the app. Changes on disk reload the view when there are no unsaved edits; with unsaved edits both versions are kept, exactly as for notes. The other version is written as `tasks (conflict YYYY-MM-DD HHmm).md` next to the list; since only `tasks.md` is a task list, that copy shows up as a note of the project and its tasks are not counted or shown in the task views. The list pane marks conflict copies (names ending in ` (conflict YYYY-MM-DD HHmm).md`, optionally numbered) with a warning icon. The **View as** switch at the right end of the header (`list` / `text`, a radio group: arrow keys or a click change it, and focus stays on it) shows the same file, with the same session, in the text editor or as the task view; it sits at the same place in both headers. `Ctrl+Shift+M` (`Cmd+Shift+M`) toggles it while a project's task list is selected, also from inside the text editor but not while typing in another field; it moves focus into the editor, or to the task list. A task edit that reaches the list while it is shown as text (an undo from a toast) is handed to the editor like a change from disk, so the next keystroke keeps it.
 
-**Task view.** Selecting a project's task list shows its tasks in file order under their headings. Done tasks stay where they are, struck through and dimmed; **hide done** in the header hides them (and done subtasks), remembered per list while the app runs. Toggling never moves a task, so focus stays on it.
+**Task view.** Selecting a project's task list shows its tasks in file order under their headings. Done tasks stay where they are, struck through and dimmed; **hide done** in the header hides them (and done subtasks), remembered per list and workspace in the device settings (`hideDone`). Toggling never moves a task, so focus stays on it.
 
 Each row shows a chevron when the task has detail, the subtask counter (`done/total`) when it has subtasks, and a `↗ <note>` chip when it links to a note (see [Linked notes](#linked-notes)). Icons are [Lucide](https://lucide.dev) line icons drawn with the text color: muted, the accent color on the selected row, and hidden from assistive technology.
 
@@ -410,11 +480,11 @@ The index (`src/lib/core/searchIndex.ts`, wrapping [MiniSearch](https://github.c
 
 The index is built in memory as the app reads files, never in a separate pass: the background summary reads index each note's text, opening a note re-indexes it, renames and deletions move or drop it, and task lists are re-indexed whenever the task index changes. A note saved while typing is queued and indexed when the app is idle (a search indexes anything still queued first), so autosave never pays for it. Tasks are keyed by their text and how many identical lines come before them, not by line number, so adding, editing or moving a task re-indexes only that task. Search covers whatever has been read so far; on a cold start it fills up in the background. Open results are refreshed when the indexed content changes.
 
-In the palette, `↑`/`↓` (or `Ctrl+N`/`Ctrl+P`) move, `Enter` opens and `Esc` closes and gives focus back to where it was. A note opens in the editor, a task opens its list with the task focused (done tasks are shown if they were hidden), a project opens its task list. Input starting with `>` lists commands (new note, new project, sync now, hide or show done tasks, switch list / text), filtered by plain substring; input starting with `#` is reserved for tags. The palette is a modal dialog with a combobox that controls the result listbox (`aria-activedescendant`); focus stays in its input.
+In the palette, `↑`/`↓` (or `Ctrl+N`/`Ctrl+P`) move, `Enter` opens and `Esc` closes and gives focus back to where it was. A note opens in the editor, a task opens its list with the task focused (done tasks are shown if they were hidden), a project opens its task list. Input starting with `>` lists commands (new note, new project, sync now, hide or show done tasks, switch list / text, settings), filtered by plain substring; input starting with `#` is reserved for tags. The palette is a modal dialog with a combobox that controls the result listbox (`aria-activedescendant`); focus stays in its input.
 
 ## Quick capture
 
-A global shortcut, `Ctrl+Alt+Space` (`Cmd+Alt+Space` on macOS), opens a small always-on-top window to add a task or a note without switching to Kaido. It works while the app runs, even when its window is not focused.
+A global shortcut, `Ctrl+Alt+Space` (`Cmd+Alt+Space` on macOS) by default, opens a small always-on-top window to add a task or a note without switching to Kaido. It works while the app runs, even when its window is not focused. The shortcut can be changed or turned off in the settings (`captureShortcut`).
 
 | Key | Does |
 |---|---|
@@ -443,11 +513,23 @@ The capture window cannot emit events itself: it calls `capture_submit` and `cap
 
 Payloads are validated with valibot on arrival; malformed ones are dropped. Both sides are reached through `src/lib/storage` (`CaptureChannel` for the capture window, `CaptureHost` for the main window, with Tauri and in-memory implementations).
 
-**Shortcut registration.** If the shortcut cannot be registered (usually another app uses it), the failure is logged and the app works on without it. The main window asks `capture_shortcut_status` once at startup and shows a toast if the shortcut is unavailable. On Linux, global shortcuts depend on the desktop: under a pure Wayland session they may not fire at all.
+**Shortcut registration.** At startup, before the main window loads, Rust registers `captureShortcut` from `settings.json` (`null` disables it; a missing or invalid value means the default). Like the frontend, Rust accepts only shortcuts with `Ctrl`, `Alt` or `Super`/`Cmd` (`CommandOrControl` counts) and at most 100 characters; no modifier or `Shift` alone is invalid, both at startup (the default is used) and in `set_capture_shortcut`. If the shortcut cannot be registered (usually another app uses it), the failure is logged and the app works on without it. The main window asks `capture_shortcut_status` (`{ registered, shortcut }`, `shortcut` is `null` when disabled) once settings are read; if it differs from `captureShortcut` it calls `set_capture_shortcut`, and it shows a toast if the configured shortcut is unavailable. `set_capture_shortcut` registers the new shortcut first and releases the old one only when that worked; on failure the old one stays active and the result has `registered: false`, the attempted `shortcut` and a `message`. `null` disables the shortcut. On Linux, global shortcuts depend on the desktop: under a pure Wayland session they may not fire at all.
+
+## Workspace creation and setup
+
+`scaffold_workspace { root }` creates a workspace in a missing folder (its parent must exist) or an empty one (`.DS_Store`, `Thumbs.db` and `desktop.ini` are ignored); any other folder fails with `NotEmpty`. A folder inside the open workspace, or one that contains it, fails with `InvalidPath`, so a workspace never ends up nested in another. It writes, never replacing anything: `inbox/tasks.md` (empty), `.kaido/config.json` (`{ "version": 1, "ignore": [] }`), `.gitattributes` with `tasks.md merge=union` and `.gitignore` with `.kaido-*.tmp` and `.Trash-*`. Then, when git is installed and the folder is not already inside a repository, it runs `git init` and, only when a git identity is configured, commits everything as `Set up Kaido workspace`. Git problems do not undo the files: the result's `git` is `initialized`, `existing-repo`, `git-missing` or `failed`, `commit` is the commit hash or `null`, and `gitError` explains a failure. The command does not open the workspace.
+
+`ensure_workspace_files` adds only the `.gitattributes` and `.gitignore` lines the open workspace lacks: it appends them with the file's own line endings (adding a final line break first if needed) and never rewrites existing lines. Whether task lists already merge with `merge=union` is asked to git when the workspace is in a repository (`git check-attr merge -- tasks.md x/tasks.md`, read-only, `GIT_OPTIONAL_LOCKS=0`), so every attributes file and pattern counts. Without git, the text of `.gitattributes` decides: `merge=union` set for `tasks.md`, `**/tasks.md`, `*.md`, `**/*.md`, `*`, `**` or `**/*` counts unless a later line for one of those patterns turns it off (`-merge`, `!merge`, `merge`, `merge=<other>`, `binary`). The line is not reported or added again when it is already the file's last line (then something read after it, such as `.git/info/attributes`, turns it off, and appending would not help); `**/<entry>` counts for an ignore entry. It waits like a file write while a sync rebases. `workspace_setup_status` reports what is missing without changing anything.
+
+`git_clone { url, parent, name }` creates `parent/name` (it must not exist; `name` must be a valid folder name for the OS) and runs `git clone -- <url> <name>` in `parent` with the same environment as other network commands (no prompts, batch SSH unless the user configured an SSH command, the `ext::` transport disabled). `GIT_ALLOW_PROTOCOL` and `GIT_PROTOCOL_FROM_USER` are removed from its environment, since they would override the disabled transport. An SSH command counts as configured only in the system or global git configuration: the check does not read a repository around the destination. A destination inside the open workspace, or one that contains it, fails with `InvalidPath`. The clone is killed after 10 minutes (`GitNetwork`) or by `git_clone_cancel` (`Cancelled`) together with every process it started: on Unix its process group, on Windows the job object it was put in right after it started (`taskkill /T /F` if the job could not be set up), which also covers helpers like `git-remote-https` and the launcher `git.exe` some installations use. A cancel that arrives before git starts keeps it from starting. After any failure the new folder is removed. When the app exits, running clones are cancelled this way and exit waits up to 2 seconds for each to finish removing its folder. Failures are `GitAuth`, `GitNetwork` or `GitFailed` with sanitized messages, never containing credentials from the URL.
+
+**Device settings hot reload.** Rust watches the folder holding `settings.json` and, about 200 ms after changes stop, emits `settings://changed` (no payload) to the main window if the file's contents differ from what the app last wrote or reported. The app's own `write_settings` calls are therefore not reported. Reporting a change does not update the version writes may replace (see [Settings writes](#settings-writes)).
 
 ## Git sync
 
 The workspace is stored in a git repository the user owns. The Rust side (`src-tauri/src/git.rs`, `sync.rs`) runs the `git` installed on the system; the frontend decides when to commit and sync.
+
+With **auto-sync** off (`autoSync: false`), the scheduler (`src/lib/core/syncScheduler.ts`) commits and syncs nothing on its own: start and window focus only read the status, no commit, interval or retry timer is armed, and the sidebar says `auto-sync off`. **Sync now** still commits and syncs once. Turning it back on commits and syncs what is pending.
 
 ### Running git
 
@@ -458,7 +540,7 @@ The workspace is stored in a git repository the user owns. The Rust side (`src-t
 
 | Commands | Limit | On timeout |
 |---|---|---|
-| Reading (`status`, `rev-parse`, `config`, `diff`, `log`, `cat-file`) | 10 s | Killed with the processes it started (its process group on Unix); `GitNetwork` |
+| Reading (`status`, `rev-parse`, `config`, `diff`, `log`, `cat-file`) | 10 s | Killed with the processes it started (its process group on Unix, its job object on Windows); `GitNetwork` |
 | Network (`fetch`, `push`) | 120 s | Killed the same way; `GitNetwork`. Also killed when the app exits |
 | Writing (`add`, `commit`, `checkout --merge`, `update-ref`, `rebase` and its `--continue`, `--skip`, `--abort`) | 10 min | Never sent `SIGKILL`. On Unix it is asked to stop with `SIGTERM` (git removes its lock files and exits cleanly) and waited for until it exits; elsewhere it is waited for without a limit. `GitFailed` |
 

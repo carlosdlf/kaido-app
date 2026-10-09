@@ -34,3 +34,14 @@ export function isSearchShortcut(event: KeyPress, mac: boolean): boolean {
 export function searchShortcutLabels(mac: boolean): { aria: string; hint: string } {
   return mac ? { aria: "Meta+K", hint: "⌘K" } : { aria: "Control+K", hint: "^K" };
 }
+
+/** `Ctrl+,`, or `Cmd+,` on macOS: open the settings. */
+export function isSettingsShortcut(event: KeyPress, mac: boolean): boolean {
+  if (event.key !== "," || event.altKey || event.shiftKey) return false;
+  return mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+}
+
+/** How the settings shortcut is announced (`aria-keyshortcuts`) and shown. */
+export function settingsShortcutLabels(mac: boolean): { aria: string; hint: string } {
+  return mac ? { aria: "Meta+,", hint: "⌘," } : { aria: "Control+,", hint: "^," };
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/carlosdlf/kaido-app/blob/main/schemas/workspace-config.schema.json",
+  "title": "Kaido workspace configuration",
+  "description": ".kaido/config.json inside a workspace, synced with it. Fields with invalid values fall back to their defaults.",
+  "type": "object",
+  "properties": {
+    "version": {
+      "description": "Format version of this file.",
+      "type": "integer",
+      "const": 1
+    },
+    "ignore": {
+      "description": "Extra paths to hide, in a gitignore-like syntax: names (drafts, *.draft.md), anchored paths (/scratch), folders (tmp/), * ? and **.",
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    }
+  },
+  "required": ["version"]
+}

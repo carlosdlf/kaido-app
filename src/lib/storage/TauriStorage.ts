@@ -19,7 +19,11 @@ import type {
   ChangeListener,
   CloseHandler,
   FileContents,
+  GitVersion,
   OpenedWorkspace,
+  ScaffoldResult,
+  SetupFiles,
+  SetupStatus,
   Storage,
   Unsubscribe,
   WriteOptions,
@@ -27,6 +31,8 @@ import type {
 } from "./types";
 
 export const CHANGE_EVENT = "workspace://changed";
+/** Emitted when the device settings file was changed outside the app. */
+export const SETTINGS_EVENT = "settings://changed";
 
 const FileEntrySchema = v.object({ path: v.string(), size: v.number(), modified: v.number() });
 const OpenedSchema = v.object({ root: v.string() });
@@ -69,6 +75,17 @@ const SyncResultSchema = v.object({
   // Older backends leave it out: nothing was deferred.
   deferred: v.optional(v.boolean(), false),
 });
+const GitVersionSchema = v.object({ available: v.boolean(), version: v.nullable(v.string()) });
+const SetupFilesSchema = v.object({ created: v.array(v.string()), updated: v.array(v.string()) });
+const ScaffoldResultSchema = v.object({
+  root: v.string(),
+  created: v.array(v.string()),
+  updated: v.array(v.string()),
+  git: v.picklist(["initialized", "existing-repo", "git-missing", "failed"]),
+  commit: v.nullable(v.string()),
+  gitError: v.nullable(v.string()),
+});
+const SetupStatusSchema = v.object({ missing: v.array(v.string()) });
 /** Commands without a result resolve to `null`. */
 const NoResult = v.nullish(v.never());
 
@@ -151,6 +168,38 @@ export class TauriStorage implements Storage {
 
   async writeSettings(contents: string): Promise<void> {
     await call(v.unknown(), "write_settings", { contents });
+  }
+
+  async watchSettings(listener: () => void): Promise<Unsubscribe> {
+    try {
+      return await listen<unknown>(SETTINGS_EVENT, () => listener());
+    } catch (error) {
+      throw toStorageError(error);
+    }
+  }
+
+  gitVersion(): Promise<GitVersion> {
+    return call(GitVersionSchema, "git_version");
+  }
+
+  scaffoldWorkspace(root: string): Promise<ScaffoldResult> {
+    return call(ScaffoldResultSchema, "scaffold_workspace", { root });
+  }
+
+  workspaceSetupStatus(): Promise<SetupStatus> {
+    return call(SetupStatusSchema, "workspace_setup_status");
+  }
+
+  ensureWorkspaceFiles(): Promise<SetupFiles> {
+    return call(SetupFilesSchema, "ensure_workspace_files");
+  }
+
+  cloneRepository(url: string, parent: string, name: string): Promise<OpenedWorkspace> {
+    return call(OpenedSchema, "git_clone", { url, parent, name });
+  }
+
+  async cancelClone(): Promise<void> {
+    await call(v.unknown(), "git_clone_cancel");
   }
 
   async gitStatus(): Promise<GitStatus> {

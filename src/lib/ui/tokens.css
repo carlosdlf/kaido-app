@@ -51,9 +51,18 @@
   --font-size-meta: 11px;
   --font-size-small: 12px;
   --font-size-ui: 13px;
-  --font-size-note: 15px;
-  --font-size-note-h2: 18px;
-  --font-size-note-h1: 30px;
+  /* Titles in the app chrome (start screen, dialogs). */
+  --font-size-title: 18px;
+  /*
+   * Text of the note editor and the task views. The app sets it from the
+   * editor font size setting; the sizes below follow it, the chrome does not.
+   */
+  --font-size-editor: 15px;
+  --font-size-note: var(--font-size-editor);
+  --font-size-note-h2: calc(var(--font-size-editor) * 1.2);
+  --font-size-note-h1: calc(var(--font-size-editor) * 2);
+  /* Code, tables and task rows: a step below the note text. */
+  --font-size-editor-mono: calc(var(--font-size-editor) - 2px);
 
   --line-height-ui: 1.5;
   --line-height-note: 1.7;
@@ -102,6 +111,10 @@
   --palette-width: 640px;
   --palette-offset: 12vh;
   --palette-max-height: 60vh;
+  /* Settings dialog and start screen. */
+  --dialog-width: 560px;
+  --dialog-max-height: 80vh;
+  --start-width: 520px;
   /* Quick capture window: one row, and a project picker row. */
   --capture-height: 52px;
   --capture-row-height: 28px;

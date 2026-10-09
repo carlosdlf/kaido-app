@@ -16,6 +16,35 @@ export interface OpenedWorkspace {
   root: string;
 }
 
+/** Whether git is installed. */
+export interface GitVersion {
+  available: boolean;
+  /** e.g. `2.43.0`, or `null` without git. */
+  version: string | null;
+}
+
+/** Files a workspace setup created or added lines to, workspace-relative. */
+export interface SetupFiles {
+  created: string[];
+  updated: string[];
+}
+
+/** What creating a workspace did; git problems never undo the files. */
+export interface ScaffoldResult extends SetupFiles {
+  /** Canonical absolute path of the new workspace, to open. */
+  root: string;
+  git: "initialized" | "existing-repo" | "git-missing" | "failed";
+  /** The initial commit, or `null` (no identity, no git, or a failure). */
+  commit: string | null;
+  /** Why git init or the initial commit failed, or `null`. */
+  gitError: string | null;
+}
+
+/** Setup files the open workspace is missing or that lack lines Kaido needs. */
+export interface SetupStatus {
+  missing: string[];
+}
+
 export type ChangeListener = (event: ChangeEvent) => void;
 export type Unsubscribe = () => void;
 /**
@@ -69,7 +98,39 @@ export interface Storage {
   deleteFile(path: string, expectedHash: string): Promise<void>;
   /** Raw device settings, or `null` if the file does not exist. */
   readSettings(): Promise<string | null>;
+  /**
+   * Replaces the device settings, but only the version last read or
+   * written (compare-and-swap): if the file changed since, or exists and
+   * was never read, nothing is written and the error is `Conflict`.
+   */
   writeSettings(contents: string): Promise<void>;
+  /**
+   * Subscribes to changes of the device settings file made outside the app
+   * (another editor). The app's own writes are not reported.
+   */
+  watchSettings(listener: () => void): Promise<Unsubscribe>;
+  /** Whether git is installed, and its version. Never fails for a missing git. */
+  gitVersion(): Promise<GitVersion>;
+  /**
+   * Prepares a new workspace at `root` (an absolute path): creates the
+   * folder if needed (refusing a folder that is not empty with `NotEmpty`),
+   * adds the inbox, the workspace config, `.gitattributes` and `.gitignore`,
+   * and makes it a git repository with a first commit where possible. Does
+   * not open it.
+   */
+  scaffoldWorkspace(root: string): Promise<ScaffoldResult>;
+  /** Which setup files of the open workspace are missing lines (never changes anything). */
+  workspaceSetupStatus(): Promise<SetupStatus>;
+  /** Adds the missing `.gitattributes` and `.gitignore` lines to the open workspace. */
+  ensureWorkspaceFiles(): Promise<SetupFiles>;
+  /**
+   * Clones `url` into `<parent>/<name>` and resolves to the new folder. Does
+   * not open it. Fails with `Cancelled` after `cancelClone`, `Conflict`
+   * when the destination exists, or `GitAuth`, `GitNetwork`, `GitFailed`.
+   */
+  cloneRepository(url: string, parent: string, name: string): Promise<OpenedWorkspace>;
+  /** Stops a running clone; the clone then fails. Does nothing when none runs. */
+  cancelClone(): Promise<void>;
   /** Subscribes to workspace changes, including the app's own writes. */
   watch(listener: ChangeListener): Promise<Unsubscribe>;
   /**
