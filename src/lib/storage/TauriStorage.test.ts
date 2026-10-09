@@ -10,6 +10,17 @@ vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ onCloseReq
 
 const { CHANGE_EVENT, TauriStorage, writeFileArgs } = await import("./TauriStorage");
 
+const repoStatus = {
+  state: "ready",
+  branch: "main",
+  upstream: "origin/main",
+  remote: true,
+  ahead: 1,
+  behind: 0,
+  changed: ["inbox/a.md"],
+  gitVersion: "2.43.0",
+};
+
 const entry = { path: "a.md", size: 1, modified: 2 };
 const written = { ...entry, hash: "ab12" };
 const read = { contents: "text", hash: "ab12" };
@@ -155,6 +166,125 @@ describe("TauriStorage", () => {
     await expect(storage.readFile("a.md")).rejects.toMatchObject({ kind: "Io" });
     invoke.mockResolvedValue(entry);
     await expect(storage.writeFile("a.md", "x")).rejects.toMatchObject({ kind: "Io" });
+  });
+
+  describe("git", () => {
+    it("reads the status", async () => {
+      invoke.mockResolvedValue(repoStatus);
+      await expect(storage.gitStatus()).resolves.toEqual(repoStatus);
+      expect(invoke).toHaveBeenCalledWith("git_status", undefined);
+    });
+
+    it("drops absent optional status fields", async () => {
+      invoke.mockResolvedValue({ ...repoStatus, pausedReason: null, operation: null });
+      await expect(storage.gitStatus()).resolves.toEqual(repoStatus);
+      invoke.mockResolvedValue({
+        ...repoStatus,
+        state: "paused",
+        pausedReason: "operation-in-progress",
+        operation: "rebase",
+      });
+      await expect(storage.gitStatus()).resolves.toMatchObject({
+        pausedReason: "operation-in-progress",
+        operation: "rebase",
+      });
+    });
+
+    it("keeps a status message and drops an empty one", async () => {
+      const pausedMessage =
+        "Kaido started this rebase. Run git rebase --continue or git rebase --abort.";
+      invoke.mockResolvedValue({
+        ...repoStatus,
+        state: "paused",
+        pausedReason: "operation-in-progress",
+        operation: "rebase",
+        pausedMessage,
+      });
+      await expect(storage.gitStatus()).resolves.toMatchObject({ pausedMessage });
+      invoke.mockResolvedValue({ ...repoStatus, pausedMessage: "" });
+      await expect(storage.gitStatus()).resolves.toEqual(repoStatus);
+      invoke.mockResolvedValue({ ...repoStatus, pausedMessage: null });
+      await expect(storage.gitStatus()).resolves.toEqual(repoStatus);
+    });
+
+    it("reads an unavailable state", async () => {
+      invoke.mockResolvedValue({ state: "unavailable", reason: "git-missing" });
+      await expect(storage.gitStatus()).resolves.toEqual({
+        state: "unavailable",
+        reason: "git-missing",
+      });
+    });
+
+    it.each([
+      { ...repoStatus, state: "weird" },
+      { ...repoStatus, ahead: -1 },
+      { ...repoStatus, pausedReason: "tired" },
+      { state: "unavailable", reason: "nope" },
+      { ...repoStatus, changed: [1] },
+    ])("rejects a malformed status %#", async (response) => {
+      invoke.mockResolvedValue(response);
+      await expect(storage.gitStatus()).rejects.toMatchObject({
+        kind: "Io",
+        message: "Unexpected response from git_status.",
+      });
+    });
+
+    it("commits with a message", async () => {
+      invoke.mockResolvedValue({ commit: "abc", paths: ["a.md"] });
+      await expect(storage.gitCommit("Update a.md")).resolves.toEqual({
+        commit: "abc",
+        paths: ["a.md"],
+      });
+      expect(invoke).toHaveBeenCalledWith("git_commit", { message: "Update a.md" });
+      invoke.mockResolvedValue({ commit: null, paths: [] });
+      await expect(storage.gitCommit("x")).resolves.toEqual({ commit: null, paths: [] });
+      invoke.mockResolvedValue({ commit: 1, paths: [] });
+      await expect(storage.gitCommit("x")).rejects.toMatchObject({ kind: "Io" });
+    });
+
+    it.each([
+      "index-locked",
+      "upstream-mismatch",
+      "upstream-gone",
+      "outside-commits",
+      "local-merges",
+    ])("accepts the %s paused reason", async (reason) => {
+      invoke.mockResolvedValue({ ...repoStatus, state: "paused", pausedReason: reason });
+      await expect(storage.gitStatus()).resolves.toMatchObject({ pausedReason: reason });
+    });
+
+    it("reads deferred syncs, and treats a missing flag as not deferred", async () => {
+      const base = { pulled: 0, pushed: 0, changed: [], conflicts: [] };
+      invoke.mockResolvedValue({ ...base, deferred: true });
+      await expect(storage.gitSync()).resolves.toEqual({ ...base, deferred: true });
+      invoke.mockResolvedValue(base);
+      await expect(storage.gitSync()).resolves.toEqual({ ...base, deferred: false });
+      invoke.mockResolvedValue({ ...base, deferred: "yes" });
+      await expect(storage.gitSync()).rejects.toMatchObject({ kind: "Io" });
+    });
+
+    it("syncs", async () => {
+      const result = {
+        pulled: 2,
+        pushed: 1,
+        changed: ["a.md"],
+        conflicts: [{ path: "a.md", copy: "a (conflict 2026-10-08 1430).md" }],
+        deferred: false,
+      };
+      invoke.mockResolvedValue(result);
+      await expect(storage.gitSync()).resolves.toEqual(result);
+      expect(invoke).toHaveBeenCalledWith("git_sync", undefined);
+      invoke.mockResolvedValue({ ...result, conflicts: [{ path: "a.md" }] });
+      await expect(storage.gitSync()).rejects.toMatchObject({ kind: "Io" });
+    });
+
+    it.each(["GitUnavailable", "GitPaused", "GitNetwork", "GitAuth", "GitFailed"])(
+      "passes through %s errors",
+      async (kind) => {
+        invoke.mockRejectedValue({ kind, message: "details" });
+        await expect(storage.gitSync()).rejects.toMatchObject({ kind, message: "details" });
+      },
+    );
   });
 
   describe("close requests", () => {

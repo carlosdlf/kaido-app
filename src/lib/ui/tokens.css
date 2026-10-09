@@ -35,6 +35,8 @@
   /* Status */
   --color-success: #6ccb8a;
   --color-danger: #f2837a;
+  /* Paused, needs attention but nothing failed: a yellow distinct from the accent. */
+  --color-warning: #e8c66a;
   --color-conflict-bg: #1f1a12;
   --color-conflict-border: #5a4520;
   --color-paused-bg: #1f1315;
@@ -98,6 +100,8 @@
   /* Motion */
   --duration-fast: 80ms;
   --duration-base: 140ms;
+  /* One turn of a busy indicator. */
+  --duration-spin: 1200ms;
   --easing-standard: cubic-bezier(0.2, 0, 0, 1);
 }
 

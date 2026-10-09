@@ -11,7 +11,13 @@
   } from "$lib/core/views";
   import { isNewNoteShortcut, newNoteShortcutLabels } from "$lib/core/newNote";
   import { isNewProjectShortcut, newProjectShortcutLabels } from "$lib/core/projectNames";
-  import { isViewModeShortcut, viewModeShortcutLabels } from "$lib/core/shortcuts";
+  import {
+    isSyncShortcut,
+    isViewModeShortcut,
+    syncShortcutLabels,
+    viewModeShortcutLabels,
+  } from "$lib/core/shortcuts";
+  import { describeSync } from "$lib/core/syncStatus";
   import { openTaskCount, type InsertPosition, type TaskRef } from "$lib/core/taskDocument";
   import { allTaskRows, taskRows, type RowOptions } from "$lib/core/taskRows";
   import { taskGroups } from "$lib/core/taskIndex";
@@ -48,6 +54,8 @@
   const newNoteShortcut = newNoteShortcutLabels(mac);
   const newProjectShortcut = newProjectShortcutLabels(mac);
   const viewModeShortcut = viewModeShortcutLabels(mac);
+  const syncShortcut = syncShortcutLabels(mac);
+  const syncView = $derived(app.sync ? describeSync(app.sync, now) : null);
 
   /** The main pane shows the combined task view. */
   const showAll = $derived(app.item === ALL_TASKS);
@@ -201,6 +209,12 @@
 
   function handleKeydown(event: KeyboardEvent) {
     if (event.defaultPrevented || event.isComposing) return;
+    if (isSyncShortcut(event, mac)) {
+      // Works everywhere, the editor included; the browser would offer to save the page.
+      event.preventDefault();
+      if (!event.repeat) app.syncNow();
+      return;
+    }
     if (isNewProjectShortcut(event, mac)) {
       event.preventDefault();
       if (!event.repeat && app.phase.kind === "ready") newProjectRequest += 1;
@@ -223,7 +237,11 @@
 </script>
 
 <!-- Save pending edits as soon as the user leaves the window. -->
-<svelte:window onblur={() => void app.flush()} onkeydown={handleKeydown} />
+<svelte:window
+  onblur={() => void app.flush()}
+  onfocus={() => app.windowFocused()}
+  onkeydown={handleKeydown}
+/>
 
 <Toasts
   toasts={app.toasts}
@@ -246,6 +264,9 @@
       oncreateproject={(name) => app.createProject(name)}
       createProjectShortcut={newProjectShortcut}
       {newProjectRequest}
+      sync={syncView}
+      onsync={() => app.syncNow()}
+      {syncShortcut}
     />
     <ListPane
       title={listTitle(app.folder)}

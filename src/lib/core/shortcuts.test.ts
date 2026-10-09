@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { isViewModeShortcut, viewModeShortcutLabels } from "./shortcuts";
+import {
+  isSyncShortcut,
+  isViewModeShortcut,
+  syncShortcutLabels,
+  viewModeShortcutLabels,
+} from "./shortcuts";
 
 const press = (key: string, modifiers: Partial<Record<string, boolean>> = {}) => ({
   key,
@@ -26,5 +31,23 @@ describe("view mode shortcut", () => {
   it("has labels for assistive technology and hints", () => {
     expect(viewModeShortcutLabels(false)).toEqual({ aria: "Control+Shift+M", hint: "^⇧M" });
     expect(viewModeShortcutLabels(true)).toEqual({ aria: "Meta+Shift+M", hint: "⌘⇧M" });
+  });
+});
+
+describe("sync shortcut", () => {
+  it("is Ctrl+Shift+S, or Cmd+Shift+S on macOS", () => {
+    expect(isSyncShortcut(press("S", { ctrlKey: true, shiftKey: true }), false)).toBe(true);
+    expect(isSyncShortcut(press("s", { metaKey: true, shiftKey: true }), true)).toBe(true);
+    expect(isSyncShortcut(press("s", { ctrlKey: true }), false)).toBe(false);
+    expect(isSyncShortcut(press("s", { ctrlKey: true, shiftKey: true }), true)).toBe(false);
+    expect(isSyncShortcut(press("s", { ctrlKey: true, shiftKey: true, altKey: true }), false)).toBe(
+      false,
+    );
+    expect(isSyncShortcut(press("m", { ctrlKey: true, shiftKey: true }), false)).toBe(false);
+  });
+
+  it("has labels for assistive technology and hints", () => {
+    expect(syncShortcutLabels(false)).toEqual({ aria: "Control+Shift+S", hint: "^⇧S" });
+    expect(syncShortcutLabels(true)).toEqual({ aria: "Meta+Shift+S", hint: "⌘⇧S" });
   });
 });

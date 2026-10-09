@@ -22,6 +22,11 @@
  * text right away and are saved through the list's session like editor
  * edits: the open list's session, or one created on demand from the index
  * for the All tasks view, dropped again once everything is on disk.
+ *
+ * Once a workspace is loaded, a `SyncScheduler` commits changes (the app's
+ * own writes and changes reported by the watcher) and syncs with the
+ * upstream in the background. It stops when another workspace opens or the
+ * app closes, after pending saves are written; no sync starts while closing.
  */
 
 import {
@@ -33,6 +38,8 @@ import {
   type Timers,
   type WriteOutcome,
 } from "$lib/core/saveMachine";
+import { ChangeHints, commitMessage, listingLookup } from "$lib/core/commitMessage";
+import type { CommitResult, SyncResult } from "$lib/core/git";
 import { newNoteFolder, newNotePath } from "$lib/core/newNote";
 import { nextAfterRemoval, renamedPath, validateNoteName } from "$lib/core/noteNames";
 import { projectTasksPath, validateProjectName } from "$lib/core/projectNames";
@@ -45,6 +52,14 @@ import type {
   TaskEdit,
   TaskRef,
 } from "$lib/core/taskDocument";
+import {
+  SyncScheduler,
+  type GitErrorKind,
+  type GitOutcome,
+  type SyncSchedulerOptions,
+  type SyncSnapshot,
+} from "$lib/core/syncScheduler";
+import { conflictsKeptMessage } from "$lib/core/syncStatus";
 import { NO_TASK_DOCS, TaskIndex, type TaskDocs } from "$lib/core/taskIndex";
 import {
   ALL_TASKS,
@@ -79,6 +94,7 @@ import {
   isStorageError,
   StorageError,
   toStorageError,
+  trackWrites,
   type FileContents,
   type Storage,
   type Unsubscribe,
@@ -157,6 +173,10 @@ export interface AppStateOptions {
   saveDelay?: number;
   /** Longest wait for pending saves when the app closes or switches workspaces. */
   closeTimeout?: number;
+  /** Delays of the git sync scheduler. */
+  sync?: Partial<
+    Pick<SyncSchedulerOptions, "commitDelay" | "syncInterval" | "focusSyncAge" | "backoffDelays">
+  >;
 }
 
 interface LoadedConfig {
@@ -298,6 +318,27 @@ export function createProjectFailedMessage(message: string): string {
   return `The project could not be created: ${message}`;
 }
 
+const GIT_ERROR_KINDS: Partial<Record<string, GitErrorKind>> = {
+  GitUnavailable: "unavailable",
+  GitPaused: "paused",
+  GitNetwork: "network",
+  GitAuth: "auth",
+};
+
+/** Runs a git call and reports a failure as an outcome for the scheduler. */
+async function gitOutcome<T>(work: () => Promise<T>): Promise<GitOutcome<T>> {
+  try {
+    return { ok: true, value: await work() };
+  } catch (error) {
+    const storageError = toStorageError(error);
+    return {
+      ok: false,
+      kind: GIT_ERROR_KINDS[storageError.kind] ?? "failed",
+      message: storageError.message,
+    };
+  }
+}
+
 /** Actions that are refused once while edits cannot be saved. */
 type UnsafeAction = "close" | "switch";
 
@@ -333,6 +374,8 @@ export class AppState {
   hideDone: ReadonlySet<string> = $state.raw(new Set());
   /** The latest request for the task views to move focus, or `null`. */
   taskFocus: TaskFocusRequest | null = $state.raw(null);
+  /** Git state of the open workspace, or `null` before syncing starts. */
+  sync: SyncSnapshot | null = $state.raw(null);
 
   readonly #storage: Storage;
   readonly #defer: (task: () => void) => void;
@@ -341,6 +384,11 @@ export class AppState {
   readonly #timers: Timers;
   readonly #saveDelay: number | undefined;
   readonly #closeTimeout: number;
+  readonly #syncOptions: AppStateOptions["sync"];
+  /** Commits and syncs the open workspace; `null` before it is loaded. */
+  #scheduler: SyncScheduler | null = null;
+  /** What the app did to files since the last commit, for commit messages. */
+  #hints = new ChangeHints();
   /** Autosave sessions by path: the open note and notes still being saved. */
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- private bookkeeping, never rendered
   readonly #sessions = new Map<string, SaveSession>();
@@ -403,7 +451,21 @@ export class AppState {
   #publishPending = false;
 
   constructor(storage: Storage, options: AppStateOptions = {}) {
-    this.#storage = storage;
+    this.#storage = trackWrites(storage, {
+      written: (path, created) => {
+        if (created) this.#hints.created(path);
+        this.#scheduler?.changed();
+      },
+      renamed: (from, to) => {
+        this.#hints.renamed(from, to);
+        this.#scheduler?.changed();
+      },
+      deleted: (path) => {
+        this.#hints.deleted(path);
+        this.#scheduler?.changed();
+      },
+    });
+    this.#syncOptions = options.sync;
     this.#defer = options.defer ?? defaultDefer;
     this.#schedule = options.schedule ?? defaultSchedule;
     this.#concurrency = options.concurrency ?? 8;
@@ -458,6 +520,7 @@ export class AppState {
     }
     const generation = ++this.#generation;
     this.#dropUndo();
+    const stopping = this.#stopSync();
     const closing = this.#closeSessions();
     this.#unwatch?.();
     this.#unwatch = null;
@@ -470,8 +533,11 @@ export class AppState {
     this.#changes = new Promise((resolve) => (finishInitialLoad = resolve));
     this.phase = { kind: "loading", path };
     try {
-      // Pending saves must land in the workspace they belong to.
+      // Pending saves must land in the workspace they belong to, and git
+      // must be done with it before the backend switches.
       if (closing) await closing;
+      await this.#withTimeout(stopping);
+      this.#hints = new ChangeHints();
       const { root } = await this.#storage.openWorkspace(path);
       // Subscribe before listing so no change between the two is missed.
       const unwatch = await this.#storage.watch((event) => this.#onChange(event, generation));
@@ -503,6 +569,7 @@ export class AppState {
       this.#background = new Promise((resolve) => {
         this.#defer(() => {
           this.#enqueue([...this.#index.keys()], generation);
+          this.#startSync(generation);
           resolve();
         });
       });
@@ -1008,6 +1075,21 @@ export class AppState {
     });
   }
 
+  /** Commits pending changes and syncs now, lifting stops and retry delays. */
+  syncNow(): void {
+    this.#scheduler?.syncNow();
+  }
+
+  /** The window got focus: refresh the git status and sync if it has been a while. */
+  windowFocused(): void {
+    this.#scheduler?.focus();
+  }
+
+  /** Resolves when no git operation is running. */
+  syncIdle(): Promise<void> {
+    return this.#scheduler?.idle() ?? Promise.resolve();
+  }
+
   /** Shows a short message. */
   notify(message: string): void {
     this.#toast(message);
@@ -1045,7 +1127,51 @@ export class AppState {
     this.#unwatch = null;
     this.#stopCloseHandler?.();
     this.#stopCloseHandler = null;
+    void this.#stopSync();
     void this.#closeSessions();
+  }
+
+  /** Starts committing and syncing the workspace loaded as `generation`. */
+  #startSync(generation: number): void {
+    if (generation !== this.#generation || this.#disposed || this.#scheduler) return;
+    const storage = this.#storage;
+    const scheduler: SyncScheduler = new SyncScheduler({
+      io: {
+        status: () => gitOutcome(() => storage.gitStatus()),
+        commit: (message) => gitOutcome(() => storage.gitCommit(message)),
+        sync: () => gitOutcome(() => storage.gitSync()),
+        flush: () => this.#withTimeout(this.flush()),
+        message: (changed) => {
+          const onDisk = listingLookup(this.#files.map((file) => file.path));
+          return commitMessage(this.#hints.describe(changed, onDisk));
+        },
+      },
+      timers: this.#timers,
+      ...this.#syncOptions,
+      events: {
+        changed: (snapshot) => {
+          if (this.#scheduler === scheduler) this.sync = snapshot;
+        },
+        committed: (result: CommitResult) => {
+          if (this.#scheduler === scheduler) this.#hints.committed(result.paths);
+        },
+        synced: (result: SyncResult) => {
+          if (this.#scheduler !== scheduler || result.conflicts.length === 0) return;
+          this.#toast(conflictsKeptMessage(result.conflicts.map((conflict) => conflict.copy)));
+        },
+      },
+    });
+    this.#scheduler = scheduler;
+    this.sync = scheduler.snapshot;
+    scheduler.start();
+  }
+
+  /** Stops the scheduler; resolves when its running git operation is done. */
+  #stopSync(): Promise<void> {
+    const scheduler = this.#scheduler;
+    this.#scheduler = null;
+    this.sync = null;
+    return scheduler?.stop() ?? Promise.resolve();
   }
 
   #select(folder: string): void {
@@ -1403,12 +1529,24 @@ export class AppState {
       .catch(() => undefined);
   }
 
-  /** Saves before the window closes; keeps it open once if something could not be saved. */
+  /**
+   * Saves before the window closes; keeps it open once if something could
+   * not be saved. No git operation starts meanwhile, and a running one is
+   * awaited (within the close timeout).
+   */
   async #confirmClose(): Promise<boolean> {
+    const scheduler = this.#scheduler;
+    const gitIdle = scheduler?.suspend() ?? Promise.resolve();
     // Saves of a previous workspace count as well.
-    await this.#withTimeout(Promise.all([this.flush(), this.#closing]));
+    await this.#withTimeout(Promise.all([this.flush(), this.#closing, gitIdle]));
     const unsaved = this.#unsaved([...this.#sessions.values(), ...this.#closingSessions]);
-    return this.#allow("close", unsaved, UNSAVED_ON_CLOSE);
+    const close = this.#allow("close", unsaved, UNSAVED_ON_CLOSE);
+    if (close) {
+      if (this.#scheduler === scheduler) void this.#stopSync();
+    } else {
+      scheduler?.resume();
+    }
+    return close;
   }
 
   /** Paths of sessions that still have edits to save. */
@@ -1695,6 +1833,8 @@ export class AppState {
   }
 
   #onChange(event: ChangeEvent, generation: number): void {
+    // The app's own writes are reported too; both restart the commit delay.
+    if (generation === this.#generation) this.#scheduler?.changed();
     this.#changes = this.#changes.then(() => this.#applyChange(event, generation));
   }
 

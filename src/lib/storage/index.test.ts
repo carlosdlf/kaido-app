@@ -20,4 +20,21 @@ describe("createStorage", () => {
     await storage.openWorkspace(SAMPLE_ROOT);
     expect((await storage.listFiles()).length).toBeGreaterThan(5);
   });
+
+  it("serves the sample workspace as a clean repository with an upstream", async () => {
+    vi.useFakeTimers();
+    try {
+      const storage = createStorage();
+      await storage.openWorkspace(SAMPLE_ROOT);
+      const status = storage.gitStatus();
+      await vi.runAllTimersAsync();
+      await expect(status).resolves.toMatchObject({
+        state: "ready",
+        upstream: "origin/main",
+        changed: [],
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

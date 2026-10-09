@@ -5,7 +5,9 @@
  * change notifications (with fresh metadata) for writes and simulated
  * external edits of listed files and the workspace configuration, and
  * conditional writes based on content hashes. Renames stay within a folder
- * and never replace a file; deleted notes are kept in `trash`.
+ * and never replace a file; deleted notes are kept in `trash`. A fake git
+ * repository (`git`) commits snapshots of the files and simulates an
+ * upstream, paused states and failures.
  */
 
 import {
@@ -14,7 +16,9 @@ import {
   type ChangeEvent,
   type FileEntry,
 } from "$lib/core/workspace";
+import type { CommitResult, GitStatus, SyncResult } from "$lib/core/git";
 import { contentHash } from "./contentHash";
+import { MemoryGit, type MemoryGitOptions } from "./MemoryGit";
 import { StorageError } from "./errors";
 import { checkNotePath, checkRenamePaths, checkStoragePath, MAX_FILE_BYTES } from "./paths";
 import type {
@@ -45,6 +49,8 @@ export interface MemoryStorageOptions {
   now?: () => number;
   /** Notify watchers about the app's own writes, like a real file watcher. Default `true`. */
   echoWrites?: boolean;
+  /** The fake git repository; by default the folder is not a repository. */
+  git?: MemoryGitOptions;
 }
 
 const encoder = new TextEncoder();
@@ -71,12 +77,26 @@ export class MemoryStorage implements Storage {
   #closeHandler: CloseHandler | null = null;
   readonly #now: () => number;
   readonly #echoWrites: boolean;
+  /** The workspace's fake git repository, controllable from tests. */
+  readonly git: MemoryGit;
 
   constructor(options: MemoryStorageOptions = {}) {
     this.settings = options.settings ?? null;
     this.pick = options.pick ?? null;
     this.#now = options.now ?? Date.now;
     this.#echoWrites = options.echoWrites ?? true;
+    this.git = new MemoryGit(
+      {
+        root: () => {
+          this.#files();
+          return this.root ?? "";
+        },
+        files: () => this.#files(),
+        now: () => this.#now(),
+        write: (path, contents) => this.setExternal(path, contents),
+      },
+      options.git,
+    );
     for (const [root, files] of Object.entries(options.folders ?? {})) {
       this.addFolder(root, files);
     }
@@ -121,6 +141,7 @@ export class MemoryStorage implements Storage {
       throw new StorageError("NotFound", "The folder does not exist.");
     }
     this.root = path;
+    this.git.opened();
     return { root: path };
   }
 
@@ -213,6 +234,18 @@ export class MemoryStorage implements Storage {
 
   async writeSettings(contents: string): Promise<void> {
     this.settings = contents;
+  }
+
+  gitStatus(): Promise<GitStatus> {
+    return this.git.status();
+  }
+
+  gitCommit(message: string): Promise<CommitResult> {
+    return this.git.commit(message);
+  }
+
+  gitSync(): Promise<SyncResult> {
+    return this.git.sync();
   }
 
   async watch(listener: ChangeListener): Promise<Unsubscribe> {

@@ -146,6 +146,9 @@ The Rust commands live in `src-tauri/src/commands.rs`. Each one runs its disk wo
 | `delete_file` | `path`, `expectedHash` | – |
 | `read_settings` | – | `string \| null` |
 | `write_settings` | `contents` | – |
+| `git_status` | – | `GitStatus`, see [Git sync](#git-sync) |
+| `git_commit` | `message` | `{ commit, paths }` |
+| `git_sync` | – | `SyncResult` |
 
 `FileEntry` is `{ path, size, modified }`, with `modified` in milliseconds since the Unix epoch. `hash` is the lowercase hex SHA-256 of the file's bytes; the frontend only compares hashes and never computes them.
 
@@ -186,6 +189,11 @@ Errors cross the boundary as `{ kind, message }` and become a `StorageError` in 
 | `Superseded` | A newer `open_workspace` call overtook this one |
 | `Conflict` | A conditional write found the file missing, present or changed (see [Conditional writes](#conditional-writes)) |
 | `Io` | Any other failure |
+| `GitUnavailable` | Git is not installed (`git-missing`) or the workspace is not in a repository (`not-a-repo`); the message is the reason |
+| `GitPaused` | The repository is in a state where the git command must not run; the message starts with the [paused reason](#status) or `pull-conflict` |
+| `GitNetwork` | The remote could not be reached, or a reading or network git command timed out |
+| `GitAuth` | The remote refused the credentials |
+| `GitFailed` | Any other git failure, with git's sanitized output (including a writing command stopped after its time limit) |
 
 ### Change event
 
@@ -376,17 +384,158 @@ The view reads the **task index** (`src/lib/core/taskIndex.ts`): the parsed text
 
 `+ new project` in the sidebar (or `Ctrl+Shift+N`, `Cmd+Shift+N` on macOS) opens a name field. `Enter` creates the project, `Esc` or leaving the field cancels. The name is used as typed (trimmed) for the folder (`src/lib/core/projectNames.ts`): the [note name rules](#editing-and-autosave) apply without adding `.md`, plus names starting with `_` (including `_archive`), `inbox`, `node_modules`, existing project names (ignoring case), names hidden by the ignore patterns, and names over 100 UTF-8 bytes are refused with the reason shown. The project is created by writing an empty `<name>/tasks.md` with `expectedHash: null`, so an existing list is never replaced. The new project is selected with its task list open and the "Add a task…" field focused.
 
-## Sync
+## Git sync
 
-Sync is not implemented yet. This is the planned design.
+The workspace is stored in a git repository the user owns. The Rust side (`src-tauri/src/git.rs`, `sync.rs`) runs the `git` installed on the system; the frontend decides when to commit and sync.
 
-Kaido runs the `git` binary installed on the system, so it reuses the user's SSH keys and credential helpers and works with any remote.
+### Running git
 
-- Changes are written to disk immediately and committed after a short idle delay, grouped into one commit.
-- Pull uses `--rebase` to keep history linear; push runs in the background.
-- Sync never blocks the UI. Without a network connection, changes stay committed locally.
-- If the same lines change on two devices, both versions are kept as separate files and the user is notified. `tasks.md` uses git's `merge=union` driver so list edits merge cleanly.
-- If the repository is in an unexpected state (rebase in progress, detached HEAD), sync pauses until it is resolved.
+- `git` is looked up in `PATH` and started with explicit arguments, never through a shell, as `git -C <workspace root> …`. It always runs on a background thread.
+- Environment: `GIT_TERMINAL_PROMPT=0` (never prompt), `LC_ALL=C` (parseable output), `GIT_EDITOR=true` (never open an editor), and `GIT_OPTIONAL_LOCKS=0` for read-only commands. Inherited variables that would point git at another repository or inject configuration are removed: `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_PREFIX`, `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_NAMESPACE`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*` and `GIT_CONFIG_VALUE_*`. For `fetch` and `push`, if neither `GIT_SSH_COMMAND`, `GIT_SSH` nor `core.sshCommand` is set, `GIT_SSH_COMMAND="ssh -o BatchMode=yes"` is used so SSH fails instead of asking for a password (a key with a passphrase must be loaded in the SSH agent).
+- Everything else is the user's own setup: identity, hooks, commit signing, credential helpers and configuration.
+- Time limits depend on what a command does:
+
+| Commands | Limit | On timeout |
+|---|---|---|
+| Reading (`status`, `rev-parse`, `config`, `diff`, `log`, `cat-file`) | 10 s | Killed with the processes it started (its process group on Unix); `GitNetwork` |
+| Network (`fetch`, `push`) | 120 s | Killed the same way; `GitNetwork`. Also killed when the app exits |
+| Writing (`add`, `commit`, `checkout --merge`, `update-ref`, `rebase` and its `--continue`, `--skip`, `--abort`) | 10 min | Never sent `SIGKILL`. On Unix it is asked to stop with `SIGTERM` (git removes its lock files and exits cleanly) and waited for until it exits; elsewhere it is waited for without a limit. `GitFailed` |
+
+- Messages built from git's output are sanitized: `hint:` lines are dropped, credentials in URLs (`user:token@`) and the query parameters `access_token`, `token`, `password` and `private_token` are removed, paths inside the workspace become workspace-relative, other absolute paths become `<path>`, and the text is cut to 500 characters.
+
+### Workspace inside a repository
+
+The workspace may be the root of a repository or a folder inside one (for example notes kept in a code repository). `add`, `commit` and `diff` use the pathspec of the workspace folder, so nothing outside it is staged or committed, even files the user staged. The app's temp files (`.kaido-*.tmp`) and trash folders (`.Trash-*`) are always excluded.
+
+### Status
+
+`git_status` only reads: it takes no lock and never changes the repository. It returns one of:
+
+```ts
+type GitStatus =
+  | { state: "unavailable"; reason: "git-missing" | "not-a-repo" }
+  | {
+      state: "ready" | "paused";
+      pausedReason?:
+        | "operation-in-progress" | "index-locked" | "unmerged-files" | "detached-head" | "no-identity"
+        | "upstream-mismatch" | "upstream-gone" | "local-merges" | "outside-commits" | "outside-changes";
+      pausedMessage?: string;    // extra explanation, e.g. for a rebase Kaido started
+      operation?: "rebase" | "merge" | "cherry-pick" | "revert" | "bisect";
+      branch: string | null;     // null when HEAD is detached
+      upstream: string | null;   // e.g. "origin/main"; null: commit only, no pull or push
+      remote: boolean;           // any remote configured
+      ahead: number;             // vs the upstream as last fetched
+      behind: number;
+      changed: string[];         // workspace-relative paths with uncommitted changes, untracked included
+      gitVersion: string;
+    };
+```
+
+Paused reasons, in order of priority (only the first one found is reported):
+
+| Reason | When | Commits |
+|---|---|---|
+| `operation-in-progress` | A rebase, merge, cherry-pick, revert or bisect is in progress (`operation` says which). For a rebase Kaido started, `pausedMessage` says so (see [Rebases started by the app](#rebases-started-by-the-app)) | Refused |
+| `index-locked` | `<git dir>/index.lock` is at least 5 s old and still there when checked again 1.5 s later: a git command is stuck, or one crashed and left it. A younger lock belongs to a command that is still running and is not reported | Refused |
+| `unmerged-files` | The index has unmerged files | Refused |
+| `detached-head` | HEAD is not on a branch | Refused |
+| `no-identity` | `user.name` or `user.email` is not set (in the git configuration or the environment) | Refused |
+| `upstream-mismatch` | The upstream is not the branch of the same name on a remote (a local upstream `.`, another branch name), the branch pushes to another remote (`branch.<name>.pushRemote` or `remote.pushDefault`), or the remote or branch name starts with `-` | Allowed |
+| `upstream-gone` | The upstream is configured but its remote-tracking branch does not exist: it was never pushed, or a sync found it deleted on the remote (for example after a merged pull request) and removed the stale tracking branch, like `git fetch --prune` (which also deletes that tracking branch's reflog). Both cases look the same, so the user pushes the branch once with git, or picks another upstream | Allowed |
+| `local-merges` | Local commits not on the upstream include merge commits; a rebase would flatten them and could drop or rewrite their changes | Allowed |
+| `outside-commits` | Local commits not on the upstream change files outside the workspace folder; they would be pushed with the notes | Allowed |
+| `outside-changes` | Files outside the workspace folder have uncommitted changes, tracked or untracked | Allowed |
+
+The app never repairs these states.
+
+### Commit
+
+`git_commit { message }` stages everything in the workspace (`git add -A -- <workspace>`) and commits only those paths (`git commit -m <message> -- <workspace>`). It returns `{ commit: string | null, paths: string[] }`: the new commit's hash and its workspace-relative paths, or `null` and `[]` when there was nothing to commit. Hooks run normally; a failing hook is a `GitFailed` error with its output. Refused (`GitPaused`) for the reasons marked "Refused" above. File writes are not held back while it runs; a write that lands meanwhile is picked up by the next commit.
+
+### Sync
+
+`git_sync` needs an upstream branch (`GitFailed` otherwise) and runs:
+
+1. Paused states are checked. `upstream-gone`, `local-merges` and `outside-commits` may change with a fetch, so for those the sync still fetches and checks again afterwards (the frontend only calls it for them on "Sync now"); every other paused state is refused right away with `GitPaused`.
+2. `git fetch -- <remote> refs/heads/<branch>`. If the branch does not exist on the remote, the stale remote-tracking branch is removed and the error is `GitPaused("upstream-gone")`. Then every paused state is checked again and refused with `GitPaused`.
+3. If behind: the working tree lock is taken (file writes wait from here until the rebase is over) and the status read again. If the workspace has uncommitted changes, nothing is pulled or pushed and the result has `deferred: true` (the rebase would refuse; the frontend commits and syncs again). Otherwise `git rebase @{upstream}` runs, with `rebase.autoStash`, `rebase.updateRefs` and `rebase.autoSquash` turned off, so history stays linear and no other branch moves. Local commits are always replayed (no fork-point guessing), so a commit is never dropped even if the upstream was force-pushed; a commit the upstream rewrote shows up as a conflict and both versions are kept.
+4. If ahead: `git push -- <remote> HEAD:refs/heads/<branch>`, never forced, never other branches. If the push is rejected because the remote moved meanwhile, the sync starts over from step 1 once, then fails with `GitFailed`.
+
+It returns:
+
+```ts
+type SyncResult = {
+  pulled: number;                              // commits integrated from the upstream
+  pushed: number;                              // commits pushed
+  changed: string[];                           // workspace-relative paths changed by the pull
+  conflicts: { path: string; copy: string }[];
+  deferred: boolean;                           // skipped because of uncommitted workspace changes
+};
+```
+
+**Conflicts.** During the rebase every unmerged path is checked first. Only notes (listable `*.md` files inside the workspace, stored as regular files; `.kaido/config.json` excluded) are resolved. Any other conflict ends the rebase (see below) and fails with `GitPaused` whose message is `pull-conflict: <paths>` (paths outside the workspace are relative to the repository root): pulling would conflict on files Kaido does not merge. `pull-conflict` is never a status; after it the repository is as before the sync. For notes, content is never lost:
+
+| Conflict | Resolution |
+|---|---|
+| Both sides changed or added the note | The upstream version stays at its path; this device's version is written to a conflict copy |
+| One side deleted or renamed it, the other changed it | The changed version is kept |
+| Both sides renamed it differently | Both names are kept |
+
+Versions are written as a checkout would write them (`git cat-file --filters`), so line-ending settings and other checkout filters apply. The conflict copy is `<folder>/<stem> (conflict YYYY-MM-DD HHmm).md` in local time, the same name the editor uses for its own conflicts, with ` 2`, ` 3`… appended if taken and the stem shortened to fit 255 bytes. Existing files are never replaced. A step is resolved all or nothing: if any conflicted file of the step changed after git wrote it (its content differs, or it was modified after the git command returned), nothing is written and the rebase is left for the user. Before `git rebase --continue`, everything staged must be either a file the app wrote (unchanged since) or what git staged for the commit being replayed (`REBASE_HEAD`); otherwise the rebase stops the same way, so nothing staged by someone else is committed. After the rebase, paused states are checked again before pushing. A commit that becomes empty is dropped.
+
+`tasks.md` merges line by line when `.gitattributes` sets `tasks.md merge=union`; without it, conflicting task lists follow the same keep-both rule.
+
+### Rebases started by the app
+
+Before the rebase starts, the app writes `<git dir>/kaido-rebase` with the commit HEAD was on (`orig-head`) and the upstream commit (`onto`), and removes it when its rebase finishes or is undone. The marker is informational only: while a rebase in progress matches it, the status reports `operation-in-progress` with a `pausedMessage` saying Kaido started the rebase and how to finish it (`git rebase --continue` after resolving the conflicts) or undo it (`git rebase --abort`). The same text follows `operation-in-progress: ` in `GitPaused` errors. A marker left with no rebase in progress is removed by the next `git_commit` or `git_sync`.
+
+A rebase is undone (`git rebase --abort`) only by the sync that started it, right after one of its own steps failed (a git error, a `pull-conflict`, a writing command stopped after its time limit), and only if that cannot lose anything someone else did:
+
+- every file the app wrote, or that git wrote for a conflict, still has the contents recorded at that moment (a conflict file modified after the git command returned is someone else's);
+- there is no other unmerged file, unstaged change or new untracked file (the app's temp files aside);
+- every other staged change is exactly what the commit being replayed (`REBASE_HEAD`) has at that path.
+
+If a step fails half-way (before its resolutions are staged), the conflict copies it wrote are kept (an extra file loses nothing) and the conflict markers are put back in the notes it had overwritten (`git checkout --merge`), so the working tree shows both versions again and `git rebase --continue` refuses until the user resolves them. The same check runs before `git rebase --skip`. If it fails, for example because a file was edited in another program during the rebase, the rebase and its marker are left in place and the error is `GitPaused` with the `operation-in-progress` message above.
+
+The app never undoes a rebase later: a rebase interrupted by an app exit or a crash, or one that could not be undone safely, stays until the user finishes or aborts it with git. Sync stays paused meanwhile; commits are refused.
+
+### Error classification
+
+For `fetch` and `push`, git's error output is matched case-insensitively (`AUTH_PATTERNS` and `NETWORK_PATTERNS` in `git.rs`), authentication first:
+
+| Kind | Output contains |
+|---|---|
+| `GitAuth` | `permission denied`, `authentication failed`, `could not read username`, `could not read password`, `terminal prompts disabled`, `invalid username or password`, `invalid credentials`, `bad credentials`, `access denied`, `host key verification failed`, `returned error: 401`, `returned error: 403`, `repository not found` |
+| `GitNetwork` | `could not resolve host`, `name or service not known`, `temporary failure in name resolution`, `nodename nor servname`, `no address associated`, `network is unreachable`, `no route to host`, `connection refused`, `connection timed out`, `operation timed out`, `timed out`, `connection reset`, `connection closed`, `failed to connect`, `couldn't connect`, `could not connect`, `unable to access`, `remote end hung up`, `early eof`, `does not appear to be a git repository` (for example a remote on an unmounted drive), `could not read from remote repository` |
+| `GitFailed` | Anything else, and every failure of a local command |
+
+Messages read `git <command> failed: <sanitized output>`.
+
+### Stopping on exit
+
+When the app exits (`RunEvent::ExitRequested` / `Exit`), `SyncControl::shutdown` in `sync.rs`:
+
+1. refuses new commits and syncs (`GitFailed`, "stopped because the app is closing");
+2. kills `fetch` or `push` in flight; writing commands are never killed;
+3. lets a running sync stop at its next safe point (before fetching, before pushing, between conflict resolutions);
+4. waits up to 3 seconds for running operations, then lets the app exit.
+
+Nothing is aborted on exit or afterwards. A rebase still in progress, including one whose writing command is still running (git runs in its own process group and finishes on its own), keeps its marker and is reported as described in [Rebases started by the app](#rebases-started-by-the-app).
+
+### Workspace operation locks
+
+Each repository has two async locks (`src-tauri/src/state.rs`):
+
+| Lock | Taken by | Purpose |
+|---|---|---|
+| git (mutex) | `git_commit`, `git_sync` | One git operation at a time |
+| working tree (read/write) | `write_file`, `rename_file`, `delete_file` (shared); `git_sync` (exclusive) only while it rebases and resolves conflicts | File writes never land in the middle of a rebase |
+
+File writes never wait for `git add`, `git commit`, fetch or push; only for a rebase. `git_status`, `read_file` and `list_files` take no lock.
+
+- The locks are keyed by the repository's git common folder (`git rev-parse --git-common-dir`, canonicalized, shared by all worktrees), or by the workspace folder outside a repository. Reopening the same folder, or another folder of the same repository, gives the same locks, so two operations on one repository never overlap.
+- They are only taken after the workspace state's own locks are released, always git before working tree, never twice by one command, and neither the watcher nor `open_workspace` take them, so they cannot deadlock.
+- A git command still waiting for its lock when another workspace is opened fails with `Superseded` instead of running. A file command waiting the same way still completes on the folder it was issued for, so no text is lost.
 
 ## Security
 

@@ -1662,7 +1662,9 @@ dependencies = [
 name = "kaido"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "dunce",
+ "libc",
  "notify",
  "serde",
  "serde_json",

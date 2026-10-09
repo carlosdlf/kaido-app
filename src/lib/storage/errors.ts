@@ -12,6 +12,11 @@ export const STORAGE_ERROR_KINDS = [
   "PermissionDenied",
   "Conflict",
   "Io",
+  "GitUnavailable",
+  "GitPaused",
+  "GitNetwork",
+  "GitAuth",
+  "GitFailed",
 ] as const;
 
 export type StorageErrorKind = (typeof STORAGE_ERROR_KINDS)[number];

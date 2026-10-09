@@ -1,6 +1,8 @@
 /** A small workspace served from memory when the UI runs outside the desktop app. */
 
 export const SAMPLE_ROOT = "/sample-workspace";
+/** How long each git operation of the sample repository takes. */
+export const SAMPLE_GIT_DELAY_MS = 400;
 
 export const sampleWorkspace: Record<string, string> = {
   "inbox/tasks.md": [

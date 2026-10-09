@@ -1,6 +1,12 @@
 //! Tauri commands. Each one is a thin wrapper that resolves the open
-//! workspace and runs the real work (in `fs_ops`, `settings`, `state`) on a
-//! blocking thread so the UI never waits on disk I/O.
+//! workspace and runs the real work (in `fs_ops`, `settings`, `state`,
+//! `sync`) on a blocking thread so the UI never waits on disk I/O or git.
+//!
+//! File commands and git operations coordinate through the repository's
+//! operation locks (see `state`).
+
+use std::path::Path;
+use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::ipc::{Invoke, InvokeBody, Request};
@@ -9,8 +15,10 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::error::{AppError, AppResult};
 use crate::fs_ops::{self, FileContents, FileEntry, WriteCondition, WrittenFile};
+use crate::git::GitOptions;
 use crate::settings::{self, SettingsDir};
-use crate::state::AppState;
+use crate::state::{AppState, TreeLock};
+use crate::sync::{self, CommitResult, GitStatus, SyncControl, SyncResult};
 
 /// Event emitted with a [`crate::watcher::ChangeBatch`] payload.
 pub const CHANGED_EVENT: &str = "workspace://changed";
@@ -28,6 +36,9 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         delete_file,
         read_settings,
         write_settings,
+        git_status,
+        git_commit,
+        git_sync,
     ]
 }
 
@@ -44,6 +55,50 @@ where
     tauri::async_runtime::spawn_blocking(work)
         .await
         .map_err(|_| AppError::Io("a background task failed".into()))?
+}
+
+/// Runs a file command on the open workspace's root, on a blocking thread,
+/// holding the repository's working tree lock shared: it waits only while a
+/// sync rebases, never for `git add` or `git commit`.
+///
+/// If another workspace was opened while it waited, it still runs on the
+/// folder it was issued for, so the user's text is never lost. The guard
+/// moves into the blocking task, so it is released when the work ends even
+/// if the command's future is dropped.
+async fn file_op<T, F>(state: &AppState, work: F) -> AppResult<T>
+where
+    F: FnOnce(&Path) -> AppResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let workspace = state.current()?;
+    let guard = Arc::clone(&workspace.lock.tree).read_owned().await;
+    blocking(move || {
+        let _guard = guard;
+        work(&workspace.root)
+    })
+    .await
+}
+
+/// Runs a git operation on the open workspace, on a blocking thread,
+/// holding the repository's git lock. `work` also gets the working tree lock,
+/// to take while it rewrites the working tree. Fails with `Superseded` if
+/// another workspace was opened while it waited.
+async fn git_op<T, F>(state: &AppState, work: F) -> AppResult<T>
+where
+    F: FnOnce(&Path, &TreeLock) -> AppResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let workspace = state.current()?;
+    let guard = Arc::clone(&workspace.lock.git).lock_owned().await;
+    if !state.is_current(&workspace) {
+        return Err(AppError::Superseded);
+    }
+    let tree = Arc::clone(&workspace.lock.tree);
+    blocking(move || {
+        let _guard = guard;
+        work(&workspace.root, &tree)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -68,9 +123,13 @@ pub async fn open_workspace<R: Runtime>(
 ) -> AppResult<OpenedWorkspace> {
     let root = blocking(move || {
         let emitter = app.clone();
-        app.state::<AppState>().open(&path, move |batch| {
-            let _ = emitter.emit(CHANGED_EVENT, batch);
-        })
+        let options = app.state::<GitOptions>().inner().clone();
+        // One operation lock per repository (see `state`).
+        let key = move |root: &Path| sync::lock_key(&options, root).unwrap_or(root.to_path_buf());
+        app.state::<AppState>()
+            .open_keyed(&path, key, move |batch| {
+                let _ = emitter.emit(CHANGED_EVENT, batch);
+            })
     })
     .await?;
     let root = root
@@ -127,8 +186,10 @@ pub async fn write_file(
     contents: String,
 ) -> AppResult<WrittenFile> {
     let condition = write_condition(request.body())?;
-    let root = state.root()?;
-    blocking(move || fs_ops::write_file(&root, &path, &contents, &condition)).await
+    file_op(&state, move |root| {
+        fs_ops::write_file(root, &path, &contents, &condition)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -137,8 +198,7 @@ pub async fn rename_file(
     from: String,
     to: String,
 ) -> AppResult<WrittenFile> {
-    let root = state.root()?;
-    blocking(move || fs_ops::rename_file(&root, &from, &to)).await
+    file_op(&state, move |root| fs_ops::rename_file(root, &from, &to)).await
 }
 
 /// Checks the `expectedHash` argument of `delete_file`, which must be a
@@ -160,8 +220,10 @@ pub async fn delete_file(
     expected_hash: Option<serde_json::Value>,
 ) -> AppResult<()> {
     let expected_hash = delete_hash(expected_hash)?;
-    let root = state.root()?;
-    blocking(move || fs_ops::delete_file(&root, &path, &expected_hash)).await
+    file_op(&state, move |root| {
+        fs_ops::delete_file(root, &path, &expected_hash)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -174,6 +236,47 @@ pub async fn read_settings(dir: State<'_, SettingsDir>) -> AppResult<Option<Stri
 pub async fn write_settings(dir: State<'_, SettingsDir>, contents: String) -> AppResult<()> {
     let dir = dir.0.clone();
     blocking(move || settings::write_settings(&dir, &contents)).await
+}
+
+/// Status of the workspace's git repository. Takes no lock and never
+/// changes the repository.
+#[tauri::command]
+pub async fn git_status(
+    state: State<'_, AppState>,
+    git: State<'_, GitOptions>,
+) -> AppResult<GitStatus> {
+    let root = state.root()?;
+    let options = git.inner().clone();
+    blocking(move || sync::status(&options, &root)).await
+}
+
+#[tauri::command]
+pub async fn git_commit(
+    state: State<'_, AppState>,
+    git: State<'_, GitOptions>,
+    control: State<'_, SyncControl>,
+    message: String,
+) -> AppResult<CommitResult> {
+    let options = git.inner().clone();
+    let control = control.inner().clone();
+    git_op(&state, move |root, _tree| {
+        sync::commit(&options, root, &message, &control)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn git_sync(
+    state: State<'_, AppState>,
+    git: State<'_, GitOptions>,
+    control: State<'_, SyncControl>,
+) -> AppResult<SyncResult> {
+    let options = git.inner().clone();
+    let control = control.inner().clone();
+    git_op(&state, move |root, tree| {
+        sync::sync(&options, root, &control, tree)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -198,6 +301,8 @@ mod tests {
         let settings_dir = tempfile::tempdir().unwrap();
         let app = mock_builder()
             .manage(AppState::default())
+            .manage(crate::git::test_env::options())
+            .manage(SyncControl::default())
             .manage(SettingsDir(settings_dir.path().join("config")))
             .invoke_handler(handler())
             .build(mock_context(noop_assets()))
@@ -263,7 +368,13 @@ mod tests {
         let capability: serde_json::Value =
             serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
         let granted = capability["permissions"].as_array().unwrap();
-        for cmd in ["rename_file", "delete_file"] {
+        for cmd in [
+            "rename_file",
+            "delete_file",
+            "git_status",
+            "git_commit",
+            "git_sync",
+        ] {
             assert!(build.contains(&format!("\"{cmd}\"")), "{cmd}");
             let permission = format!("allow-{}", cmd.replace('_', "-"));
             assert!(granted.iter().any(|p| p == &permission), "{permission}");
@@ -519,6 +630,342 @@ mod tests {
             std::fs::read_to_string(dir.path().join("a.md")).unwrap(),
             "changed"
         );
+    }
+
+    #[test]
+    fn git_commands_through_ipc() {
+        use crate::git::test_env::git;
+        let (_app, webview, _settings) = app();
+        for cmd in ["git_status", "git_sync"] {
+            assert_eq!(
+                error_kind(invoke(&webview, cmd, serde_json::json!({}))),
+                "NoWorkspace"
+            );
+        }
+        let message = serde_json::json!({ "message": "m" });
+        assert_eq!(
+            error_kind(invoke(&webview, "git_commit", message.clone())),
+            "NoWorkspace"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        git(&base, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        git(&base, &["clone", "-q", "remote.git", "seed"]);
+        std::fs::write(base.join("seed/README.md"), "x").unwrap();
+        git(&base.join("seed"), &["add", "-A"]);
+        git(&base.join("seed"), &["commit", "-q", "-m", "seed"]);
+        git(
+            &base.join("seed"),
+            &["push", "-q", "origin", "HEAD:refs/heads/main"],
+        );
+        git(&base, &["clone", "-q", "remote.git", "notes"]);
+        let notes = base.join("notes");
+        invoke(
+            &webview,
+            "open_workspace",
+            serde_json::json!({ "path": notes }),
+        )
+        .unwrap();
+
+        let status = invoke(&webview, "git_status", serde_json::json!({})).unwrap();
+        assert_eq!(status["state"], "ready");
+        assert_eq!(status["branch"], "main");
+        assert_eq!(status["upstream"], "origin/main");
+        assert_eq!(status["changed"], serde_json::json!([]));
+
+        let write = serde_json::json!({ "path": "inbox/a.md", "contents": "# A\n" });
+        invoke(&webview, "write_file", write).unwrap();
+        let status = invoke(&webview, "git_status", serde_json::json!({})).unwrap();
+        assert_eq!(status["changed"], serde_json::json!(["inbox/a.md"]));
+
+        let args = serde_json::json!({ "message": "Add inbox/a.md" });
+        let done = invoke(&webview, "git_commit", args).unwrap();
+        assert_eq!(done["paths"], serde_json::json!(["inbox/a.md"]));
+        assert_eq!(done["commit"], git(&notes, &["rev-parse", "HEAD"]));
+        let again = invoke(&webview, "git_commit", message).unwrap();
+        assert_eq!(again, serde_json::json!({ "commit": null, "paths": [] }));
+
+        let synced = invoke(&webview, "git_sync", serde_json::json!({})).unwrap();
+        assert_eq!(
+            synced,
+            serde_json::json!({ "pulled": 0, "pushed": 1, "changed": [], "conflicts": [], "deferred": false })
+        );
+
+        let plain = tempfile::tempdir().unwrap();
+        invoke(
+            &webview,
+            "open_workspace",
+            serde_json::json!({ "path": plain.path() }),
+        )
+        .unwrap();
+        let status = invoke(&webview, "git_status", serde_json::json!({})).unwrap();
+        assert_eq!(
+            status,
+            serde_json::json!({ "state": "unavailable", "reason": "not-a-repo" })
+        );
+        let err = invoke(&webview, "git_sync", serde_json::json!({})).unwrap_err();
+        assert_eq!(
+            err,
+            serde_json::json!({ "kind": "GitUnavailable", "message": "not-a-repo" })
+        );
+    }
+
+    /// Polls until `done` is set or a few seconds passed.
+    fn wait_for(done: &std::sync::atomic::AtomicBool) -> bool {
+        let start = std::time::Instant::now();
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            if start.elapsed() > Duration::from_secs(5) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    #[test]
+    fn file_commands_wait_only_for_a_rebase() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (app, webview, _settings) = app();
+        let dir = tempfile::tempdir().unwrap();
+        invoke(
+            &webview,
+            "open_workspace",
+            serde_json::json!({ "path": dir.path() }),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("old.md"), "x").unwrap();
+        std::fs::write(dir.path().join("gone.md"), "x").unwrap();
+
+        // A running commit does not hold writes back.
+        let lock = app.state::<AppState>().current().unwrap().lock;
+        let git_guard = lock.git.try_lock().unwrap();
+        let args = serde_json::json!({ "path": "during-commit.md", "contents": "x" });
+        invoke(&webview, "write_file", args).unwrap();
+        drop(git_guard);
+
+        // Stand in for a running rebase.
+        let guard = lock.tree.try_write().unwrap();
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let spawn = |cmd: &'static str, args: serde_json::Value| {
+            let webview = webview.clone();
+            let finished = Arc::clone(&finished);
+            std::thread::spawn(move || {
+                let result = invoke(&webview, cmd, args);
+                finished.store(true, Ordering::SeqCst);
+                result
+            })
+        };
+        let writer = spawn(
+            "write_file",
+            serde_json::json!({ "path": "new.md", "contents": "x" }),
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!finished.load(Ordering::SeqCst));
+        assert!(!dir.path().join("new.md").exists());
+
+        // Reading and git status do not wait.
+        invoke(
+            &webview,
+            "read_file",
+            serde_json::json!({ "path": "old.md" }),
+        )
+        .unwrap();
+        let status = invoke(&webview, "git_status", serde_json::json!({})).unwrap();
+        assert_eq!(status["state"], "unavailable");
+
+        drop(guard);
+        assert!(wait_for(&finished));
+        writer.join().unwrap().unwrap();
+        assert!(dir.path().join("new.md").exists());
+
+        // Renames and deletes wait too.
+        let guard = lock.tree.try_write().unwrap();
+        finished.store(false, Ordering::SeqCst);
+        let renamer = spawn(
+            "rename_file",
+            serde_json::json!({ "from": "old.md", "to": "renamed.md" }),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!finished.load(Ordering::SeqCst));
+        drop(guard);
+        assert!(wait_for(&finished));
+        renamer.join().unwrap().unwrap();
+
+        let guard = lock.tree.try_write().unwrap();
+        finished.store(false, Ordering::SeqCst);
+        let hash = fs_ops::content_hash(b"y");
+        let deleter = spawn(
+            "delete_file",
+            serde_json::json!({ "path": "gone.md", "expectedHash": hash }),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!finished.load(Ordering::SeqCst));
+        drop(guard);
+        assert!(wait_for(&finished));
+        // The hash does not match, so the file stays; what matters is that
+        // the command only ran once the lock was free.
+        assert_eq!(error_kind(deleter.join().unwrap()), "Conflict");
+    }
+
+    #[test]
+    fn git_operations_for_a_replaced_workspace_are_skipped() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (app, webview, _settings) = app();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        invoke(
+            &webview,
+            "open_workspace",
+            serde_json::json!({ "path": first.path() }),
+        )
+        .unwrap();
+        let lock = app.state::<AppState>().current().unwrap().lock;
+        let guard = lock.git.try_lock().unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let spawn = |cmd: &'static str, args: serde_json::Value| {
+            let webview = webview.clone();
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let result = invoke(&webview, cmd, args);
+                done.store(true, Ordering::SeqCst);
+                result
+            })
+        };
+        let syncer = spawn("git_sync", serde_json::json!({}));
+        let writer = spawn(
+            "write_file",
+            serde_json::json!({ "path": "late.md", "contents": "x" }),
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        invoke(
+            &webview,
+            "open_workspace",
+            serde_json::json!({ "path": second.path() }),
+        )
+        .unwrap();
+        drop(guard);
+
+        assert_eq!(error_kind(syncer.join().unwrap()), "Superseded");
+        // A write issued for the old workspace still lands there.
+        writer.join().unwrap().unwrap();
+        assert!(first.path().join("late.md").exists());
+        assert!(!second.path().join("late.md").exists());
+    }
+
+    #[test]
+    fn git_status_explains_the_apps_rebase_without_taking_locks() {
+        use crate::git::test_env::git;
+        let (app, webview, _settings) = app();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        git(&base, &["init", "-q", "-b", "main", "repo"]);
+        let repo = base.join("repo");
+        let write_commit = |rel: &str, text: &str, msg: &str| {
+            std::fs::write(repo.join(rel), text).unwrap();
+            git(&repo, &["add", "-A"]);
+            git(&repo, &["commit", "-q", "-m", msg]);
+        };
+        write_commit("a.md", "base", "base");
+        git(&repo, &["checkout", "-q", "-b", "other"]);
+        write_commit("a.md", "other", "other");
+        git(&repo, &["checkout", "-q", "main"]);
+        write_commit("a.md", "main", "main");
+        let out = crate::git::Git::new(&crate::git::test_env::options(), &repo)
+            .run(crate::git::Mode::Write, ["rebase", "other"])
+            .unwrap();
+        assert!(!out.success);
+        // As if a sync had started this rebase and the app had crashed.
+        let state = |name: &str| {
+            std::fs::read_to_string(repo.join(".git/rebase-merge").join(name))
+                .unwrap()
+                .trim()
+                .to_owned()
+        };
+        let marker = sync::RebaseMarker {
+            orig_head: state("orig-head"),
+            onto: state("onto"),
+        };
+        std::fs::write(
+            repo.join(".git").join(sync::REBASE_MARKER),
+            marker.to_text(),
+        )
+        .unwrap();
+        invoke(
+            &webview,
+            "open_workspace",
+            serde_json::json!({ "path": repo }),
+        )
+        .unwrap();
+
+        let lock = app.state::<AppState>().current().unwrap().lock;
+        let _git = lock.git.try_lock().unwrap();
+        let _tree = lock.tree.try_write().unwrap();
+        for _ in 0..2 {
+            let status = invoke(&webview, "git_status", serde_json::json!({})).unwrap();
+            assert_eq!(status["pausedReason"], "operation-in-progress");
+            assert_eq!(status["pausedMessage"], sync::APP_REBASE_MESSAGE);
+        }
+        assert!(repo.join(".git/rebase-merge").exists());
+    }
+
+    #[test]
+    fn a_slow_commit_does_not_delay_file_writes() {
+        use crate::git::test_env::git;
+        use std::os::unix::fs::PermissionsExt;
+        let (_app, webview, _settings) = app();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dunce::canonicalize(dir.path()).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        let hook = repo.join(".git/hooks/pre-commit");
+        let started = repo.join(".git/hook-started");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\nsleep 2\n", started.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        invoke(
+            &webview,
+            "open_workspace",
+            serde_json::json!({ "path": repo }),
+        )
+        .unwrap();
+        std::fs::write(repo.join("a.md"), "a").unwrap();
+
+        let committer = {
+            let webview = webview.clone();
+            std::thread::spawn(move || {
+                invoke(
+                    &webview,
+                    "git_commit",
+                    serde_json::json!({ "message": "Add a.md" }),
+                )
+            })
+        };
+        let start = std::time::Instant::now();
+        while !started.exists() {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let start = std::time::Instant::now();
+        let args = serde_json::json!({ "path": "b.md", "contents": "typed meanwhile" });
+        invoke(&webview, "write_file", args).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let done = committer.join().unwrap().unwrap();
+        assert_eq!(done["paths"], serde_json::json!(["a.md"]));
+        // The write is picked up by the next commit.
+        let next = invoke(
+            &webview,
+            "git_commit",
+            serde_json::json!({ "message": "Add b.md" }),
+        )
+        .unwrap();
+        assert_eq!(next["paths"], serde_json::json!(["b.md"]));
     }
 
     #[test]

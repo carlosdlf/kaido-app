@@ -35,6 +35,25 @@ pub enum AppError {
     Superseded,
     #[error("{0}")]
     Io(String),
+    /// Git is not installed or the workspace is not in a repository. The
+    /// message is the reason: `git-missing` or `not-a-repo`.
+    #[error("{0}")]
+    GitUnavailable(String),
+    /// The repository is in a state where the operation must not run. The
+    /// message starts with the reason (`detached-head`, `unmerged-files`…);
+    /// for `unmerged-files` found during a sync it is followed by `: ` and
+    /// the list of files.
+    #[error("{0}")]
+    GitPaused(String),
+    /// The remote could not be reached, or git timed out.
+    #[error("{0}")]
+    GitNetwork(String),
+    /// The remote refused the credentials.
+    #[error("{0}")]
+    GitAuth(String),
+    /// Any other git failure, with git's sanitized output.
+    #[error("{0}")]
+    GitFailed(String),
 }
 
 impl AppError {
@@ -52,6 +71,11 @@ impl AppError {
             AppError::Conflict(_) => "Conflict",
             AppError::Superseded => "Superseded",
             AppError::Io(_) => "Io",
+            AppError::GitUnavailable(_) => "GitUnavailable",
+            AppError::GitPaused(_) => "GitPaused",
+            AppError::GitNetwork(_) => "GitNetwork",
+            AppError::GitAuth(_) => "GitAuth",
+            AppError::GitFailed(_) => "GitFailed",
         }
     }
 
@@ -129,6 +153,11 @@ mod tests {
             (AppError::Conflict(String::new()), "Conflict"),
             (AppError::Superseded, "Superseded"),
             (AppError::Io(String::new()), "Io"),
+            (AppError::GitUnavailable(String::new()), "GitUnavailable"),
+            (AppError::GitPaused(String::new()), "GitPaused"),
+            (AppError::GitNetwork(String::new()), "GitNetwork"),
+            (AppError::GitAuth(String::new()), "GitAuth"),
+            (AppError::GitFailed(String::new()), "GitFailed"),
         ];
         for (err, kind) in cases {
             assert_eq!(err.kind(), kind);

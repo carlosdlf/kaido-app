@@ -11,6 +11,9 @@ const COMMANDS: &[&str] = &[
     "delete_file",
     "read_settings",
     "write_settings",
+    "git_status",
+    "git_commit",
+    "git_sync",
 ];
 
 fn main() {

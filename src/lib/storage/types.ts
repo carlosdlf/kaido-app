@@ -6,9 +6,10 @@
  * Workspace paths are relative to the workspace root and `/`-separated.
  */
 
+import type { CommitResult, GitStatus, SyncResult } from "$lib/core/git";
 import type { ChangeEvent, FileEntry } from "$lib/core/workspace";
 
-export type { ChangeEvent, FileEntry };
+export type { ChangeEvent, CommitResult, FileEntry, GitStatus, SyncResult };
 
 export interface OpenedWorkspace {
   /** Canonical absolute path of the workspace root. */
@@ -76,4 +77,21 @@ export interface Storage {
    * handler should be registered at a time.
    */
   onCloseRequested(handler: CloseHandler): Promise<Unsubscribe>;
+  /** The workspace's git state. Never fails for a missing git or repository: those are states. */
+  gitStatus(): Promise<GitStatus>;
+  /**
+   * Stages and commits every change inside the workspace folder (temporary
+   * files excluded). `commit` is `null` when there was nothing to commit.
+   * Fails with `GitPaused` in a paused state that does not allow commits
+   * (only `outside-changes`, `outside-commits`, `upstream-mismatch` and
+   * `upstream-gone` do).
+   */
+  gitCommit(message: string): Promise<CommitResult>;
+  /**
+   * Fetches, rebases onto the upstream (keeping both versions of conflicting
+   * notes) and pushes. Requires an upstream. With uncommitted changes in
+   * the workspace it only fetches and reports `deferred`. Fails with
+   * `GitNetwork`, `GitAuth`, `GitPaused` (message: the reason) or `GitFailed`.
+   */
+  gitSync(): Promise<SyncResult>;
 }

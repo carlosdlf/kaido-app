@@ -4,6 +4,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as v from "valibot";
+import {
+  GIT_OPERATIONS,
+  PAUSED_REASONS,
+  UNAVAILABLE_REASONS,
+  type CommitResult,
+  type GitRepoStatus,
+  type GitStatus,
+  type SyncResult,
+} from "$lib/core/git";
 import type { ChangeEvent, FileEntry } from "$lib/core/workspace";
 import { StorageError, toStorageError } from "./errors";
 import type {
@@ -34,6 +43,32 @@ const ChangeEventSchema = v.object({
   rescan: v.boolean(),
 });
 const OptionalString = v.nullable(v.string());
+const Count = v.pipe(v.number(), v.integer(), v.minValue(0));
+const GitStatusSchema = v.variant("state", [
+  v.object({ state: v.literal("unavailable"), reason: v.picklist(UNAVAILABLE_REASONS) }),
+  v.object({
+    state: v.picklist(["ready", "paused"]),
+    pausedReason: v.nullish(v.picklist(PAUSED_REASONS)),
+    operation: v.nullish(v.picklist(GIT_OPERATIONS)),
+    pausedMessage: v.nullish(v.string()),
+    branch: v.nullable(v.string()),
+    upstream: v.nullable(v.string()),
+    remote: v.boolean(),
+    ahead: Count,
+    behind: Count,
+    changed: v.array(v.string()),
+    gitVersion: v.string(),
+  }),
+]);
+const CommitResultSchema = v.object({ commit: v.nullable(v.string()), paths: v.array(v.string()) });
+const SyncResultSchema = v.object({
+  pulled: Count,
+  pushed: Count,
+  changed: v.array(v.string()),
+  conflicts: v.array(v.object({ path: v.string(), copy: v.string() })),
+  // Older backends leave it out: nothing was deferred.
+  deferred: v.optional(v.boolean(), false),
+});
 /** Commands without a result resolve to `null`. */
 const NoResult = v.nullish(v.never());
 
@@ -68,6 +103,17 @@ export function writeFileArgs(
   const args: Record<string, unknown> = { path, contents };
   if (options.expectedHash !== undefined) args["expectedHash"] = options.expectedHash;
   return args;
+}
+
+/** Drops absent optional fields (sent as `null` or left out) from a parsed status. */
+export function normalizeGitStatus(status: v.InferOutput<typeof GitStatusSchema>): GitStatus {
+  if (status.state === "unavailable") return status;
+  const { pausedReason, operation, pausedMessage, ...rest } = status;
+  const result: GitRepoStatus = { ...rest };
+  if (pausedReason != null) result.pausedReason = pausedReason;
+  if (operation != null) result.operation = operation;
+  if (pausedMessage != null && pausedMessage !== "") result.pausedMessage = pausedMessage;
+  return result;
 }
 
 export class TauriStorage implements Storage {
@@ -105,6 +151,18 @@ export class TauriStorage implements Storage {
 
   async writeSettings(contents: string): Promise<void> {
     await call(v.unknown(), "write_settings", { contents });
+  }
+
+  async gitStatus(): Promise<GitStatus> {
+    return normalizeGitStatus(await call(GitStatusSchema, "git_status"));
+  }
+
+  gitCommit(message: string): Promise<CommitResult> {
+    return call(CommitResultSchema, "git_commit", { message });
+  }
+
+  gitSync(): Promise<SyncResult> {
+    return call(SyncResultSchema, "git_sync");
   }
 
   async watch(listener: ChangeListener): Promise<Unsubscribe> {

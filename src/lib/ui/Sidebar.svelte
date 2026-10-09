@@ -4,6 +4,15 @@
   import Inbox from "@lucide/svelte/icons/inbox";
   import ListChecks from "@lucide/svelte/icons/list-checks";
   import Plus from "@lucide/svelte/icons/plus";
+  import CircleSlash from "@lucide/svelte/icons/circle-slash";
+  import CirclePause from "@lucide/svelte/icons/circle-pause";
+  import CloudCheck from "@lucide/svelte/icons/cloud-check";
+  import CloudOff from "@lucide/svelte/icons/cloud-off";
+  import HardDrive from "@lucide/svelte/icons/hard-drive";
+  import RefreshCw from "@lucide/svelte/icons/refresh-cw";
+  import TriangleAlert from "@lucide/svelte/icons/triangle-alert";
+  import CloudUpload from "@lucide/svelte/icons/cloud-upload";
+  import { syncAnnouncement, type SyncIcon, type SyncView } from "$lib/core/syncStatus";
   import { nextListIndex } from "$lib/core/listNavigation";
   import { ALL_TASKS, type SidebarEntry } from "$lib/core/views";
   import { INBOX } from "$lib/core/workspace";
@@ -27,6 +36,12 @@
     createProjectShortcut?: { aria: string; hint: string };
     /** Each new value opens the new project field. */
     newProjectRequest?: number;
+    /** Git sync status, or `null` while there is none to show. */
+    sync?: SyncView | null;
+    /** Sync now. */
+    onsync?: () => void;
+    /** The sync shortcut, for assistive technology and the tooltip. */
+    syncShortcut?: { aria: string; hint: string };
   }
 
   let {
@@ -41,7 +56,42 @@
     oncreateproject,
     createProjectShortcut,
     newProjectRequest = 0,
+    sync = null,
+    onsync,
+    syncShortcut,
   }: Props = $props();
+
+  const SYNC_ICONS = {
+    checking: RefreshCw,
+    synced: CloudCheck,
+    syncing: RefreshCw,
+    pending: CloudUpload,
+    local: HardDrive,
+    offline: CloudOff,
+    paused: CirclePause,
+    failed: TriangleAlert,
+    unavailable: CircleSlash,
+  } satisfies Record<SyncIcon, unknown>;
+
+  const SyncGlyph = $derived(sync ? SYNC_ICONS[sync.icon] : null);
+
+  /**
+   * Read out politely when the sync state changes. Transient states and the
+   * age of the last sync are skipped, so a routine sync stays silent.
+   */
+  let announced = $state("");
+  $effect(() => {
+    if (!sync) {
+      announced = "";
+      return;
+    }
+    const next = syncAnnouncement(sync);
+    if (next !== null) announced = next;
+  });
+  const syncHint = $derived(
+    syncShortcut ? `Click or press ${syncShortcut.hint} to sync now.` : "Click to sync now.",
+  );
+  const syncTooltip = $derived(sync ? [...sync.details, syncHint].join("\n") : "");
 
   // New project
   let creating = $state(false);
@@ -265,7 +315,24 @@
     {/if}
     <div class="status">
       <span class="workspace" title={workspaceName}>~/{workspaceName}</span>
-      <span>local only</span>
+      {#if sync && SyncGlyph}
+        <button
+          type="button"
+          class="sync"
+          data-tone={sync.tone}
+          data-icon={sync.icon}
+          title={syncTooltip}
+          aria-keyshortcuts={syncShortcut?.aria}
+          aria-describedby="sync-details"
+          onclick={() => onsync?.()}
+        >
+          <SyncGlyph aria-hidden="true" />
+          <span class="visually-hidden">Sync now, </span>
+          <span class="sync-text">{sync.text}</span>
+        </button>
+        <span id="sync-details" class="visually-hidden">{sync.details.join("; ")}</span>
+      {/if}
+      <span class="visually-hidden" role="status" aria-live="polite">{announced}</span>
     </div>
   </footer>
 </aside>
@@ -435,9 +502,63 @@
   }
 
   .workspace {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .sync {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: var(--space-4);
+    max-width: 70%;
+    padding: 0 var(--space-2);
+    border-radius: var(--radius-sm);
+    color: var(--color-muted);
+  }
+
+  .sync:hover {
+    color: var(--color-text);
+  }
+
+  .sync :global(.lucide-icon) {
+    flex-shrink: 0;
+  }
+
+  .sync-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .sync[data-tone="ok"] :global(.lucide-icon) {
+    color: var(--color-success);
+  }
+
+  .sync[data-tone="warning"] {
+    color: var(--color-warning);
+  }
+
+  .sync[data-tone="error"] {
+    color: var(--color-danger);
+  }
+
+  .sync[data-icon="syncing"] :global(.lucide-icon) {
+    animation: spin var(--duration-spin) linear infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .sync[data-icon="syncing"] :global(.lucide-icon) {
+      animation: none;
+    }
+  }
+
+  @keyframes spin {
+    to {
+      transform: rotate(1turn);
+    }
   }
 
   .notice {
