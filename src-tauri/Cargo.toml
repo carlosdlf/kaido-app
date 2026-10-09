@@ -1,6 +1,6 @@
 [package]
 name = "kaido"
-version = "0.0.0"
+version = "1.0.0"
 description = "Notes and tasks for developers, stored as Markdown in your own git repo."
 authors = ["Kaido contributors"]
 license = "MIT OR Apache-2.0"
