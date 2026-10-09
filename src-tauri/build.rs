@@ -7,6 +7,8 @@ const COMMANDS: &[&str] = &[
     "list_files",
     "read_file",
     "write_file",
+    "rename_file",
+    "delete_file",
     "read_settings",
     "write_settings",
 ];

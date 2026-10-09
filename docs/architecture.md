@@ -117,6 +117,8 @@ All platform access goes through the `Storage` interface (`src/lib/storage/types
 | `listFiles()` | Lists every listable Markdown file, sorted by path |
 | `readFile(path)` | Reads a note or `.kaido/config.json`; resolves to `{ contents, hash }` |
 | `writeFile(path, contents, { expectedHash? })` | Atomically writes a note or `.kaido/config.json`; resolves to its `FileEntry` plus the new `hash`. See [Conditional writes](#conditional-writes) |
+| `renameFile(from, to)` | Renames a note within its folder without replacing another file; resolves to the `FileEntry` and `hash` of the file at `to` |
+| `deleteFile(path, expectedHash)` | Moves a note to the system trash, only if it still has `expectedHash`. The note is removed permanently only where no trash is available: on Linux, when the trash folders cannot be written (missing, no permission, read-only, full). On Windows and macOS a failed trash move is reported and the note is kept, as is any other trash failure on Linux. Notes over 8 MiB cannot be renamed or deleted, since no hash is handed out for them |
 | `readSettings()` / `writeSettings(contents)` | Reads or writes the raw device `settings.json` (`null` if missing) |
 | `watch(listener)` | Subscribes to workspace changes, including the app's own writes |
 | `onCloseRequested(handler)` | Runs `handler` before the window closes; it resolves to `false` to keep the window open |
@@ -126,7 +128,7 @@ All platform access goes through the `Storage` interface (`src/lib/storage/types
 | Backend | Used for |
 |---|---|
 | `TauriStorage` | The desktop app. Calls the Rust commands and listens to the watcher event. Responses are validated with valibot; an unexpected response becomes an `Io` error, and a malformed change event is treated as a rescan. |
-| `MemoryStorage` | Tests and `pnpm dev` in a browser (serves a sample workspace). Follows the same path, size, read-only and conditional write rules as the desktop backend and can simulate external edits. Its hash is a fast non-cryptographic content hash; like the desktop hash, equal contents always give equal hashes. |
+| `MemoryStorage` | Tests and `pnpm dev` in a browser (serves a sample workspace). Follows the same path, size, read-only, conditional write, rename and delete rules as the desktop backend and can simulate external edits. Deleted notes are kept in its `trash` list. Its hash is a fast non-cryptographic content hash; like the desktop hash, equal contents always give equal hashes. |
 
 ### Commands
 
@@ -139,6 +141,8 @@ The Rust commands live in `src-tauri/src/commands.rs`. Each one runs its disk wo
 | `list_files` | – | `FileEntry[]` |
 | `read_file` | `path` | `{ contents, hash }` |
 | `write_file` | `path`, `contents`, optional `expectedHash` | `FileEntry` and `hash` |
+| `rename_file` | `from`, `to` | `FileEntry` and `hash` of the file at `to` |
+| `delete_file` | `path`, `expectedHash` | – |
 | `read_settings` | – | `string \| null` |
 | `write_settings` | `contents` | – |
 
@@ -155,6 +159,12 @@ The Rust commands live in `src-tauri/src/commands.rs`. Each one runs its disk wo
 | a hash | The file exists and its current hash matches |
 
 Otherwise the write fails with `Conflict` and the file is left untouched. The check runs right before the atomic rename; a change landing between the check and the rename is not detected.
+
+### Renaming and deleting
+
+- `rename_file` and `delete_file` accept notes only, never `.kaido/config.json` (`InvalidPath`).
+- A rename stays in the same folder (`InvalidPath` otherwise; the folder part is compared exactly). It never replaces a file: an existing `to`, including `to` equal to `from`, is a `Conflict`. A case-only rename (`a.md` to `A.md`) works, also on case-insensitive file systems. The note must be readable and at most 8 MiB (`TooLarge`). A missing `from` is `NotFound`.
+- A delete needs the hash of the version the user has seen; a different hash is a `Conflict`, so a newer version is never deleted. A missing file is `NotFound`.
 
 Calls to `open_workspace` run one at a time and the most recently issued one wins: an older call still waiting fails with `Superseded`, which the UI ignores. A failed open keeps the previous workspace.
 
@@ -278,7 +288,7 @@ Saving is handled per note by `SaveSession` (`src/lib/core/saveMachine.ts`), a p
 - At most one write per note is in flight. Edits made during a write are saved after it.
 - Every write passes the hash of the last known disk version as `expectedHash` (or `null` if the file was deleted), so a newer version on disk is never overwritten.
 - When the watcher reports the open note, the file is read again. The same hash as the last save is the app's own write and is ignored. Without unsaved edits, the new version replaces the editor text. With unsaved edits, both versions are kept.
-- **Keeping both versions.** The disk version is written next to the note as `<name> (conflict YYYY-MM-DD HHmm).md` (with ` 2`, ` 3`… if taken), then the editor text replaces the note. If the file changes again meanwhile, this is retried up to three times. Once a version is kept in a copy, later retries only write the editor text, so the same version is never copied twice. A notice names the copy.
+- **Keeping both versions.** The disk version is written next to the note as `<name> (conflict YYYY-MM-DD HHmm).md` (with ` 2`, ` 3`… if taken; a name too long for the suffix is shortened so the copy fits in 255 bytes), then the editor text replaces the note. If the file changes again meanwhile, this is retried up to three times. Once a version is kept in a copy, later retries only write the editor text, so the same version is never copied twice. A notice names the copy.
 - A note deleted outside the app is shown as missing, unless it has unsaved edits; then the next save creates it again.
 - Other failures keep the text, show `save failed — retrying` in the header and retry with a growing delay, and on the next edit.
 
@@ -287,6 +297,13 @@ The header shows `saved · 2m ago`, `saving…`, `unsaved` or `save failed — r
 Line endings are kept as they are: each note is edited with the line separator it uses (`\n`, `\r\n` or `\r`, taken from its first line break), new lines and pasted text use it too, and a note that is shown but not edited is never rewritten.
 
 **Switching workspaces and closing.** Before another workspace opens, pending saves are written in the current one (waiting at most a few seconds). If some edits are still unsaved after that, because saving failed or took too long, the switch is refused: the current workspace and editor stay as they are and a notice names the notes. Closing the window works the same way, and also counts saves of a previous workspace that are still running. Trying the same action again right away goes ahead without the unsaved edits. That consent only covers the very next attempt: any edit, any successful save, or a check that finds nothing unsaved withdraws it.
+
+**Note actions.** Right-clicking a note in the list, or pressing `Shift+F10` or the context menu key on the focused row, opens a menu with **Rename** (`F2`), **Copy path** (the workspace-relative path) and **Delete** (`Del`). `F2` and `Delete` also work directly on the focused row, never while typing in the editor.
+
+- **Rename** edits the file name in the row, with the name before `.md` selected. `Enter` or leaving the field confirms (switching to another window does not), `Esc` cancels; an unchanged name just ends editing, even one the rules below would refuse. The name is used as typed, trimmed, with `.md` added when missing (`src/lib/core/noteNames.ts`). Names that break on Linux, macOS or Windows are refused with the reason shown next to the field: `/`, `\`, control characters, `<>:"|?*`, a leading dot, a trailing space or dot, Windows device names (`CON`, `NUL`, `COM1`…), names over 200 UTF-8 bytes (leaving room for conflict copies and the trash within the usual 255-byte limit), `tasks.md`, names already used in the folder (compared case-insensitively, except the note's own name; this includes an open note whose file was deleted elsewhere and the selected note shown as missing), and names hidden by the ignore patterns. Unsaved edits are saved first; an open note then keeps its text, undo history and save state under the new path, without being read again.
+- **Delete** asks for no confirmation. Pending edits are saved first, then the file is moved to the system trash, the next row is selected and a toast offers **Undo** for a few seconds (`Ctrl+Z` / `Cmd+Z` while the toast or the list has focus; in the list it undoes the most recent delete). Holding `Delete` deletes one note. Undo writes the deleted contents back, including edits that could not be saved, with `expectedHash: null`, so a file that took the name meanwhile is kept and a notice says so.
+- Notes over 8 MiB cannot be renamed or deleted from the app.
+- Both run in the same queue as change events and update the model right away, so the watcher's later report of the change is a no-op. Failures show a notice and change nothing.
 
 **New notes.** `Ctrl+N` (`Cmd+N` on macOS) or the `+ new note` button in the list pane creates an empty note in the selected project, or in `inbox/` when All tasks is selected (`src/lib/core/newNote.ts`). It is named `untitled.md`, then `untitled 2.md`, `untitled 3.md`…, skipping names already in the workspace (compared case-insensitively) or hidden by the ignore patterns. The file is written with `expectedHash: null`; if a file with that name appeared on disk meanwhile, the next name is tried, a few times at most. The note is added to the model, selected and opened with the editor focused right away, without waiting for the watcher; its autosave starts from the hash of that first write. A failure shows a notice and changes nothing else.
 

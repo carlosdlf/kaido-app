@@ -11,6 +11,10 @@
  * app closes, and are dropped once everything is on disk. Closing the window
  * or opening another workspace while edits cannot be saved is refused once
  * with a notice; trying again right away goes ahead without them.
+ *
+ * Renaming and deleting notes run in the same queue as change events, after
+ * the note's pending edits are saved. The model is updated right away, so
+ * the watcher's later report of the app's own change is a no-op.
  */
 
 import {
@@ -23,6 +27,7 @@ import {
   type WriteOutcome,
 } from "$lib/core/saveMachine";
 import { newNoteFolder, newNotePath } from "$lib/core/newNote";
+import { nextAfterRemoval, renamedPath, validateNoteName } from "$lib/core/noteNames";
 import {
   ALL_TASKS,
   fallbackSummary,
@@ -54,6 +59,7 @@ import { parseSettings, serializeSettings, type DeviceSettings } from "$lib/conf
 import { parseWorkspaceConfig, type WorkspaceConfig } from "$lib/config/workspaceConfig";
 import {
   isStorageError,
+  StorageError,
   toStorageError,
   type FileContents,
   type Storage,
@@ -78,6 +84,26 @@ export type DocumentState =
 export interface Toast {
   id: number;
   message: string;
+  /** Label of the toast's action button, e.g. `Undo`. */
+  action?: string;
+}
+
+export type RenameOutcome =
+  | { kind: "renamed"; path: string }
+  /** The name cannot be used; the reason is shown next to it. */
+  | { kind: "invalid"; reason: string }
+  /** Renaming failed for another reason, already reported in a toast. */
+  | { kind: "failed" };
+
+/** Tells the editor that cached state moved to another path or must be dropped. */
+export type EditorPathChange =
+  { kind: "rename"; from: string; to: string } | { kind: "forget"; path: string };
+
+interface DeletedNote {
+  path: string;
+  /** What the note contained, including edits that could not be saved. */
+  contents: string;
+  generation: number;
 }
 
 export interface AppStateOptions {
@@ -167,6 +193,37 @@ export function unsavedOnSwitchMessage(paths: readonly string[]): string {
   return `Changes to ${paths.join(", ")} could not be saved. Open the folder again to switch without them.`;
 }
 
+export function nameTakenMessage(name: string): string {
+  return `A note named ${name} already exists.`;
+}
+
+export const NAME_IGNORED = "Notes with this name are hidden by the workspace ignore patterns.";
+export const NOTE_GONE = "This note no longer exists.";
+
+export function renameFailedMessage(name: string, message: string): string {
+  return `${name} could not be renamed: ${message}`;
+}
+
+export function deletedMessage(name: string): string {
+  return `Deleted ${name}`;
+}
+
+export function deleteConflictMessage(name: string): string {
+  return `${name} changed on disk and was not deleted.`;
+}
+
+export function deleteFailedMessage(name: string, message: string): string {
+  return `${name} could not be deleted: ${message}`;
+}
+
+export function restoreTakenMessage(name: string): string {
+  return `${name} already exists, so the deleted note was not restored.`;
+}
+
+export function restoreFailedMessage(name: string, message: string): string {
+  return `${name} could not be restored: ${message}`;
+}
+
 /** Actions that are refused once while edits cannot be saved. */
 type UnsafeAction = "close" | "switch";
 
@@ -191,6 +248,8 @@ export class AppState {
   toasts: Toast[] = $state.raw([]);
   /** Bumped when the editor should take focus, e.g. after a note was created. */
   editorFocusRequest: number = $state(0);
+  /** Renamed and deleted notes, in order, so the editor can move or drop their state. */
+  editorChanges: readonly EditorPathChange[] = $state.raw([]);
 
   readonly #storage: Storage;
   readonly #defer: (task: () => void) => void;
@@ -221,6 +280,9 @@ export class AppState {
   /** Bumped by every `openWorkspace` call, so only the latest one proceeds. */
   #openRequest = 0;
   #toastId = 0;
+  /** Deleted notes that an undo toast can restore, by toast id. */
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- private bookkeeping, never rendered
+  readonly #deleted = new Map<number, DeletedNote>();
   #settings: ParseResult<DeviceSettings> = parseSettings(null);
   #settingsWarnings: ConfigWarning[] = [];
   #config: WorkspaceConfig = parseWorkspaceConfig(null).value;
@@ -298,6 +360,7 @@ export class AppState {
       if (!this.#allow("switch", unsaved, unsavedOnSwitchMessage(unsaved))) return;
     }
     const generation = ++this.#generation;
+    this.#dropUndo();
     const closing = this.#closeSessions();
     this.#unwatch?.();
     this.#unwatch = null;
@@ -425,7 +488,8 @@ export class AppState {
         return;
       }
       if (generation !== this.#generation) return;
-      this.#openCreated(written, folder);
+      this.#openCreated(written, "", folder);
+      this.editorFocusRequest += 1;
       return;
     }
     if (generation === this.#generation) this.#toast(NO_FREE_NOTE_NAME);
@@ -438,7 +502,149 @@ export class AppState {
     );
   }
 
+  /**
+   * Renames a note within its folder to the name the user typed. Pending
+   * edits are saved first; an open note keeps its buffer, undo history and
+   * selection under the new path.
+   */
+  async renameNote(path: string, input: string): Promise<RenameOutcome> {
+    if (this.phase.kind !== "ready") return { kind: "failed" };
+    // An unchanged name is no rename, even one this app would not accept.
+    const typed = input.trim();
+    const current = baseName(path);
+    if (typed === current || `${typed}.md` === current) return { kind: "renamed", path };
+    const validation = validateNoteName(input);
+    if (!validation.ok) return { kind: "invalid", reason: validation.reason };
+    const name = validation.name;
+    const to = renamedPath(path, name);
+    const generation = this.#generation;
+    return this.#serial(async (): Promise<RenameOutcome> => {
+      if (generation !== this.#generation) return { kind: "failed" };
+      if (!this.#isNote(path)) return { kind: "invalid", reason: NOTE_GONE };
+      if (this.#nameTaken(path, to)) return { kind: "invalid", reason: nameTakenMessage(name) };
+      if (classifyPath(to, createPathFilter(this.#config)) === null)
+        return { kind: "invalid", reason: NAME_IGNORED };
+
+      const session = this.#sessions.get(path);
+      try {
+        if (session) {
+          await session.exclusive(async () => {
+            const written = await this.#storage.renameFile(path, to);
+            session.moveTo(written.path, written.hash);
+            // Moved before the session's next step, which reports under the new path.
+            if (generation === this.#generation) this.#applyRename(path, written, session);
+          });
+        } else {
+          const written = await this.#storage.renameFile(path, to);
+          if (generation === this.#generation) this.#applyRename(path, written, null);
+        }
+      } catch (error) {
+        if (generation !== this.#generation) return { kind: "failed" };
+        const storageError = toStorageError(error);
+        if (storageError.kind === "Conflict") {
+          return { kind: "invalid", reason: nameTakenMessage(name) };
+        }
+        this.#toast(renameFailedMessage(baseName(path), storageError.message));
+        return { kind: "failed" };
+      }
+      if (generation !== this.#generation) return { kind: "failed" };
+      return { kind: "renamed", path: to };
+    });
+  }
+
+  /**
+   * Deletes a note after saving its pending edits, selects the next item and
+   * shows a toast that can undo it. Failures show a toast and change nothing.
+   */
+  async deleteNote(path: string): Promise<void> {
+    if (this.phase.kind !== "ready") return;
+    const generation = this.#generation;
+    await this.#serial(async () => {
+      if (generation !== this.#generation || !this.#isNote(path)) return;
+      const name = baseName(path);
+      const session = this.#sessions.get(path);
+      let contents: string;
+      try {
+        if (session) {
+          contents = await session.exclusive(async () => {
+            const hash = session.hash;
+            if (hash === null) throw new StorageError("NotFound", `${path} does not exist.`);
+            await this.#storage.deleteFile(path, hash);
+            // The latest buffer, including edits that could not be saved.
+            return session.text;
+          });
+        } else {
+          const file = await this.#storage.readFile(path);
+          await this.#storage.deleteFile(path, file.hash);
+          contents = file.contents;
+        }
+      } catch (error) {
+        if (generation !== this.#generation) return;
+        const storageError = toStorageError(error);
+        if (storageError.kind === "Conflict") {
+          this.#toast(deleteConflictMessage(name));
+          // Show what is on disk now.
+          void session?.externalChange();
+        } else {
+          this.#toast(deleteFailedMessage(name, storageError.message));
+        }
+        return;
+      }
+      if (generation !== this.#generation) return;
+      this.#applyDelete(path, session ?? null);
+      const id = this.#toast(deletedMessage(name), "Undo");
+      this.#deleted.set(id, { path, contents, generation });
+    });
+  }
+
+  /**
+   * Restores the note deleted with toast `id`, without replacing a file that
+   * took its name meanwhile, and selects it.
+   */
+  async undoDelete(id: number): Promise<void> {
+    const deleted = this.#deleted.get(id);
+    if (!deleted) return;
+    this.dismissToast(id);
+    await this.#serial(async () => {
+      if (deleted.generation !== this.#generation) return;
+      const name = baseName(deleted.path);
+      let written: WrittenFile;
+      try {
+        written = await this.#storage.writeFile(deleted.path, deleted.contents, {
+          expectedHash: null,
+        });
+      } catch (error) {
+        if (deleted.generation !== this.#generation) return;
+        const storageError = toStorageError(error);
+        this.#toast(
+          storageError.kind === "Conflict"
+            ? restoreTakenMessage(name)
+            : restoreFailedMessage(name, storageError.message),
+        );
+        return;
+      }
+      if (deleted.generation !== this.#generation) return;
+      const role = classifyPath(deleted.path, createPathFilter(this.#config));
+      // A note hidden by the ignore patterns meanwhile is restored but not shown.
+      if (role?.kind !== "note" || role.archived) return;
+      this.#openCreated(written, deleted.contents, role.project);
+    });
+  }
+
+  /** The toast of the most recent delete that can still be undone, or `null`. */
+  get latestUndo(): number | null {
+    let latest: number | null = null;
+    for (const id of this.#deleted.keys()) latest = latest === null ? id : Math.max(latest, id);
+    return latest;
+  }
+
+  /** Shows a short message. */
+  notify(message: string): void {
+    this.#toast(message);
+  }
+
   dismissToast(id: number): void {
+    this.#deleted.delete(id);
     this.toasts = this.toasts.filter((toast) => toast.id !== id);
   }
 
@@ -485,35 +691,143 @@ export class AppState {
    * watcher, and opens it with a session based on the creation write. The
    * watcher's later report carries the same metadata, so it changes nothing.
    */
-  #openCreated(written: WrittenFile, folder: string): void {
+  #openCreated(written: WrittenFile, contents: string, folder: string): void {
     const { hash, ...entry } = written;
     const path = entry.path;
     this.#files = [...this.#files.filter((file) => file.path !== path), entry];
     this.workspace = buildWorkspace(this.#files, this.#config);
-    this.#store.set(path, summarizeFile(path, ""));
+    this.#store.set(path, summarizeFile(path, contents));
     this.#schedulePublish();
 
     this.#leave(path);
     // A session left from a note deleted at this path is replaced.
     this.#sessions.get(path)?.dispose();
-    const session = this.#createSession(path, { contents: "", hash }, entry.modified);
+    const session = this.#createSession(path, { contents, hash }, entry.modified);
     this.#sessions.set(path, session);
     // Drop reads still in flight for the previous selection.
     this.#documentRequest += 1;
     this.folder = folder;
     this.item = path;
-    this.document = { status: "ready", path, text: "", modified: entry.modified };
+    this.document = { status: "ready", path, text: contents, modified: entry.modified };
     this.saveStatus = session.status;
-    this.editorFocusRequest += 1;
+  }
+
+  /** Runs `task` in the change queue, so watcher reports wait until it is done. */
+  #serial<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.#changes.then(task);
+    this.#changes = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /** A note shown in the workspace (not a task list). */
+  #isNote(path: string): boolean {
+    return this.#index.has(path) && !isTaskListPath(path);
+  }
+
+  /**
+   * Whether `to` belongs to something other than `from`: a listed file, an
+   * open note whose file is gone but whose edits are kept, or the selected
+   * item shown as missing. Many file systems ignore case, so names are
+   * compared that way and only a case-only rename may match.
+   */
+  #nameTaken(from: string, to: string): boolean {
+    const key = to.toLowerCase();
+    if (key === from.toLowerCase()) return false;
+    const same = (path: string) => path.toLowerCase() === key;
+    return (
+      this.#files.some((file) => same(file.path)) ||
+      [...this.#sessions.keys()].some(same) ||
+      same(this.item)
+    );
+  }
+
+  /** Moves a renamed note in the model, its summary, session and selection. */
+  #applyRename(from: string, written: WrittenFile, session: SaveSession | null): void {
+    const entry: FileEntry = {
+      path: written.path,
+      size: written.size,
+      modified: written.modified,
+    };
+    const to = entry.path;
+    const summary = this.#store.view().get(from);
+    this.#files = [...this.#files.filter((file) => file.path !== from && file.path !== to), entry];
+    this.workspace = buildWorkspace(this.#files, this.#config);
+    this.#store.retain((path) => path !== from);
+    if (session) {
+      this.#store.set(to, summarizeFile(to, session.text));
+    } else {
+      // A title taken from the file name changes; read it again.
+      if (summary) this.#store.set(to, summary);
+      this.#enqueue([to], this.#generation);
+    }
+    this.#schedulePublish();
+
+    if (session) {
+      if (this.#sessions.get(from) === session) this.#sessions.delete(from);
+      const stale = this.#sessions.get(to);
+      if (stale !== session) stale?.dispose();
+      this.#sessions.set(to, session);
+    }
+    this.editorChanges = [...this.editorChanges, { kind: "rename", from, to }];
+
+    if (this.item !== from) return;
+    this.item = to;
+    const doc = this.document;
+    if (doc?.path !== from) return;
+    if (session && doc.status === "ready") {
+      // The buffer, so the editor sees no change and keeps its history.
+      this.document = { status: "ready", path: to, text: session.text, modified: entry.modified };
+    } else if (doc.status === "loading") {
+      void this.#loadDocument(to, this.#generation);
+    } else {
+      this.document = { ...doc, path: to };
+    }
+  }
+
+  /** Removes a deleted note from the model and selects the next item if it was selected. */
+  #applyDelete(path: string, session: SaveSession | null): void {
+    const ids = listItems(this.workspace, this.folder, this.summaries).map((item) => item.id);
+    const next = this.item === path ? nextAfterRemoval(ids, path) : null;
+    this.#files = this.#files.filter((file) => file.path !== path);
+    this.workspace = buildWorkspace(this.#files, this.#config);
+    if (this.#store.retain((other) => other !== path)) this.#schedulePublish();
+    if (session) {
+      session.dispose();
+      if (this.#sessions.get(path) === session) this.#sessions.delete(path);
+    }
+    this.editorChanges = [...this.editorChanges, { kind: "forget", path }];
+    if (this.item !== path) return;
+    this.#documentRequest += 1;
+    this.item = "";
+    this.document = null;
+    this.saveStatus = null;
+    if (next !== null) this.selectItem(next);
+  }
+
+  /** Undo toasts belong to the workspace they were shown in. */
+  #dropUndo(): void {
+    if (this.#deleted.size === 0) return;
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity -- local to this call, never rendered
+    const ids = new Set(this.#deleted.keys());
+    this.#deleted.clear();
+    this.toasts = this.toasts.filter((toast) => !ids.has(toast.id));
   }
 
   #ready(path: string, text: string): DocumentState {
     return { status: "ready", path, text, modified: this.#index.get(path)?.modified ?? 0 };
   }
 
-  #toast(message: string): void {
+  #toast(message: string, action?: string): number {
     this.#toastId += 1;
-    this.toasts = [...this.toasts, { id: this.#toastId, message }];
+    const toast: Toast =
+      action === undefined
+        ? { id: this.#toastId, message }
+        : { id: this.#toastId, message, action };
+    this.toasts = [...this.toasts, toast];
+    return this.#toastId;
   }
 
   /** Flushes the open note before another one is shown. */
@@ -653,28 +967,31 @@ export class AppState {
       timers: this.#timers,
       ...(this.#saveDelay === undefined ? {} : { saveDelay: this.#saveDelay }),
       events: {
+        // A rename moves the session, so its current path is read each time.
         status: (status) => {
-          if (this.#sessions.get(path) !== session) return;
-          if (path === this.item) this.saveStatus = status;
+          if (this.#sessions.get(session.path) !== session) return;
+          if (session.path === this.item) this.saveStatus = status;
           else if (status.kind === "saved")
             void session.settled().then(() => this.#retire(session));
         },
         saved: (contents) => {
           this.#refused = null;
-          this.#updateSummary(path, contents);
+          this.#updateSummary(session.path, contents);
         },
         reloaded: (contents) => {
-          this.#updateSummary(path, contents);
-          if (path === this.item && this.#sessions.get(path) === session) {
-            this.document = this.#ready(path, contents);
+          const current = session.path;
+          this.#updateSummary(current, contents);
+          if (current === this.item && this.#sessions.get(current) === session) {
+            this.document = this.#ready(current, contents);
           }
         },
         removed: () => {
-          if (this.#sessions.get(path) !== session) return;
+          const current = session.path;
+          if (this.#sessions.get(current) !== session) return;
           session.dispose();
-          this.#sessions.delete(path);
-          if (path === this.item) {
-            this.document = { status: "missing", path };
+          this.#sessions.delete(current);
+          if (current === this.item) {
+            this.document = { status: "missing", path: current };
             this.saveStatus = null;
           }
         },

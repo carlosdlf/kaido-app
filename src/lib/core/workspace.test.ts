@@ -86,6 +86,16 @@ describe("buildWorkspace", () => {
     expect(workspace.projects[1]?.notes.map((note) => note.name)).toEqual(["A.md", "b.md"]);
   });
 
+  it("sorts the inbox notes too, including loose root files", () => {
+    const workspace = build(["inbox/zeta.md", "inbox/Beta.md", "alpha.md", "inbox/a.md"]);
+    expect(workspace.projects[0]?.notes.map((note) => note.name)).toEqual([
+      "a.md",
+      "alpha.md",
+      "Beta.md",
+      "zeta.md",
+    ]);
+  });
+
   it("sorts numbers naturally", () => {
     const workspace = build(["p/note-10.md", "p/note-2.md", "p/note-1.md"]);
     expect(workspace.projects[1]?.notes.map((note) => note.name)).toEqual([

@@ -15,10 +15,15 @@
  * - with unsaved edits both versions are kept: the disk version is written
  *   to a conflict copy next to the file and the buffer then replaces it.
  *
+ * Renaming or deleting the file runs as an exclusive step (`exclusive`)
+ * after pending edits are saved, so no write races it; a rename then moves
+ * the session to the new path (`moveTo`) with its buffer and status.
+ *
  * Nothing here touches the platform: storage access and timers are passed
  * in, so the whole flow can be tested with fakes.
  */
 
+import { FILE_NAME_LIMIT_BYTES, truncateUtf8, utf8Length } from "./noteNames";
 import { formatAge } from "./time";
 
 /** Delay after the last edit before saving. */
@@ -107,6 +112,7 @@ export function conflictStamp(time: number): string {
 /**
  * Where the other version of `path` is kept after a conflict:
  * `<dir>/<stem> (conflict YYYY-MM-DD HHmm).md`, then `… 2.md`, `… 3.md`.
+ * A stem too long for the suffix to fit in a file name is shortened.
  */
 export function conflictCopyPath(path: string, time: number, attempt = 1): string {
   const slash = path.lastIndexOf("/");
@@ -114,8 +120,9 @@ export function conflictCopyPath(path: string, time: number, attempt = 1): strin
   const name = path.slice(slash + 1);
   const extension = MARKDOWN_EXTENSION.exec(name)?.[0] ?? ".md";
   const stem = MARKDOWN_EXTENSION.test(name) ? name.slice(0, -extension.length) : name;
-  const suffix = attempt > 1 ? ` ${attempt}` : "";
-  return `${folder}${stem} (conflict ${conflictStamp(time)})${suffix}${extension}`;
+  const suffix = ` (conflict ${conflictStamp(time)})${attempt > 1 ? ` ${attempt}` : ""}${extension}`;
+  const room = FILE_NAME_LIMIT_BYTES - utf8Length(suffix);
+  return `${folder}${truncateUtf8(stem, room)}${suffix}`;
 }
 
 /** File name of a workspace path. */
@@ -149,8 +156,16 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Thrown to exclusive steps that never ran because the session was disposed. */
+export const SESSION_CLOSED = "The note was closed.";
+
+interface ExclusiveStep {
+  run(): Promise<void>;
+  cancel(): void;
+}
+
 export class SaveSession {
-  readonly path: string;
+  #path: string;
   /** Last known disk contents, or `null` if the file does not exist. */
   #base: string | null;
   #baseHash: string | null;
@@ -174,9 +189,10 @@ export class SaveSession {
   #active = false;
   #idle: Promise<void> = Promise.resolve();
   #disposed = false;
+  readonly #steps: ExclusiveStep[] = [];
 
   constructor(options: SaveSessionOptions) {
-    this.path = options.path;
+    this.#path = options.path;
     this.#base = options.contents;
     this.#baseHash = options.hash;
     this.#buffer = options.contents;
@@ -187,6 +203,16 @@ export class SaveSession {
     this.#events = options.events ?? {};
     this.#saveDelay = options.saveDelay ?? SAVE_DELAY_MS;
     this.#retryDelays = options.retryDelays ?? RETRY_DELAYS_MS;
+  }
+
+  /** Path of the document; changes with `moveTo`. */
+  get path(): string {
+    return this.#path;
+  }
+
+  /** Hash of the last known disk version, or `null` if the file does not exist. */
+  get hash(): string | null {
+    return this.#baseHash;
   }
 
   get status(): SaveStatus {
@@ -244,10 +270,40 @@ export class SaveSession {
     return this.#idle;
   }
 
+  /**
+   * Saves pending edits, then runs `task` as the only disk work of this
+   * session: saves and checks wait until it is done. Resolves or rejects
+   * like `task`; a session disposed before the task starts rejects with
+   * `SESSION_CLOSED`.
+   */
+  exclusive<T>(task: () => Promise<T>): Promise<T> {
+    if (this.#disposed) return Promise.reject(new Error(SESSION_CLOSED));
+    return new Promise<T>((resolve, reject) => {
+      this.#cancelTimer();
+      if (this.#pending !== null || this.dirty) this.#wantSave = true;
+      this.#steps.push({
+        run: () => task().then(resolve, reject),
+        cancel: () => reject(new Error(SESSION_CLOSED)),
+      });
+      void this.#pump();
+    });
+  }
+
+  /**
+   * The file was renamed to `path`; `hash` is the hash of the file there.
+   * Call it from an `exclusive` task. Buffer, status and pending edits stay;
+   * if the file there is not the known disk version, it is checked again.
+   */
+  moveTo(path: string, hash: string): void {
+    this.#path = path;
+    if (this.#baseHash !== null && hash !== this.#baseHash) this.#wantCheck = true;
+  }
+
   /** Stops timers and events. Work already started still finishes, silently. */
   dispose(): void {
     this.#disposed = true;
     this.#cancelTimer();
+    for (const step of this.#steps.splice(0)) step.cancel();
   }
 
   #schedule(delay: number): void {
@@ -285,6 +341,8 @@ export class SaveSession {
         } else if (this.#wantSave) {
           this.#wantSave = false;
           await this.#save();
+        } else if (this.#steps.length > 0) {
+          await this.#steps.shift()?.run();
         } else {
           break;
         }
@@ -296,7 +354,7 @@ export class SaveSession {
 
   async #read(): Promise<ReadOutcome> {
     try {
-      return await this.#io.read(this.path);
+      return await this.#io.read(this.#path);
     } catch (error) {
       return { kind: "error", message: errorMessage(error) };
     }
@@ -317,7 +375,7 @@ export class SaveSession {
       return;
     }
     this.#setStatus({ kind: "saving" });
-    const result = await this.#write(this.path, contents, this.#baseHash);
+    const result = await this.#write(this.#path, contents, this.#baseHash);
     if (this.#disposed) return;
     if (result.kind === "ok") this.#saved(contents, result.hash);
     else if (result.kind === "conflict") await this.#resolveConflict(null);
@@ -395,7 +453,7 @@ export class SaveSession {
         }
         expected = disk.hash;
       }
-      const result = await this.#write(this.path, contents, expected);
+      const result = await this.#write(this.#path, contents, expected);
       if (this.#disposed) return;
       if (result.kind === "ok") {
         this.#saved(contents, result.hash);
@@ -415,7 +473,7 @@ export class SaveSession {
   ): Promise<{ kind: "ok"; path: string } | { kind: "error"; message: string }> {
     const time = this.#timers.now();
     for (let attempt = 1; attempt <= MAX_CONFLICT_COPY_NAMES; attempt += 1) {
-      const path = conflictCopyPath(this.path, time, attempt);
+      const path = conflictCopyPath(this.#path, time, attempt);
       const result = await this.#write(path, contents, null);
       if (result.kind === "ok") return { kind: "ok", path };
       if (result.kind === "error") return result;

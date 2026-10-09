@@ -24,6 +24,8 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         list_files,
         read_file,
         write_file,
+        rename_file,
+        delete_file,
         read_settings,
         write_settings,
     ]
@@ -130,6 +132,39 @@ pub async fn write_file(
 }
 
 #[tauri::command]
+pub async fn rename_file(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+) -> AppResult<WrittenFile> {
+    let root = state.root()?;
+    blocking(move || fs_ops::rename_file(&root, &from, &to)).await
+}
+
+/// Checks the `expectedHash` argument of `delete_file`, which must be a
+/// string. It is taken as a raw JSON value so a missing key, `null` and other
+/// types all produce a typed error instead of a deserialization failure.
+fn delete_hash(value: Option<serde_json::Value>) -> AppResult<String> {
+    match value {
+        Some(serde_json::Value::String(hash)) => Ok(hash),
+        _ => Err(AppError::Io(format!(
+            "invalid delete_file request: {EXPECTED_HASH_KEY} must be a string"
+        ))),
+    }
+}
+
+#[tauri::command]
+pub async fn delete_file(
+    state: State<'_, AppState>,
+    path: String,
+    expected_hash: Option<serde_json::Value>,
+) -> AppResult<()> {
+    let expected_hash = delete_hash(expected_hash)?;
+    let root = state.root()?;
+    blocking(move || fs_ops::delete_file(&root, &path, &expected_hash)).await
+}
+
+#[tauri::command]
 pub async fn read_settings(dir: State<'_, SettingsDir>) -> AppResult<Option<String>> {
     let dir = dir.0.clone();
     blocking(move || settings::read_settings(&dir)).await
@@ -220,6 +255,19 @@ mod tests {
             error_kind(invoke(&webview, "write_file", write)),
             "NoWorkspace"
         );
+    }
+
+    #[test]
+    fn every_command_is_declared_and_granted() {
+        let build = include_str!("../build.rs");
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let granted = capability["permissions"].as_array().unwrap();
+        for cmd in ["rename_file", "delete_file"] {
+            assert!(build.contains(&format!("\"{cmd}\"")), "{cmd}");
+            let permission = format!("allow-{}", cmd.replace('_', "-"));
+            assert!(granted.iter().any(|p| p == &permission), "{permission}");
+        }
     }
 
     #[test]
@@ -375,6 +423,102 @@ mod tests {
         let read = invoke(&webview, "read_file", serde_json::json!({ "path": "a.md" })).unwrap();
         assert_eq!(read["contents"], "four");
         assert!(!dir.path().join("b.md").exists());
+    }
+
+    #[test]
+    fn rename_through_ipc() {
+        let (_app, webview, _settings) = app();
+        let dir = tempfile::tempdir().unwrap();
+        let none = serde_json::json!({ "from": "a.md", "to": "b.md" });
+        assert_eq!(
+            error_kind(invoke(&webview, "rename_file", none.clone())),
+            "NoWorkspace"
+        );
+        invoke(
+            &webview,
+            "open_workspace",
+            serde_json::json!({ "path": dir.path() }),
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("p")).unwrap();
+        std::fs::write(dir.path().join("p/a.md"), "body").unwrap();
+        std::fs::write(dir.path().join("p/taken.md"), "x").unwrap();
+
+        let rename = |from: &str, to: &str| {
+            invoke(
+                &webview,
+                "rename_file",
+                serde_json::json!({ "from": from, "to": to }),
+            )
+        };
+        let renamed = rename("p/a.md", "p/b.md").unwrap();
+        assert_eq!(renamed["path"], "p/b.md");
+        assert_eq!(renamed["size"], 4);
+        assert!(renamed["modified"].as_u64().unwrap() > 0);
+        assert_eq!(renamed["hash"], fs_ops::content_hash(b"body"));
+        assert_eq!(renamed.as_object().unwrap().len(), 4);
+        assert_eq!(error_kind(rename("p/b.md", "p/taken.md")), "Conflict");
+        assert_eq!(error_kind(rename("p/b.md", "b.md")), "InvalidPath");
+        assert_eq!(error_kind(rename("p/missing.md", "p/c.md")), "NotFound");
+        assert!(dir.path().join("p/b.md").exists());
+    }
+
+    #[test]
+    fn delete_hash_must_be_a_string() {
+        assert_eq!(
+            delete_hash(Some(serde_json::json!("ab"))).unwrap(),
+            "ab".to_owned()
+        );
+        for bad in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(1)),
+            Some(serde_json::json!({})),
+        ] {
+            let err = delete_hash(bad).unwrap_err();
+            assert_eq!(err.kind(), "Io");
+            assert_eq!(
+                err.to_string(),
+                "invalid delete_file request: expectedHash must be a string"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_errors_through_ipc() {
+        // Successful deletes use the OS trash and are tested in `fs_ops`
+        // with the trash replaced.
+        let (_app, webview, _settings) = app();
+        let dir = tempfile::tempdir().unwrap();
+        let delete = |args: serde_json::Value| invoke(&webview, "delete_file", args);
+        let hash = fs_ops::content_hash(b"body");
+        let args = serde_json::json!({ "path": "a.md", "expectedHash": hash });
+        assert_eq!(error_kind(delete(args)), "NoWorkspace");
+        invoke(
+            &webview,
+            "open_workspace",
+            serde_json::json!({ "path": dir.path() }),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("a.md"), "changed").unwrap();
+
+        let args = serde_json::json!({ "path": "a.md", "expectedHash": hash });
+        assert_eq!(error_kind(delete(args)), "Conflict");
+        let args = serde_json::json!({ "path": "missing.md", "expectedHash": hash });
+        assert_eq!(error_kind(delete(args)), "NotFound");
+        let args = serde_json::json!({ "path": ".kaido/config.json", "expectedHash": hash });
+        assert_eq!(error_kind(delete(args)), "InvalidPath");
+        for bad in [
+            serde_json::json!({ "path": "a.md" }),
+            serde_json::json!({ "path": "a.md", "expectedHash": null }),
+            serde_json::json!({ "path": "a.md", "expectedHash": 3 }),
+        ] {
+            assert_eq!(error_kind(delete(bad)), "Io");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.md")).unwrap(),
+            "changed"
+        );
     }
 
     #[test]

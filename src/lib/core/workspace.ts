@@ -115,9 +115,13 @@ function emptyProject(name: string): Project {
   return { name, tasks: null, notes: [] };
 }
 
+function sortNotes(project: Project): void {
+  project.notes.sort((a, b) => compareNames(a.name, b.name));
+}
+
 function sortProjects(projects: Map<string, Project>): Project[] {
   const list = [...projects.values()];
-  for (const project of list) project.notes.sort((a, b) => compareNames(a.name, b.name));
+  for (const project of list) sortNotes(project);
   return list.sort((a, b) => compareNames(a.name, b.name));
 }
 
@@ -142,6 +146,7 @@ export function buildWorkspace(files: readonly FileEntry[], options: WorkspaceOp
 
   const inbox = active.get(INBOX) ?? emptyProject(INBOX);
   active.delete(INBOX);
+  sortNotes(inbox);
   return { projects: [inbox, ...sortProjects(active)], archived: sortProjects(archived) };
 }
 

@@ -99,12 +99,28 @@ pub const MAX_FILE_SIZE: u64 = 8 * 1024 * 1024;
 /// refused with `InvalidPath`.
 pub fn ensure_allowed(rel: &str) -> AppResult<()> {
     paths::validate_relative(rel)?;
-    if rel == CONFIG_FILE || (is_markdown(rel) && !is_pruned_path(rel)) {
+    if rel == CONFIG_FILE || is_note_path(rel) {
         Ok(())
     } else {
         Err(AppError::InvalidPath(format!(
             "{rel} is not a note or the workspace config file"
         )))
+    }
+}
+
+/// Whether `rel` names a listable note: `*.md` outside pruned locations.
+fn is_note_path(rel: &str) -> bool {
+    is_markdown(rel) && !is_pruned_path(rel)
+}
+
+/// Like [`ensure_allowed`], but only for notes: the workspace config file is
+/// refused too. Used by operations that move or remove files.
+pub fn ensure_note(rel: &str) -> AppResult<()> {
+    paths::validate_relative(rel)?;
+    if is_note_path(rel) {
+        Ok(())
+    } else {
+        Err(AppError::InvalidPath(format!("{rel} is not a note")))
     }
 }
 
@@ -424,6 +440,329 @@ fn publish_new(
         Err(_) => check_condition(target, &WriteCondition::CreateOnly, label).and_then(|()| {
             fs::rename(temp, target).map_err(|e| AppError::from_io(&e, "write", label))
         }),
+    }
+}
+
+/// Splits a validated relative path into its folder (empty for the root) and
+/// file name.
+fn split_parent(rel: &str) -> (&str, &str) {
+    rel.rsplit_once('/').unwrap_or(("", rel))
+}
+
+/// Resolves the folder `dir_rel` (empty for the root) that holds the entry
+/// `label`. Symlinks are followed; the folder must exist and stay inside the
+/// workspace.
+fn resolve_folder(root: &Path, dir_rel: &str, label: &str) -> AppResult<PathBuf> {
+    if dir_rel.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    let dir = paths::resolve_existing(root, dir_rel).map_err(|err| match err {
+        AppError::NotFound(_) => AppError::NotFound(format!("{label} was not found")),
+        other => other,
+    })?;
+    if dir.is_dir() {
+        Ok(dir)
+    } else {
+        Err(AppError::NotADirectory(format!(
+            "a parent of {label} is not a folder"
+        )))
+    }
+}
+
+/// Checks the existing directory entry `path` (whose folder is already
+/// resolved) for an operation that acts on the entry itself, such as a
+/// rename or a delete, and returns its own metadata (not following a link).
+///
+/// The entry must exist (`NotFound` otherwise). If it is a symlink, the link
+/// is what gets renamed or deleted, but where it points must still be inside
+/// the workspace and be a note or the config file, the same rule `read_file`
+/// and `write_file` apply; a link to a folder, to a missing location or to
+/// `.git/config` is refused. This keeps every operation consistent: no file
+/// the frontend cannot read is ever touched through a link, and the target of
+/// an allowed link is never modified.
+fn existing_entry(root: &Path, path: &Path, rel: &str) -> AppResult<fs::Metadata> {
+    let meta = fs::symlink_metadata(path).map_err(|e| AppError::from_io(&e, "open", rel))?;
+    let target = paths::resolve_existing(root, rel)?;
+    ensure_resolved_allowed(root, &target, rel)?;
+    if target.is_dir() {
+        return Err(AppError::InvalidPath(format!(
+            "{rel} is a folder, not a file"
+        )));
+    }
+    Ok(meta)
+}
+
+/// Renames a note within its folder and returns the entry of the note at its
+/// new path with the hash of its bytes.
+///
+/// Both paths must be notes (the config file cannot be renamed) in the same
+/// folder; moving between folders is refused with `InvalidPath`. An existing
+/// `to` is never replaced (`Conflict`), except when it is the same entry as
+/// `from` under a different letter case on a case-insensitive file system
+/// (`a.md` to `A.md`), which is a plain rename.
+///
+/// The rename is race-free where the file system supports hard links: `from`
+/// is linked to the new name, which fails if anything exists there, and then
+/// removed. Elsewhere it falls back to a check followed by a rename, with a
+/// window of a few system calls in which a file created by another program
+/// could be replaced.
+///
+/// A symlink is renamed itself, not its target (see [`existing_entry`]). The
+/// note must be readable and at most [`MAX_FILE_SIZE`] bytes, since its hash
+/// is returned; the hash is taken right before renaming. A note over 8 MiB
+/// therefore cannot be renamed through the app (`TooLarge`).
+pub fn rename_file(root: &Path, from: &str, to: &str) -> AppResult<WrittenFile> {
+    rename_file_with(root, from, to, |a, b| fs::hard_link(a, b), has_entry_named)
+}
+
+fn rename_file_with(
+    root: &Path,
+    from: &str,
+    to: &str,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    entry_exists: impl FnOnce(&Path, &str) -> bool,
+) -> AppResult<WrittenFile> {
+    ensure_note(from)?;
+    ensure_note(to)?;
+    let (from_dir, from_name) = split_parent(from);
+    let (to_dir, to_name) = split_parent(to);
+    if from_dir != to_dir {
+        return Err(AppError::InvalidPath(format!(
+            "{to} is not in the same folder as {from}"
+        )));
+    }
+    let dir = resolve_folder(root, from_dir, from)?;
+    let from_path = dir.join(from_name);
+    let to_path = dir.join(to_name);
+    // The folder may be a link into a pruned location such as `.git`.
+    ensure_resolved_allowed(root, &from_path, from)?;
+    ensure_resolved_allowed(root, &to_path, to)?;
+    let from_meta = existing_entry(root, &from_path, from)?;
+    let hash = content_hash(&read_bytes(&from_path, from)?);
+
+    match fs::symlink_metadata(&to_path) {
+        Ok(to_meta) => {
+            let case_only = is_case_variant(from_name, to_name)
+                && same_entry(&from_meta, &to_meta)
+                // On a case-sensitive file system both names really exist.
+                && !entry_exists(&dir, to_name);
+            if !case_only {
+                return Err(AppError::Conflict(format!("{to} already exists")));
+            }
+            ensure_parent_inside(root, &to_path, to)?;
+            fs::rename(&from_path, &to_path).map_err(|e| AppError::from_io(&e, "rename", from))?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            ensure_parent_inside(root, &to_path, to)?;
+            #[cfg(test)]
+            tests::run_before_publish_hook();
+            move_to_new_name(&from_path, &to_path, from, to, link)?;
+        }
+        Err(e) => return Err(AppError::from_io(&e, "check", to)),
+    }
+    sync_parent(&to_path);
+    let meta = fs::metadata(&to_path).map_err(|e| AppError::from_io(&e, "read", to))?;
+    Ok(WrittenFile {
+        entry: entry(to.to_owned(), &meta),
+        hash,
+    })
+}
+
+/// Gives the entry at `from_path` the new name `to_path` without ever
+/// replacing an existing entry there (see [`rename_file`]).
+fn move_to_new_name(
+    from_path: &Path,
+    to_path: &Path,
+    from: &str,
+    to: &str,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> AppResult<()> {
+    let rename_err = |e: io::Error| AppError::from_io(&e, "rename", from);
+    match link(from_path, to_path) {
+        Ok(()) => match fs::remove_file(from_path) {
+            // Removed meanwhile by another program: the note lives at `to`.
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                // Undo the link so the note keeps a single name.
+                let _ = fs::remove_file(to_path);
+                Err(rename_err(e))
+            }
+        },
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            Err(AppError::Conflict(format!("{to} already exists")))
+        }
+        // No hard links here (or not for this file): check, then rename.
+        Err(_) => match fs::symlink_metadata(to_path) {
+            Ok(_) => Err(AppError::Conflict(format!("{to} already exists"))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::rename(from_path, to_path).map_err(rename_err)
+            }
+            Err(e) => Err(AppError::from_io(&e, "check", to)),
+        },
+    }
+}
+
+/// Whether two different names only differ in letter case.
+fn is_case_variant(a: &str, b: &str) -> bool {
+    a != b && a.to_lowercase() == b.to_lowercase()
+}
+
+/// Whether two `symlink_metadata` results describe the same directory entry.
+#[cfg(unix)]
+fn same_entry(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// Whether two `symlink_metadata` results describe the same directory entry.
+/// The file identity is not available from stable `std` here, so this
+/// compares what is; it is only consulted for names that differ in case and
+/// when the folder has no entry with the exact new name.
+#[cfg(not(unix))]
+fn same_entry(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.file_type() == b.file_type()
+        && a.len() == b.len()
+        && a.modified().ok() == b.modified().ok()
+        && a.created().ok() == b.created().ok()
+}
+
+/// Whether `dir` has an entry named exactly `name` (case-sensitive). When
+/// the folder cannot be read this answers `true`, so a rename is refused
+/// rather than risking to replace a file.
+fn has_entry_named(dir: &Path, name: &str) -> bool {
+    match fs::read_dir(dir) {
+        Ok(entries) => entries.flatten().any(|e| e.file_name() == name),
+        Err(_) => true,
+    }
+}
+
+/// Moves a note to the OS trash, provided its bytes still hash to
+/// `expected_hash` (otherwise `Conflict`: a version the user has not seen is
+/// never deleted). The config file cannot be deleted. A symlink is removed
+/// itself, never its target (see [`existing_entry`]).
+///
+/// Since the hash is only ever handed out for files of at most
+/// [`MAX_FILE_SIZE`] bytes, a note over 8 MiB cannot be deleted through the
+/// app (`Conflict`).
+///
+/// Only on Linux and other freedesktop systems, and only when the trash
+/// folders themselves cannot be used (see [`trash_unavailable`]), the file is
+/// removed permanently instead. Any other trash failure is reported and the
+/// file is left in place. A change made by another program between the hash
+/// check and the removal is not detected; the window is a few system calls
+/// wide.
+pub fn delete_file(root: &Path, rel: &str, expected_hash: &str) -> AppResult<()> {
+    delete_file_with(root, rel, expected_hash, move_to_os_trash)
+}
+
+/// Moves `path` to the OS trash. On macOS this goes through `NSFileManager`
+/// rather than asking Finder, which would need the Apple Events permission
+/// and play a sound.
+#[cfg(target_os = "macos")]
+fn move_to_os_trash(path: &Path) -> Result<(), trash::Error> {
+    use trash::macos::{DeleteMethod, TrashContextExtMacos};
+    let mut context = trash::TrashContext::default();
+    context.set_delete_method(DeleteMethod::NsFileManager);
+    context.delete(path)
+}
+
+/// Moves `path` to the OS trash.
+#[cfg(not(target_os = "macos"))]
+fn move_to_os_trash(path: &Path) -> Result<(), trash::Error> {
+    trash::delete(path)
+}
+
+fn delete_file_with(
+    root: &Path,
+    rel: &str,
+    expected_hash: &str,
+    move_to_trash: impl FnOnce(&Path) -> Result<(), trash::Error>,
+) -> AppResult<()> {
+    ensure_note(rel)?;
+    let (dir_rel, name) = split_parent(rel);
+    let dir = resolve_folder(root, dir_rel, rel)?;
+    let path = dir.join(name);
+    ensure_resolved_allowed(root, &path, rel)?;
+    existing_entry(root, &path, rel)?;
+    match read_bytes(&path, rel) {
+        Ok(bytes) if content_hash(&bytes) == expected_hash => {}
+        // A file over the size limit never had its hash handed out.
+        Ok(_) | Err(AppError::TooLarge(_)) => {
+            return Err(AppError::Conflict(format!(
+                "{rel} was changed by another program"
+            )));
+        }
+        Err(e) => return Err(e),
+    }
+    ensure_parent_inside(root, &path, rel)?;
+    match move_to_trash(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if trash_unavailable(&err, &path) => {
+            fs::remove_file(&path).map_err(|e| AppError::from_io(&e, "delete", rel))
+        }
+        Err(err) => Err(trash_failure(&err, &path, rel)),
+    }
+}
+
+/// Whether a trash error means the trash folders themselves cannot be used,
+/// so that removing the file permanently is the only way to delete it.
+///
+/// Only one case counts: on Linux and other freedesktop systems, a
+/// `FileSystem` error about a path other than the file itself (a trash
+/// folder or an entry inside it) whose kind says the trash cannot be written
+/// at all: missing, no permission, read-only, or out of space or quota.
+///
+/// Everything else is reported as an error and the file is left in place:
+/// errors about the file itself, other kinds of errors on trash entries (such
+/// as a name too long for the trash's info file), `Unknown` (no home folder,
+/// an unreadable mount table, or on Windows an aborted operation), and every
+/// error from the Windows and macOS trash.
+fn trash_unavailable(err: &trash::Error, path: &Path) -> bool {
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    ))]
+    if let trash::Error::FileSystem {
+        path: failed,
+        source,
+    } = err
+    {
+        return failed != path
+            && matches!(
+                source.kind(),
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::ReadOnlyFilesystem
+                    | io::ErrorKind::StorageFull
+                    | io::ErrorKind::QuotaExceeded
+            );
+    }
+    let _ = (err, path);
+    false
+}
+
+/// Maps a trash error that is not about the trash being unavailable. The
+/// message never includes the trash error's own text, which holds absolute
+/// paths.
+fn trash_failure(err: &trash::Error, path: &Path, rel: &str) -> AppError {
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    ))]
+    if let trash::Error::FileSystem { source, .. } = err {
+        return AppError::from_io(source, "move to the trash", rel);
+    }
+    let _ = err;
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            AppError::NotFound(format!("{rel} was not found"))
+        }
+        _ => AppError::Io(format!("could not move {rel} to the trash")),
     }
 }
 
@@ -1398,6 +1737,738 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), "PermissionDenied");
         assert_eq!(read(&root, "a.md").unwrap(), "old");
         assert!(leftovers(&root).is_empty());
+    }
+
+    // Rename.
+
+    fn rename(root: &Path, from: &str, to: &str) -> AppResult<WrittenFile> {
+        rename_file(root, from, to)
+    }
+
+    fn rename_kind(root: &Path, from: &str, to: &str) -> &'static str {
+        rename(root, from, to).unwrap_err().kind()
+    }
+
+    #[test]
+    fn ensure_note_refuses_the_config_file() {
+        assert!(ensure_note("p/a.md").is_ok());
+        for rel in [CONFIG_FILE, ".git/x.md", "a.txt", "../a.md", ""] {
+            assert_eq!(ensure_note(rel).unwrap_err().kind(), "InvalidPath", "{rel}");
+        }
+    }
+
+    #[test]
+    fn renames_a_note_and_returns_its_entry_and_hash() {
+        let (_dir, root) = workspace();
+        put(&root, "p/old.md", "body");
+        let written = rename(&root, "p/old.md", "p/New name.md").unwrap();
+        assert_eq!(written.entry.path, "p/New name.md");
+        assert_eq!(written.entry.size, 4);
+        assert!(written.entry.modified > 0);
+        assert_eq!(written.hash, content_hash(b"body"));
+        assert!(!root.join("p/old.md").exists());
+        assert_eq!(read(&root, "p/New name.md").unwrap(), "body");
+        assert!(leftovers(&root.join("p")).is_empty());
+        // Notes at the root work too.
+        put(&root, "a.md", "x");
+        rename(&root, "a.md", "b.MD").unwrap();
+        assert_eq!(listed(&root), ["b.MD", "p/New name.md"]);
+    }
+
+    #[test]
+    fn rename_never_replaces_an_existing_note() {
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "mine");
+        put(&root, "b.md", "theirs");
+        fs::create_dir(root.join("dir.md")).unwrap();
+        assert_eq!(rename_kind(&root, "a.md", "b.md"), "Conflict");
+        assert_eq!(
+            rename(&root, "a.md", "b.md").unwrap_err().to_string(),
+            "b.md already exists"
+        );
+        assert_eq!(rename_kind(&root, "a.md", "dir.md"), "Conflict");
+        // Renaming to the same name is not a case change.
+        assert_eq!(rename_kind(&root, "a.md", "a.md"), "Conflict");
+        assert_eq!(read(&root, "a.md").unwrap(), "mine");
+        assert_eq!(read(&root, "b.md").unwrap(), "theirs");
+    }
+
+    #[test]
+    fn rename_conflicts_with_a_note_created_right_before_linking() {
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "mine");
+        let target = root.join("b.md");
+        before_publish(move || fs::write(target, "theirs").unwrap());
+        let err = rename(&root, "a.md", "b.md").unwrap_err();
+        assert_eq!(err.kind(), "Conflict");
+        assert_eq!(read(&root, "a.md").unwrap(), "mine");
+        assert_eq!(read(&root, "b.md").unwrap(), "theirs");
+    }
+
+    #[test]
+    fn rename_only_within_the_same_folder() {
+        let (_dir, root) = workspace();
+        put(&root, "p/a.md", "x");
+        put(&root, "q/keep.md", "x");
+        for to in ["q/a.md", "a.md", "p/sub/a.md", "P/a.md"] {
+            let err = rename(&root, "p/a.md", to).unwrap_err();
+            assert_eq!(err.kind(), "InvalidPath", "{to}");
+            assert_eq!(
+                err.to_string(),
+                format!("{to} is not in the same folder as p/a.md")
+            );
+        }
+        assert!(root.join("p/a.md").exists());
+        assert!(!root.join("q/a.md").exists());
+    }
+
+    #[test]
+    fn rename_accepts_only_notes() {
+        let (_dir, root) = workspace();
+        put(&root, ".kaido/config.json", "{}");
+        put(&root, ".kaido/a.md", "x");
+        put(&root, "a.md", "x");
+        put(&root, "notes.txt", "x");
+        let cases = [
+            (CONFIG_FILE, ".kaido/config.md"),
+            (".kaido/a.md", ".kaido/config.json"),
+            (".kaido/a.md", ".kaido/b.md"),
+            ("a.md", "a.txt"),
+            ("notes.txt", "notes.md"),
+            ("a.md", ".hidden.md"),
+            ("a.md", "../a.md"),
+            ("a.md", "node_modules.md/../x.md"),
+            ("a.md", ""),
+            ("", "a.md"),
+        ];
+        for (from, to) in cases {
+            assert_eq!(
+                rename_kind(&root, from, to),
+                "InvalidPath",
+                "{from} -> {to}"
+            );
+        }
+        assert_eq!(read(&root, CONFIG_FILE).unwrap(), "{}");
+        assert!(root.join("a.md").exists());
+    }
+
+    #[test]
+    fn rename_reports_missing_notes_and_folders() {
+        let (_dir, root) = workspace();
+        put(&root, "file.md", "x");
+        fs::create_dir(root.join("p")).unwrap();
+        assert_eq!(rename_kind(&root, "missing.md", "b.md"), "NotFound");
+        assert_eq!(
+            rename(&root, "p/missing.md", "p/b.md")
+                .unwrap_err()
+                .to_string(),
+            "p/missing.md was not found"
+        );
+        assert_eq!(rename_kind(&root, "gone/a.md", "gone/b.md"), "NotFound");
+        assert_eq!(
+            rename(&root, "gone/a.md", "gone/b.md")
+                .unwrap_err()
+                .to_string(),
+            "gone/a.md was not found"
+        );
+        assert_eq!(
+            rename_kind(&root, "file.md/a.md", "file.md/b.md"),
+            "NotADirectory"
+        );
+        fs::create_dir(root.join("p/dir.md")).unwrap();
+        assert_eq!(rename_kind(&root, "p/dir.md", "p/b.md"), "InvalidPath");
+        assert!(root.join("p/dir.md").is_dir());
+    }
+
+    #[test]
+    fn rename_refuses_notes_over_the_size_limit() {
+        let (_dir, root) = workspace();
+        let limit = usize::try_from(MAX_FILE_SIZE).unwrap();
+        fs::write(root.join("big.md"), "a".repeat(limit + 1)).unwrap();
+        assert_eq!(rename_kind(&root, "big.md", "b.md"), "TooLarge");
+        assert!(root.join("big.md").exists());
+    }
+
+    #[test]
+    fn case_only_rename_on_a_case_sensitive_file_system() {
+        let (_dir, root) = workspace();
+        put(&root, "p/note.md", "x");
+        let written = rename(&root, "p/note.md", "p/Note.md").unwrap();
+        assert_eq!(written.entry.path, "p/Note.md");
+        assert_eq!(listed(&root), ["p/Note.md"]);
+    }
+
+    #[test]
+    fn case_variants() {
+        assert!(is_case_variant("a.md", "A.md"));
+        assert!(is_case_variant("Ünïcode.md", "ünÏcode.MD"));
+        assert!(!is_case_variant("a.md", "a.md"));
+        assert!(!is_case_variant("a.md", "b.md"));
+    }
+
+    #[test]
+    fn has_entry_named_is_case_sensitive_and_conservative() {
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "x");
+        assert!(has_entry_named(&root, "a.md"));
+        assert!(!has_entry_named(&root, "b.md"));
+        // An unreadable folder answers yes so nothing gets replaced.
+        assert!(has_entry_named(&root.join("missing"), "b.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_entry_compares_identity() {
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "x");
+        put(&root, "b.md", "x");
+        fs::hard_link(root.join("a.md"), root.join("c.md")).unwrap();
+        let meta = |n: &str| fs::symlink_metadata(root.join(n)).unwrap();
+        assert!(same_entry(&meta("a.md"), &meta("a.md")));
+        assert!(same_entry(&meta("a.md"), &meta("c.md")));
+        assert!(!same_entry(&meta("a.md"), &meta("b.md")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn case_only_rename_on_a_case_insensitive_file_system() {
+        // A hard link stands in for the second spelling a case-insensitive
+        // file system resolves to the same entry; the folder lookup reports
+        // no entry with the exact new name, as such a file system would.
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "body");
+        fs::hard_link(root.join("a.md"), root.join("A.md")).unwrap();
+        let written = rename_file_with(
+            &root,
+            "a.md",
+            "A.md",
+            |_, _| panic!("a case-only rename must not link"),
+            |_, name| name != "A.md",
+        )
+        .unwrap();
+        assert_eq!(written.entry.path, "A.md");
+        assert_eq!(written.hash, content_hash(b"body"));
+        assert_eq!(read(&root, "A.md").unwrap(), "body");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn case_variant_that_is_a_separate_name_is_a_conflict() {
+        // On a case-sensitive file system both spellings can exist, even as
+        // hard links to the same file; neither is replaced.
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "body");
+        fs::hard_link(root.join("a.md"), root.join("A.md")).unwrap();
+        assert_eq!(rename_kind(&root, "a.md", "A.md"), "Conflict");
+        put(&root, "b.md", "other");
+        put(&root, "B.md", "another");
+        assert_eq!(rename_kind(&root, "b.md", "B.md"), "Conflict");
+        assert_eq!(listed(&root), ["A.md", "B.md", "a.md", "b.md"]);
+        assert_eq!(read(&root, "B.md").unwrap(), "another");
+    }
+
+    #[test]
+    fn rename_falls_back_without_hard_links() {
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "body");
+        let written =
+            rename_file_with(&root, "a.md", "b.md", unsupported, has_entry_named).unwrap();
+        assert_eq!(written.entry.path, "b.md");
+        assert_eq!(listed(&root), ["b.md"]);
+    }
+
+    #[test]
+    fn rename_fallback_still_refuses_an_existing_target() {
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "mine");
+        put(&root, "b.md", "theirs");
+        let err = move_to_new_name(
+            &root.join("a.md"),
+            &root.join("b.md"),
+            "a.md",
+            "b.md",
+            unsupported,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "Conflict");
+        assert_eq!(read(&root, "a.md").unwrap(), "mine");
+        assert_eq!(read(&root, "b.md").unwrap(), "theirs");
+    }
+
+    #[test]
+    fn rename_fallback_reports_a_failed_rename() {
+        let (_dir, root) = workspace();
+        let err = move_to_new_name(
+            &root.join("a.md"),
+            &root.join("b.md"),
+            "a.md",
+            "b.md",
+            unsupported,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "NotFound");
+        assert_eq!(err.to_string(), "a.md was not found");
+    }
+
+    #[test]
+    fn rename_keeps_the_note_when_it_vanishes_after_linking() {
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "body");
+        // Another program removes the old name right after the link.
+        let link = |from: &Path, to: &Path| {
+            fs::hard_link(from, to)?;
+            fs::remove_file(from)
+        };
+        move_to_new_name(&root.join("a.md"), &root.join("b.md"), "a.md", "b.md", link).unwrap();
+        assert_eq!(listed(&root), ["b.md"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_checks_the_new_name_through_the_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, root) = workspace();
+        put(&root, "p/a.md", "x");
+        if crate::test_support::skip_if_privileged("rename_checks_the_new_name") {
+            return;
+        }
+        // A folder that can be listed but not searched cannot stat entries.
+        fs::set_permissions(root.join("p"), fs::Permissions::from_mode(0o600)).unwrap();
+        let err = move_to_new_name(
+            &root.join("p/a.md"),
+            &root.join("p/b.md"),
+            "p/a.md",
+            "p/b.md",
+            unsupported,
+        )
+        .unwrap_err();
+        fs::set_permissions(root.join("p"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(err.kind(), "PermissionDenied");
+        assert_eq!(listed(&root), ["p/a.md"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_in_a_read_only_folder_is_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, root) = workspace();
+        put(&root, "ro/a.md", "x");
+        if crate::test_support::skip_if_privileged("rename_in_a_read_only_folder") {
+            return;
+        }
+        fs::set_permissions(root.join("ro"), fs::Permissions::from_mode(0o500)).unwrap();
+        let result = rename(&root, "ro/a.md", "ro/b.md");
+        fs::set_permissions(root.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result.unwrap_err().kind(), "PermissionDenied");
+        assert_eq!(listed(&root), ["ro/a.md"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_of_a_symlink_moves_the_link_only() {
+        use std::os::unix::fs::symlink;
+        let (_dir, root) = workspace();
+        put(&root, "p/real.md", "body");
+        symlink("real.md", root.join("p/alias.md")).unwrap();
+        let written = rename(&root, "p/alias.md", "p/renamed.md").unwrap();
+        assert_eq!(written.entry.size, 4);
+        assert_eq!(written.hash, content_hash(b"body"));
+        let meta = fs::symlink_metadata(root.join("p/renamed.md")).unwrap();
+        assert!(meta.file_type().is_symlink());
+        assert!(!root.join("p/alias.md").exists());
+        assert_eq!(read(&root, "p/renamed.md").unwrap(), "body");
+        assert_eq!(read(&root, "p/real.md").unwrap(), "body");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_applies_the_symlink_rules() {
+        use std::os::unix::fs::symlink;
+        let (_dir, root) = workspace();
+        let (_outside_dir, outside) = workspace();
+        put(&outside, "secret.md", "s");
+        put(&root, ".git/config", "[core]");
+        put(&root, ".git/a.md", "git");
+        put(&root, "dir/a.md", "x");
+        symlink(outside.join("secret.md"), root.join("out.md")).unwrap();
+        symlink(root.join(".git/config"), root.join("git.md")).unwrap();
+        symlink(root.join("nowhere.md"), root.join("dangling.md")).unwrap();
+        symlink(root.join("dir"), root.join("dirlink.md")).unwrap();
+        symlink(root.join(".git"), root.join("gitdir")).unwrap();
+        symlink(&outside, root.join("outdir")).unwrap();
+        assert_eq!(rename_kind(&root, "out.md", "b.md"), "OutsideWorkspace");
+        assert_eq!(rename_kind(&root, "git.md", "b.md"), "InvalidPath");
+        assert_eq!(rename_kind(&root, "dangling.md", "b.md"), "InvalidPath");
+        assert_eq!(rename_kind(&root, "dirlink.md", "b.md"), "InvalidPath");
+        assert_eq!(
+            rename_kind(&root, "gitdir/a.md", "gitdir/b.md"),
+            "InvalidPath"
+        );
+        assert_eq!(
+            rename_kind(&root, "outdir/secret.md", "outdir/b.md"),
+            "OutsideWorkspace"
+        );
+        for name in ["out.md", "git.md", "dangling.md", "dirlink.md"] {
+            assert!(fs::symlink_metadata(root.join(name)).is_ok(), "{name}");
+        }
+        assert!(root.join(".git/a.md").exists());
+        assert!(outside.join("secret.md").exists());
+        assert!(!root.join("b.md").exists());
+        assert!(!root.join(".git/b.md").exists());
+    }
+
+    // Delete.
+
+    fn trash_ok(_: &Path) -> Result<(), trash::Error> {
+        Ok(())
+    }
+
+    fn delete(root: &Path, rel: &str, hash: &str) -> AppResult<()> {
+        // Stands in for the OS trash: removes the file like a move would.
+        delete_file_with(root, rel, hash, |path| {
+            fs::remove_file(path).map_err(|e| trash::Error::Unknown {
+                description: e.to_string(),
+            })
+        })
+    }
+
+    #[test]
+    fn deletes_a_note_whose_hash_matches() {
+        let (_dir, root) = workspace();
+        put(&root, "p/a.md", "body");
+        put(&root, "b.md", "x");
+        delete(&root, "p/a.md", &content_hash(b"body")).unwrap();
+        delete(&root, "b.md", &content_hash(b"x")).unwrap();
+        assert!(listed(&root).is_empty());
+        assert!(root.join("p").is_dir());
+    }
+
+    #[test]
+    fn delete_hash_mismatch_leaves_the_file_intact() {
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "changed elsewhere");
+        let trash_called = std::cell::Cell::new(false);
+        let err = delete_file_with(&root, "a.md", &content_hash(b"seen"), |_| {
+            trash_called.set(true);
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), "Conflict");
+        assert_eq!(err.to_string(), "a.md was changed by another program");
+        assert!(!trash_called.get());
+        assert_eq!(read(&root, "a.md").unwrap(), "changed elsewhere");
+        // Hashes are compared exactly.
+        let upper = content_hash(b"changed elsewhere").to_uppercase();
+        assert_eq!(
+            delete(&root, "a.md", &upper).unwrap_err().kind(),
+            "Conflict"
+        );
+        assert_eq!(delete(&root, "a.md", "").unwrap_err().kind(), "Conflict");
+        assert!(root.join("a.md").exists());
+    }
+
+    #[test]
+    fn delete_of_a_note_over_the_limit_is_a_conflict() {
+        let (_dir, root) = workspace();
+        let limit = usize::try_from(MAX_FILE_SIZE).unwrap();
+        let over = "a".repeat(limit + 1);
+        fs::write(root.join("big.md"), &over).unwrap();
+        let err = delete(&root, "big.md", &content_hash(over.as_bytes())).unwrap_err();
+        assert_eq!(err.kind(), "Conflict");
+        assert!(root.join("big.md").exists());
+    }
+
+    #[test]
+    fn delete_failures() {
+        let (_dir, root) = workspace();
+        put(&root, CONFIG_FILE, "{}");
+        put(&root, "notes.txt", "x");
+        fs::create_dir(root.join("dir.md")).unwrap();
+        let hash = content_hash(b"{}");
+        let kind = |rel| {
+            delete_file_with(&root, rel, &hash, trash_ok)
+                .unwrap_err()
+                .kind()
+        };
+        assert_eq!(kind("missing.md"), "NotFound");
+        assert_eq!(kind("gone/missing.md"), "NotFound");
+        assert_eq!(kind(CONFIG_FILE), "InvalidPath");
+        assert_eq!(kind("notes.txt"), "InvalidPath");
+        assert_eq!(kind("../a.md"), "InvalidPath");
+        assert_eq!(kind("dir.md"), "InvalidPath");
+        assert_eq!(read(&root, CONFIG_FILE).unwrap(), "{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_reports_an_unreadable_note() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "x");
+        if crate::test_support::skip_if_privileged("delete_reports_an_unreadable_note") {
+            return;
+        }
+        fs::set_permissions(root.join("a.md"), fs::Permissions::from_mode(0o200)).unwrap();
+        let result = delete_file_with(&root, "a.md", &content_hash(b"x"), trash_ok);
+        fs::set_permissions(root.join("a.md"), fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(result.unwrap_err().kind(), "PermissionDenied");
+        assert!(root.join("a.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_of_a_symlink_removes_the_link_only() {
+        use std::os::unix::fs::symlink;
+        let (_dir, root) = workspace();
+        let (_outside_dir, outside) = workspace();
+        put(&outside, "secret.md", "s");
+        put(&root, "real.md", "body");
+        put(&root, ".git/config", "[core]");
+        symlink("real.md", root.join("alias.md")).unwrap();
+        symlink(outside.join("secret.md"), root.join("out.md")).unwrap();
+        symlink(root.join(".git/config"), root.join("git.md")).unwrap();
+        symlink(root.join(".git"), root.join("gitdir")).unwrap();
+        let removed = std::cell::RefCell::new(PathBuf::new());
+        delete_file_with(&root, "alias.md", &content_hash(b"body"), |path| {
+            *removed.borrow_mut() = path.to_path_buf();
+            fs::remove_file(path).map_err(|e| trash::Error::Unknown {
+                description: e.to_string(),
+            })
+        })
+        .unwrap();
+        // The link itself is handed to the trash, not its target.
+        assert_eq!(*removed.borrow(), root.join("alias.md"));
+        assert!(fs::symlink_metadata(root.join("alias.md")).is_err());
+        assert_eq!(read(&root, "real.md").unwrap(), "body");
+        let kind = |rel, hash: &[u8]| {
+            delete_file_with(&root, rel, &content_hash(hash), trash_ok)
+                .unwrap_err()
+                .kind()
+        };
+        assert_eq!(kind("out.md", b"s"), "OutsideWorkspace");
+        assert_eq!(kind("git.md", b"[core]"), "InvalidPath");
+        assert_eq!(kind("gitdir/config.md", b"[core]"), "InvalidPath");
+        assert!(outside.join("secret.md").exists());
+        assert!(root.join(".git/config").exists());
+    }
+
+    /// Runs a delete of `a.md` (body `body`) whose trash step fails with
+    /// `err`, and returns the result and whether the file is still there.
+    fn delete_with_trash_error(err: trash::Error) -> (AppResult<()>, bool) {
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "body");
+        let result = delete_file_with(&root, "a.md", &content_hash(b"body"), |_| Err(err));
+        let kept = root.join("a.md").exists();
+        (result, kept)
+    }
+
+    #[test]
+    fn trash_unavailable_only_for_the_trash_itself() {
+        let path = Path::new("/w/a.md");
+        for err in [
+            // No home folder, an unreadable mount table, or on Windows an
+            // aborted operation: never a reason to delete permanently.
+            trash::Error::Unknown {
+                description: "no home".into(),
+            },
+            trash::Error::TargetedRoot,
+            trash::Error::CouldNotAccess {
+                target: "a.md".into(),
+            },
+            trash::Error::CanonicalizePath {
+                original: path.to_path_buf(),
+            },
+            trash::Error::Os {
+                code: 5,
+                description: "denied".into(),
+            },
+        ] {
+            assert!(!trash_unavailable(&err, path), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_trash_errors_keep_the_file() {
+        let (result, kept) = delete_with_trash_error(trash::Error::Unknown {
+            description: "/abs/path: no trash".into(),
+        });
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), "Io");
+        assert_eq!(err.to_string(), "could not move a.md to the trash");
+        assert!(kept);
+    }
+
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    ))]
+    mod freedesktop {
+        use super::*;
+
+        const NOTE: &str = "/w/a.md";
+        const TRASH_FILES: &str = "/home/u/.local/share/Trash/files";
+        const TRASH_INFO: &str = "/home/u/.local/share/Trash/info/a.md.trashinfo";
+
+        fn fs_err(path: &str, source: io::Error) -> trash::Error {
+            trash::Error::FileSystem {
+                path: PathBuf::from(path),
+                source,
+            }
+        }
+
+        #[test]
+        fn only_unusable_trash_folders_mean_unavailable() {
+            let note = Path::new(NOTE);
+            for kind in [
+                io::ErrorKind::NotFound,
+                io::ErrorKind::PermissionDenied,
+                io::ErrorKind::ReadOnlyFilesystem,
+                io::ErrorKind::StorageFull,
+                io::ErrorKind::QuotaExceeded,
+            ] {
+                for trash_path in [TRASH_FILES, TRASH_INFO] {
+                    let err = fs_err(trash_path, io::Error::from(kind));
+                    assert!(trash_unavailable(&err, note), "{err:?}");
+                }
+                // The same kind about the note itself is the note's problem.
+                let err = fs_err(NOTE, io::Error::from(kind));
+                assert!(!trash_unavailable(&err, note), "{err:?}");
+            }
+            for kind in [
+                io::ErrorKind::AlreadyExists,
+                io::ErrorKind::InvalidInput,
+                io::ErrorKind::InvalidData,
+                io::ErrorKind::Unsupported,
+                io::ErrorKind::CrossesDevices,
+                io::ErrorKind::Interrupted,
+                io::ErrorKind::Other,
+            ] {
+                let err = fs_err(TRASH_INFO, io::Error::from(kind));
+                assert!(!trash_unavailable(&err, note), "{err:?}");
+            }
+        }
+
+        #[test]
+        fn file_errors_are_reported_with_their_kind() {
+            let note = Path::new(NOTE);
+            let denied = fs_err(NOTE, io::Error::from(io::ErrorKind::PermissionDenied));
+            assert_eq!(
+                trash_failure(&denied, note, "a.md").kind(),
+                "PermissionDenied"
+            );
+            let gone = fs_err(NOTE, io::Error::from(io::ErrorKind::NotFound));
+            assert_eq!(trash_failure(&gone, note, "a.md").kind(), "NotFound");
+        }
+
+        #[test]
+        fn falls_back_to_removing_when_the_trash_cannot_be_written() {
+            for kind in [
+                io::ErrorKind::NotFound,
+                io::ErrorKind::PermissionDenied,
+                io::ErrorKind::ReadOnlyFilesystem,
+                io::ErrorKind::StorageFull,
+                io::ErrorKind::QuotaExceeded,
+            ] {
+                let (result, kept) =
+                    delete_with_trash_error(fs_err(TRASH_FILES, io::Error::from(kind)));
+                result.unwrap();
+                assert!(!kept, "{kind:?}");
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_name_too_long_for_the_trash_keeps_the_file() {
+            // What the trash reports when `info/<name>.trashinfo` exceeds the
+            // file name limit (ENAMETOOLONG); the note itself is fine.
+            const ENAMETOOLONG: i32 = 36;
+            let (result, kept) = delete_with_trash_error(fs_err(
+                TRASH_INFO,
+                io::Error::from_raw_os_error(ENAMETOOLONG),
+            ));
+            let err = result.unwrap_err();
+            assert_eq!(err.kind(), "Io");
+            assert!(
+                err.to_string()
+                    .starts_with("could not move to the trash a.md")
+            );
+            assert!(kept);
+        }
+
+        #[test]
+        fn other_trash_folder_errors_keep_the_file() {
+            for kind in [
+                io::ErrorKind::AlreadyExists,
+                io::ErrorKind::InvalidInput,
+                io::ErrorKind::Other,
+            ] {
+                let (result, kept) =
+                    delete_with_trash_error(fs_err(TRASH_FILES, io::Error::from(kind)));
+                assert_eq!(result.unwrap_err().kind(), "Io", "{kind:?}");
+                assert!(kept, "{kind:?}");
+            }
+        }
+
+        #[test]
+        fn errors_about_the_note_keep_it() {
+            // For instance the trash is on another device and copying the
+            // note there runs out of space: the error names the note.
+            let (_dir, root) = workspace();
+            put(&root, "a.md", "body");
+            let err = delete_file_with(&root, "a.md", &content_hash(b"body"), |path| {
+                Err(trash::Error::FileSystem {
+                    path: path.to_path_buf(),
+                    source: io::Error::from(io::ErrorKind::StorageFull),
+                })
+            })
+            .unwrap_err();
+            assert_eq!(err.kind(), "Io");
+            assert!(root.join("a.md").exists());
+        }
+
+        #[test]
+        fn fallback_remove_failure_is_reported() {
+            let (_dir, root) = workspace();
+            put(&root, "a.md", "body");
+            let err = delete_file_with(&root, "a.md", &content_hash(b"body"), |path| {
+                fs::remove_file(path).unwrap();
+                Err(fs_err(
+                    TRASH_FILES,
+                    io::Error::from(io::ErrorKind::ReadOnlyFilesystem),
+                ))
+            })
+            .unwrap_err();
+            assert_eq!(err.kind(), "NotFound");
+        }
+    }
+
+    #[test]
+    fn other_trash_errors_keep_the_file() {
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "body");
+        let hash = content_hash(b"body");
+        let err = delete_file_with(&root, "a.md", &hash, |_| {
+            Err(trash::Error::Os {
+                code: 5,
+                description: "/abs/path denied".into(),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), "Io");
+        // The trash error text holds absolute paths and is never shown.
+        assert_eq!(err.to_string(), "could not move a.md to the trash");
+        assert!(root.join("a.md").exists());
+        // If the file vanished meanwhile, that is what gets reported.
+        let err = delete_file_with(&root, "a.md", &hash, |path| {
+            fs::remove_file(path).unwrap();
+            Err(trash::Error::CouldNotAccess {
+                target: "a.md".into(),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), "NotFound");
     }
 
     #[cfg(unix)]

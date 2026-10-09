@@ -55,6 +55,17 @@ export interface Storage {
   readFile(path: string): Promise<FileContents>;
   /** Writes atomically, creating parent folders, and returns the new metadata. */
   writeFile(path: string, contents: string, options?: WriteOptions): Promise<WrittenFile>;
+  /**
+   * Renames a note within its folder and returns the metadata and hash of
+   * the file at `to`. Never replaces an existing file (`Conflict`); moving
+   * to another folder is `InvalidPath`. A case-only rename is allowed.
+   */
+  renameFile(from: string, to: string): Promise<WrittenFile>;
+  /**
+   * Deletes a note, moving it to the system trash where there is one. The
+   * file must still have `expectedHash`, else `Conflict`.
+   */
+  deleteFile(path: string, expectedHash: string): Promise<void>;
   /** Raw device settings, or `null` if the file does not exist. */
   readSettings(): Promise<string | null>;
   writeSettings(contents: string): Promise<void>;

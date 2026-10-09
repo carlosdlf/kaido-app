@@ -11,6 +11,8 @@
     "allow-list-files",
     "allow-read-file",
     "allow-write-file",
+    "allow-rename-file",
+    "allow-delete-file",
     "allow-read-settings",
     "allow-write-settings"
   ]

@@ -4,7 +4,8 @@
  * Markdown-only listings that skip hidden folders and `node_modules`, and
  * change notifications (with fresh metadata) for writes and simulated
  * external edits of listed files and the workspace configuration, and
- * conditional writes based on content hashes.
+ * conditional writes based on content hashes. Renames stay within a folder
+ * and never replace a file; deleted notes are kept in `trash`.
  */
 
 import {
@@ -15,7 +16,7 @@ import {
 } from "$lib/core/workspace";
 import { contentHash } from "./contentHash";
 import { StorageError } from "./errors";
-import { checkStoragePath, MAX_FILE_BYTES } from "./paths";
+import { checkNotePath, checkRenamePaths, checkStoragePath, MAX_FILE_BYTES } from "./paths";
 import type {
   ChangeListener,
   CloseHandler,
@@ -64,6 +65,8 @@ export class MemoryStorage implements Storage {
   settings: string | null;
   pick: string | null;
   root: string | null = null;
+  /** Notes deleted with `deleteFile`, oldest first, like the system trash. */
+  readonly trash: { path: string; contents: string }[] = [];
   readonly #listeners = new Set<ChangeListener>();
   #closeHandler: CloseHandler | null = null;
   readonly #now: () => number;
@@ -165,10 +168,43 @@ export class MemoryStorage implements Storage {
     }
     const file = { contents, modified: this.#now() };
     files.set(path, file);
-    if (this.#echoWrites) {
-      queueMicrotask(() => this.emitChange({ paths: [path] }));
-    }
+    this.#echo([path]);
     return { ...this.#entry(path, file), hash: contentHash(contents) };
+  }
+
+  async renameFile(from: string, to: string): Promise<WrittenFile> {
+    checkRenamePaths(from, to);
+    const files = this.#files();
+    const file = files.get(from);
+    if (!file) throw new StorageError("NotFound", `${from} does not exist.`);
+    if (byteLength(file.contents) > MAX_FILE_BYTES) {
+      throw new StorageError("TooLarge", `${from} is larger than 8 MiB.`);
+    }
+    // A case-only rename is a different path; the same path is not a rename.
+    if (files.has(to)) throw new StorageError("Conflict", `${to} already exists.`);
+    // Renaming keeps the contents and the modification time.
+    files.delete(from);
+    files.set(to, file);
+    this.#echo([from, to]);
+    return { ...this.#entry(to, file), hash: contentHash(file.contents) };
+  }
+
+  async deleteFile(path: string, expectedHash: string): Promise<void> {
+    checkNotePath(path);
+    const files = this.#files();
+    const file = files.get(path);
+    if (!file) throw new StorageError("NotFound", `${path} does not exist.`);
+    if (contentHash(file.contents) !== expectedHash) {
+      throw new StorageError("Conflict", `${path} changed on disk.`);
+    }
+    files.delete(path);
+    this.trash.push({ path, contents: file.contents });
+    this.#echo([path]);
+  }
+
+  /** Reports the app's own changes asynchronously, like the file watcher. */
+  #echo(paths: string[]): void {
+    if (this.#echoWrites) queueMicrotask(() => this.emitChange({ paths }));
   }
 
   async readSettings(): Promise<string | null> {

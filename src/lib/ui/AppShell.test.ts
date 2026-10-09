@@ -62,8 +62,11 @@ async function ready(options: Parameters<typeof setup>[0] = {}) {
 }
 
 const nav = () => within(screen.getByRole("navigation", { name: "Workspace" }));
-const list = () => within(screen.getByRole("region"));
+const list = () => within(screen.getByRole("region", { name: (name) => name !== "Notifications" }));
 const editor = () => within(screen.getByRole("main", { name: "Editor" }));
+/** Toast messages as announced to assistive technology. */
+const announced = () =>
+  within(within(screen.getByRole("region", { name: "Notifications" })).getByRole("status"));
 const textbox = () => editor().getByRole("textbox", { name: "Note text", hidden: true });
 const editorText = () => {
   const view = EditorView.findFromDOM(textbox());
@@ -409,14 +412,17 @@ describe("AppShell editing", () => {
     ).toHaveAttribute("title", "disk busy");
     storage.setExternal("inbox/tasks.md", "theirs\n");
     await app.settled();
-    const toast = await screen.findByText(
+    const toast = await announced().findByText(
       /^Changed outside Kaido — the other version was saved as tasks \(conflict \d{4}-\d\d-\d\d \d{4}\)\.md$/,
     );
     expect(toast.closest("[role=status]")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Dismiss" })).toHaveAccessibleDescription(
+      toast.textContent ?? "",
+    );
     expect(await fileText(storage, "inbox/tasks.md")).toContain("mine");
     expect(editorText().state.doc.toString()).toContain("mine");
     await user.click(screen.getByRole("button", { name: "Dismiss" }));
-    expect(screen.queryByText(/Changed outside Kaido/)).toBeNull();
+    expect(announced().queryByText(/Changed outside Kaido/)).toBeNull();
   });
 
   it("hides the editor for a missing note", async () => {
@@ -492,8 +498,170 @@ describe("AppShell new note", () => {
     await user.click(list().getByRole("button", { name: "New note" }));
     await app.settled();
     expect(
-      await screen.findByText("The note could not be created: inbox is read-only."),
+      await announced().findByText("The note could not be created: inbox is read-only."),
     ).toBeInTheDocument();
     expect(app.item).toBe("inbox/tasks.md");
+  });
+});
+
+describe("AppShell note actions", () => {
+  const row = (name: RegExp) => list().getByRole("button", { name });
+
+  it("renames the open note with F2, keeping unsaved edits and undo history", async () => {
+    const user = userEvent.setup();
+    const { storage, app } = await ready();
+    await user.click(row(/reading-list\.md/));
+    await vi.waitFor(() => expect(textbox()).toHaveTextContent("# Reading list"));
+    typeAtEnd(" more");
+
+    row(/reading-list\.md/).focus();
+    await user.keyboard("{F2}");
+    const input = list().getByRole("textbox", { name: "Rename reading-list.md" });
+    await user.keyboard("{Control>}a{/Control}books{Enter}");
+    await app.settled();
+
+    await vi.waitFor(() => expect(row(/books\.md/)).toHaveFocus());
+    expect(input).not.toBeInTheDocument();
+    expect(await fileText(storage, "inbox/books.md")).toBe(
+      "# Reading list\n\nArticles to read. more",
+    );
+    expect(storage.folders.get(ROOT)?.has("inbox/reading-list.md")).toBe(false);
+    expect(editor().getByText("books.md")).toBeInTheDocument();
+    expect(textbox()).toHaveTextContent("Articles to read. more");
+    // The undo history moved with the note.
+    expect(undo(editorText())).toBe(true);
+    expect(editorText().state.doc.toString()).toBe(files["inbox/reading-list.md"]);
+    await vi.waitFor(async () =>
+      expect(await fileText(storage, "inbox/books.md")).toBe(files["inbox/reading-list.md"]),
+    );
+    expect([...(storage.folders.get(ROOT)?.keys() ?? [])].join()).not.toContain("conflict");
+  });
+
+  it("ignores F2 and Delete while typing in the editor", async () => {
+    const user = userEvent.setup();
+    const { storage, app } = await ready();
+    await user.click(row(/reading-list\.md/));
+    await vi.waitFor(() => expect(textbox()).toHaveTextContent("# Reading list"));
+    textbox().focus();
+    await user.keyboard("{F2}{Delete}");
+    await app.settled();
+    expect(list().queryByRole("textbox")).toBeNull();
+    expect(storage.trash).toEqual([]);
+  });
+
+  it("deletes with the Delete key, focuses the next row and undoes from the toast", async () => {
+    const user = userEvent.setup();
+    const { storage, app } = await ready();
+    await user.click(nav().getByRole("button", { name: /api-payments/ }));
+    await app.settled();
+    await user.click(row(/architecture\.md/));
+    await app.settled();
+    row(/architecture\.md/).focus();
+    await user.keyboard("{Delete}");
+    await app.settled();
+
+    expect(storage.trash.map((file) => file.path)).toEqual(["api-payments/architecture.md"]);
+    expect(list().queryByRole("button", { name: /architecture\.md/ })).toBeNull();
+    await vi.waitFor(() => expect(row(/deploy\.md/)).toHaveFocus());
+    expect(announced().getByText("Deleted architecture.md")).toBeInTheDocument();
+
+    const undoButton = screen.getByRole("button", { name: "Undo" });
+    undoButton.focus();
+    await user.keyboard("{Control>}z{/Control}");
+    await app.settled();
+    expect(await fileText(storage, "api-payments/architecture.md")).toBe("# Architecture");
+    expect(announced().queryByText("Deleted architecture.md")).toBeNull();
+    await vi.waitFor(() => expect(row(/architecture\.md/)).toHaveFocus());
+    expect(row(/architecture\.md/)).toHaveAttribute("aria-current", "true");
+    await vi.waitFor(() => expect(textbox()).toHaveTextContent("# Architecture"));
+  });
+
+  it("undoes the latest delete with Ctrl+Z in the list, but not in the editor", async () => {
+    const user = userEvent.setup();
+    const { storage, app } = await ready();
+    await user.click(nav().getByRole("button", { name: /api-payments/ }));
+    await app.settled();
+    await user.click(row(/architecture\.md/));
+    await app.settled();
+    row(/architecture\.md/).focus();
+    await user.keyboard("{Delete}");
+    await app.settled();
+    await vi.waitFor(() => expect(row(/deploy\.md/)).toHaveFocus());
+    await user.keyboard("{Delete}");
+    await app.settled();
+    expect(storage.trash.map((file) => file.path)).toEqual([
+      "api-payments/architecture.md",
+      "api-payments/deploy.md",
+    ]);
+
+    // In the editor, Ctrl+Z is the editor's own undo.
+    await user.click(row(/tasks\.md/));
+    await app.settled();
+    textbox().focus();
+    await user.keyboard("{Control>}z{/Control}");
+    await app.settled();
+    expect(storage.folders.get(ROOT)?.has("api-payments/deploy.md")).toBe(false);
+
+    row(/tasks\.md/).focus();
+    await user.keyboard("{Control>}z{/Control}");
+    await app.settled();
+    expect(await fileText(storage, "api-payments/deploy.md")).toContain("# Deploy");
+    expect(storage.folders.get(ROOT)?.has("api-payments/architecture.md")).toBe(false);
+    await vi.waitFor(() => expect(row(/deploy\.md/)).toHaveFocus());
+
+    await user.keyboard("{Control>}z{/Control}");
+    await app.settled();
+    expect(await fileText(storage, "api-payments/architecture.md")).toBe("# Architecture");
+    expect(announced().queryByText(/^Deleted/)).toBeNull();
+
+    // Nothing left to undo.
+    await user.keyboard("{Control>}z{/Control}");
+    await app.settled();
+    expect(app.toasts).toEqual([]);
+  });
+
+  it("copies the relative path from the context menu", async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn(async () => undefined);
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+    try {
+      await ready();
+      await user.pointer({ keys: "[MouseRight]", target: row(/reading-list\.md/) });
+      await user.click(screen.getByRole("menuitem", { name: "Copy path" }));
+      expect(writeText).toHaveBeenCalledWith("inbox/reading-list.md");
+      expect(await announced().findByText("Copied inbox/reading-list.md")).toBeInTheDocument();
+
+      writeText.mockRejectedValueOnce(new Error("denied"));
+      await user.pointer({ keys: "[MouseRight]", target: row(/reading-list\.md/) });
+      await user.click(screen.getByRole("menuitem", { name: "Copy path" }));
+      expect(
+        await announced().findByText("The path could not be copied to the clipboard."),
+      ).toBeInTheDocument();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("explains when there is no clipboard", async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal("navigator", { ...navigator, clipboard: undefined });
+    try {
+      await ready();
+      await user.pointer({ keys: "[MouseRight]", target: row(/reading-list\.md/) });
+      await user.click(screen.getByRole("menuitem", { name: "Copy path" }));
+      expect(
+        await announced().findByText("The path could not be copied to the clipboard."),
+      ).toBeInTheDocument();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("returns focus to the list when the last toast is dismissed", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready();
+    app.notify("hello");
+    await user.click(await screen.findByRole("button", { name: "Dismiss" }));
+    await vi.waitFor(() => expect(row(/tasks\.md/)).toHaveFocus());
   });
 });

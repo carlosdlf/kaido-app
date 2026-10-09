@@ -2,7 +2,7 @@
   import { untrack } from "svelte";
   import { describeSaveStatus, type SaveStatus } from "$lib/core/saveMachine";
   import { splitPath } from "$lib/core/views";
-  import type { DocumentState } from "./appState.svelte";
+  import type { DocumentState, EditorPathChange } from "./appState.svelte";
   import { NoteEditor } from "./editor/noteEditor";
 
   interface Props {
@@ -15,9 +15,11 @@
     focusRequest: number;
     /** Called on every edit with a reader for the new text. */
     onedit: (path: string, read: () => string) => void;
+    /** Renamed and deleted notes, in order; only new entries are applied. */
+    pathChanges?: readonly EditorPathChange[];
   }
 
-  let { doc, status, now, focusRequest, onedit }: Props = $props();
+  let { doc, status, now, focusRequest, onedit, pathChanges = [] }: Props = $props();
 
   const location = $derived(doc ? splitPath(doc.path) : null);
   const label = $derived(status ? describeSaveStatus(status, now) : null);
@@ -27,10 +29,14 @@
   let editor: NoteEditor | null = $state.raw(null);
   /** The document last given to the editor; a new object means new text from disk. */
   let shown: DocumentState | null = null;
+  /** How many path changes the editor has applied. */
+  let applied = 0;
 
   $effect(() => {
     if (!host) return;
     const created = new NoteEditor(host, (path, read) => onedit(path, read));
+    // A new editor has no state to move.
+    applied = untrack(() => pathChanges.length);
     editor = created;
     return () => {
       created.destroy();
@@ -51,7 +57,15 @@
 
   $effect(() => {
     const current = doc;
-    if (!editor || current?.status !== "ready" || current === shown) return;
+    const changes = pathChanges;
+    if (!editor) return;
+    // Moved first, so a renamed note is shown with its own state and history.
+    for (; applied < changes.length; applied += 1) {
+      const change = changes[applied];
+      if (change?.kind === "rename") editor.rename(change.from, change.to);
+      else if (change) editor.forget(change.path);
+    }
+    if (current?.status !== "ready" || current === shown) return;
     shown = current;
     editor.show(current.path, current.text);
   });

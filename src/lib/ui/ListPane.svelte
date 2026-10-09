@@ -1,9 +1,13 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
   import { nextListIndex } from "$lib/core/listNavigation";
+  import { stemLength } from "$lib/core/noteNames";
+  import { baseName } from "$lib/core/saveMachine";
   import { formatAge } from "$lib/core/time";
   import type { ListItem } from "$lib/core/views";
   import { scrollTopFor, visibleRange } from "$lib/core/virtualList";
+  import type { RenameOutcome } from "./appState.svelte";
+  import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
 
   interface Props {
     title: string;
@@ -19,6 +23,14 @@
     oncreate: () => void;
     /** The new note shortcut, for assistive technology and as a visible hint. */
     createShortcut: { aria: string; hint: string };
+    /** Renames a note to the name the user typed. */
+    onrename: (id: string, name: string) => Promise<RenameOutcome>;
+    ondelete: (id: string) => void;
+    oncopypath: (id: string) => void;
+    /** `Ctrl+Z` / `Cmd+Z` in the list: undoes the most recent delete, if it can still be undone. */
+    onundo?: () => void;
+    /** Each new value moves focus to the selected row. */
+    focusRequest?: number;
   }
 
   let {
@@ -31,7 +43,18 @@
     onselect,
     oncreate,
     createShortcut,
+    onrename,
+    ondelete,
+    oncopypath,
+    onundo,
+    focusRequest = 0,
   }: Props = $props();
+
+  const MENU_ITEMS: readonly MenuItem[] = [
+    { id: "rename", label: "Rename", shortcut: { aria: "F2", hint: "F2" } },
+    { id: "copy-path", label: "Copy path" },
+    { id: "delete", label: "Delete", shortcut: { aria: "Delete", hint: "Del" } },
+  ];
 
   /** Rows rendered above and below the visible ones. */
   const OVERSCAN = 8;
@@ -85,7 +108,176 @@
     untrack(() => reveal(index));
   });
 
+  /** The row button for `id`, if it is rendered. */
+  function rowButton(id: string): HTMLButtonElement | null {
+    return viewport?.querySelector<HTMLButtonElement>(`[data-item-id="${CSS.escape(id)}"]`) ?? null;
+  }
+
+  /** Scrolls row `id` into view and focuses it; the viewport if it is gone. */
+  async function focusRow(id: string) {
+    const index = items.findIndex((item) => item.id === id);
+    if (index !== -1) reveal(index);
+    await tick();
+    const button = index === -1 ? null : rowButton(id);
+    if (button) button.focus();
+    else viewport?.focus({ preventScroll: true });
+  }
+
+  function isNote(id: string): boolean {
+    return items.some((item) => item.id === id && item.kind === "note");
+  }
+
+  // Context menu
+  let menu: { id: string; x: number; y: number } | null = $state(null);
+
+  function openMenu(id: string, x: number, y: number) {
+    if (!isNote(id)) return;
+    menu = { id, x, y };
+  }
+
+  function openMenuAtRow(id: string, row: HTMLElement) {
+    const rect = row.getBoundingClientRect();
+    openMenu(id, rect.left + rect.width / 4, rect.bottom);
+  }
+
+  function closeMenu(returnFocus: boolean) {
+    const target = menu?.id;
+    menu = null;
+    if (returnFocus && target !== undefined) void focusRow(target);
+  }
+
+  function chooseMenuItem(action: string) {
+    const target = menu?.id;
+    if (target === undefined) return;
+    if (action === "rename") {
+      menu = null;
+      startRename(target);
+      return;
+    }
+    closeMenu(true);
+    if (action === "delete") ondelete(target);
+    else oncopypath(target);
+  }
+
+  // Inline rename
+  let renaming: string | null = $state(null);
+  let draft = $state("");
+  let renameError: string | null = $state(null);
+  let committing = false;
+  /**
+   * The row being renamed, outside reactivity: teardown functions read the
+   * value state had before the change that removed them.
+   */
+  let activeRename: string | null = null;
+
+  function startRename(id: string) {
+    const item = items.find((candidate) => candidate.id === id);
+    if (item?.kind !== "note") return;
+    renaming = id;
+    activeRename = id;
+    // Only the file name is edited; subfolders stay.
+    draft = baseName(item.name);
+    renameError = null;
+  }
+
+  /** Focuses the input with the name selected up to the extension. */
+  function focusRenameInput(input: HTMLInputElement) {
+    input.focus();
+    input.setSelectionRange(0, stemLength(input.value));
+    const id = activeRename;
+    // Scrolling the row away unmounts the input without a blur; that confirms too.
+    return () => {
+      if (activeRename === id) void commitRename();
+    };
+  }
+
+  async function commitRename() {
+    const id = activeRename;
+    if (id === null || committing) return;
+    committing = true;
+    const outcome = await onrename(id, draft);
+    committing = false;
+    if (activeRename !== id) return;
+    if (outcome.kind === "invalid") {
+      renameError = outcome.reason;
+      return;
+    }
+    finishRename(outcome.kind === "renamed" ? outcome.path : id);
+  }
+
+  function cancelRename() {
+    const id = activeRename;
+    if (id === null) return;
+    finishRename(id);
+  }
+
+  function finishRename(id: string) {
+    renaming = null;
+    activeRename = null;
+    renameError = null;
+    // Only take focus back when it would otherwise be lost.
+    const active = document.activeElement;
+    if (!active || active === document.body || viewport?.contains(active)) void focusRow(id);
+  }
+
+  /**
+   * Leaving the window blurs the field too; the rename then waits, and the
+   * field gets focus back with the window.
+   */
+  function handleRenameBlur() {
+    if (!document.hasFocus()) return;
+    void commitRename();
+  }
+
+  function handleRenameKeydown(event: KeyboardEvent) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void commitRename();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      cancelRename();
+    }
+  }
+
+  /** Keys on a focused note row: rename, delete and the context menu. */
+  function handleRowAction(event: KeyboardEvent, row: HTMLElement): boolean {
+    const id = row.dataset["itemId"];
+    if (id === undefined || !isNote(id) || event.ctrlKey || event.metaKey || event.altKey)
+      return false;
+    // Holding the key acts once; repeats would reach the next focused row.
+    const once = !event.repeat;
+    if (event.key === "F2" && !event.shiftKey) {
+      if (once) startRename(id);
+    } else if (event.key === "Delete" && !event.shiftKey) {
+      if (once) ondelete(id);
+    } else if (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey))
+      openMenuAtRow(id, row);
+    else return false;
+    event.preventDefault();
+    return true;
+  }
+
+  function isUndo(event: KeyboardEvent): boolean {
+    return (
+      (event.ctrlKey || event.metaKey) &&
+      !event.altKey &&
+      !event.shiftKey &&
+      event.key.toLowerCase() === "z"
+    );
+  }
+
   async function handleKeydown(event: KeyboardEvent) {
+    const target = event.target;
+    // Typing in the rename field never moves the selection.
+    if (target instanceof HTMLInputElement) return;
+    if (isUndo(event)) {
+      event.preventDefault();
+      if (!event.repeat) onundo?.();
+      return;
+    }
+    const row =
+      target instanceof HTMLElement ? target.closest<HTMLElement>("[data-item-id]") : null;
+    if (row && handleRowAction(event, row)) return;
     const next = nextListIndex(event.key, selectedIndex, items.length);
     if (next === null) return;
     event.preventDefault();
@@ -109,6 +301,30 @@
     await tick();
     if (!target.contains(document.activeElement)) target.focus({ preventScroll: true });
   }
+
+  // When the focused row goes away (deleted, renamed or filtered), focus the
+  // selected row instead of losing focus to the page.
+  let focusWasInside = false;
+  $effect.pre(() => {
+    void items;
+    focusWasInside = viewport?.contains(document.activeElement) ?? false;
+  });
+  $effect(() => {
+    void items;
+    if (!focusWasInside || !viewport || viewport.contains(document.activeElement)) return;
+    const active = document.activeElement;
+    if (active && active !== document.body) return;
+    untrack(() => void focusRow(selected));
+  });
+
+  /** The focus request already handled; the initial value never steals focus. */
+  let handledFocus = untrack(() => focusRequest);
+  $effect(() => {
+    const request = focusRequest;
+    if (request === handledFocus) return;
+    handledFocus = request;
+    untrack(() => void focusRow(selected));
+  });
 
   /** One rendered row is always focusable, so the list stays reachable with Tab. */
   function tabIndexFor(index: number, id: string): number {
@@ -143,28 +359,59 @@
         {#each rows as item, offset (item.id)}
           {@const index = range.start + offset}
           <li aria-setsize={items.length} aria-posinset={index + 1}>
-            <button
-              type="button"
-              class="row"
-              class:tasks={item.kind === "tasks"}
-              data-item-id={item.id}
-              tabindex={tabIndexFor(index, item.id)}
-              aria-current={item.id === selected ? "true" : undefined}
-              onclick={() => onselect(item.id)}
-            >
-              {#if item.kind === "tasks"}
-                <span class="box" aria-hidden="true">[ ]</span>
-                <span class="name">{item.label}</span>
-                <span class="meta">{item.openCount ?? "…"} open</span>
-              {:else}
-                <span class="line">
-                  <span class="name">{item.name}</span>
-                  <span class="age">{formatAge(item.modified, now)}</span>
-                </span>
-                <!-- Reserve the line while the title loads so rows do not jump. -->
-                <span class="excerpt">{item.title ?? "\u00a0"}</span>
-              {/if}
-            </button>
+            {#if item.kind === "note" && item.id === renaming}
+              <div class="row rename">
+                <label class="visually-hidden" for="rename-input">Rename {item.name}</label>
+                <input
+                  id="rename-input"
+                  class="rename-input"
+                  type="text"
+                  spellcheck="false"
+                  autocomplete="off"
+                  bind:value={draft}
+                  aria-invalid={renameError ? "true" : undefined}
+                  aria-describedby={renameError ? "rename-error" : undefined}
+                  onkeydown={handleRenameKeydown}
+                  oninput={() => (renameError = null)}
+                  onblur={handleRenameBlur}
+                  {@attach focusRenameInput}
+                />
+                {#if renameError}
+                  <span id="rename-error" class="rename-error" role="alert">{renameError}</span>
+                {:else}
+                  <span class="excerpt">{item.title ?? "\u00a0"}</span>
+                {/if}
+              </div>
+            {:else}
+              <button
+                type="button"
+                class="row"
+                class:tasks={item.kind === "tasks"}
+                data-item-id={item.id}
+                tabindex={tabIndexFor(index, item.id)}
+                aria-current={item.id === selected ? "true" : undefined}
+                aria-keyshortcuts={item.kind === "note" ? "F2 Delete Shift+F10" : undefined}
+                onclick={() => onselect(item.id)}
+                oncontextmenu={(event) => {
+                  if (item.kind !== "note") return;
+                  event.preventDefault();
+                  openMenu(item.id, event.clientX, event.clientY);
+                }}
+              >
+                {#if item.kind === "tasks"}
+                  <span class="box" aria-hidden="true">[ ]</span>
+                  <span class="name">{item.label}</span>
+                  <span class="meta">{item.openCount ?? "…"} open</span>
+                {:else}
+                  <span class="line">
+                    <span class="name">{item.name}</span>
+                    <span class="age">{formatAge(item.modified, now)}</span>
+                  </span>
+                  <!-- Reserve the line while the title loads so rows do not jump. -->
+                  <span class="excerpt">{item.title ?? "\u00a0"}</span>
+                {/if}
+              </button>
+            {/if}
           </li>
         {/each}
       </ul>
@@ -182,6 +429,17 @@
     <span class="name">new note</span>
     <kbd aria-hidden="true">{createShortcut.hint}</kbd>
   </button>
+
+  {#if menu}
+    <ContextMenu
+      label="Note actions"
+      x={menu.x}
+      y={menu.y}
+      items={MENU_ITEMS}
+      onselect={chooseMenuItem}
+      onclose={closeMenu}
+    />
+  {/if}
 </section>
 
 <style>
@@ -288,6 +546,31 @@
 
   .excerpt {
     font-size: var(--font-size-small);
+  }
+
+  .rename {
+    cursor: default;
+  }
+
+  .rename-input {
+    width: 100%;
+    padding: 0 var(--space-4);
+    margin-left: calc(-1 * var(--space-4));
+    background: var(--color-bg);
+    border: var(--space-1) solid var(--color-border-strong);
+    border-radius: var(--radius-sm);
+  }
+
+  .rename-input[aria-invalid="true"] {
+    border-color: var(--color-danger);
+  }
+
+  .rename-error {
+    overflow: hidden;
+    color: var(--color-danger);
+    font-size: var(--font-size-small);
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .empty {

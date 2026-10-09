@@ -33,6 +33,8 @@
     app.phase.kind === "ready" ? (app.phase.root.split(/[\\/]/).filter(Boolean).pop() ?? "") : "",
   );
 
+  const COPY_FAILED = "The path could not be copied to the clipboard.";
+
   const mac = isMac();
   const newNoteShortcut = newNoteShortcutLabels(mac);
 
@@ -42,6 +44,31 @@
 
   function createNote() {
     void app.createNote();
+  }
+
+  /** Bumped to move focus to the selected list row. */
+  let listFocus = $state(0);
+
+  function copyPath(path: string) {
+    const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard;
+    if (!clipboard) {
+      app.notify(COPY_FAILED);
+      return;
+    }
+    clipboard.writeText(path).then(
+      () => app.notify(`Copied ${path}`),
+      () => app.notify(COPY_FAILED),
+    );
+  }
+
+  async function undo(id: number) {
+    await app.undoDelete(id);
+    listFocus += 1;
+  }
+
+  function undoLatest() {
+    const id = app.latestUndo;
+    if (id !== null) void undo(id);
   }
 
   function handleKeydown(event: KeyboardEvent) {
@@ -56,7 +83,12 @@
 <!-- Save pending edits as soon as the user leaves the window. -->
 <svelte:window onblur={() => void app.flush()} onkeydown={handleKeydown} />
 
-<Toasts toasts={app.toasts} ondismiss={(id) => app.dismissToast(id)} />
+<Toasts
+  toasts={app.toasts}
+  ondismiss={(id) => app.dismissToast(id)}
+  onaction={(id) => void undo(id)}
+  onfocusexit={() => (listFocus += 1)}
+/>
 
 {#if app.phase.kind === "ready"}
   <div class="shell">
@@ -80,6 +112,11 @@
       onselect={(id) => app.selectItem(id)}
       oncreate={createNote}
       createShortcut={newNoteShortcut}
+      onrename={(id, name) => app.renameNote(id, name)}
+      ondelete={(id) => void app.deleteNote(id)}
+      oncopypath={copyPath}
+      onundo={undoLatest}
+      focusRequest={listFocus}
     />
     <EditorPane
       doc={app.document}
@@ -87,6 +124,7 @@
       {now}
       focusRequest={app.editorFocusRequest}
       onedit={(path, read) => app.edit(path, read)}
+      pathChanges={app.editorChanges}
     />
   </div>
 {:else if app.phase.kind === "no-workspace"}

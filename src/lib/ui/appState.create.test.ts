@@ -117,10 +117,11 @@ describe("AppState.createNote", () => {
     await app.createNote();
     await app.settled();
     expect(app.item).toBe("inbox/untitled 2.md");
+    // Sorted like every other project: the space sorts before the dot.
     expect(notePaths(app, "inbox")).toEqual([
       "inbox/idea.md",
-      "inbox/untitled.md",
       "inbox/untitled 2.md",
+      "inbox/untitled.md",
     ]);
   });
 

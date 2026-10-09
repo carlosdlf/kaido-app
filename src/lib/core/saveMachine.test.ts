@@ -8,12 +8,14 @@ import {
   SAVE_DELAY_MS,
   sameStatus,
   SaveSession,
+  SESSION_CLOSED,
   type DocumentIO,
   type ReadOutcome,
   type SaveStatus,
   type Timers,
   type WriteOutcome,
 } from "./saveMachine";
+import { utf8Length } from "./noteNames";
 
 const hash = (text: string) => `h:${text}`;
 
@@ -121,6 +123,21 @@ describe("conflict copies", () => {
     );
     expect(conflictCopyPath("Loose.MD", NOW, 3)).toBe("Loose (conflict 2026-10-08 1432) 3.MD");
     expect(conflictCopyPath("a/odd", NOW)).toBe("a/odd (conflict 2026-10-08 1432).md");
+  });
+
+  it("shortens long names so the conflict copy still fits in a file name", () => {
+    const long = `${"a".repeat(252)}.md`;
+    const copy = conflictCopyPath(`dir/${long}`, NOW, 12);
+    const name = baseName(copy);
+    expect(utf8Length(name)).toBe(255);
+    expect(copy).toBe(`dir/${"a".repeat(222)} (conflict 2026-10-08 1432) 12.md`);
+    // Multi-byte characters are never split.
+    const wide = conflictCopyPath(`${"日".repeat(84)}.md`, NOW);
+    expect(utf8Length(wide)).toBeLessThanOrEqual(255);
+    expect(wide).toBe(`${"日".repeat(75)} (conflict 2026-10-08 1432).md`);
+    // Names that fit are kept whole.
+    const fits = `${"a".repeat(200)}.md`;
+    expect(conflictCopyPath(fits, NOW)).toBe(`${"a".repeat(200)} (conflict 2026-10-08 1432).md`);
   });
 
   it("finds file names", () => {
@@ -670,5 +687,124 @@ describe("SaveSession removal", () => {
     expect(session.dirty).toBe(true);
     await session.flush();
     expect(disk.files.get(path)).toBe("mine");
+  });
+});
+
+describe("SaveSession exclusive steps", () => {
+  /** Renames the file on the fake disk, as storage would. */
+  const rename = (disk: FakeDisk, from: string, to: string) => {
+    const contents = disk.files.get(from) ?? "";
+    disk.files.delete(from);
+    disk.files.set(to, contents);
+    return hash(contents);
+  };
+
+  it("saves pending edits before the step runs", async () => {
+    const { disk, session, type, path } = setup();
+    type("edited");
+    const seen: string[] = [];
+    const result = await session.exclusive(async () => {
+      seen.push(disk.files.get(path) ?? "");
+      return 42;
+    });
+    expect(result).toBe(42);
+    expect(seen).toEqual(["edited"]);
+    expect(disk.writes).toHaveLength(1);
+  });
+
+  it("runs without a save when nothing is pending", async () => {
+    const { disk, session } = setup();
+    await session.exclusive(async () => undefined);
+    expect(disk.writes).toEqual([]);
+  });
+
+  it("holds saves until the step is done, then saves to the new path", async () => {
+    const { disk, session, type, path, events } = setup();
+    let finish: () => void = () => undefined;
+    const moving = session.exclusive(async () => {
+      await new Promise<void>((resolve) => (finish = resolve));
+      session.moveTo("notes/b.md", rename(disk, path, "notes/b.md"));
+    });
+    type("typed while moving");
+    await vi.advanceTimersByTimeAsync(SAVE_DELAY_MS);
+    expect(disk.writes).toEqual([]);
+    finish();
+    await moving;
+    await session.settled();
+    expect(session.path).toBe("notes/b.md");
+    expect(disk.files.get("notes/b.md")).toBe("typed while moving");
+    expect(disk.files.has(path)).toBe(false);
+    expect(disk.writes).toEqual([
+      { path: "notes/b.md", contents: "typed while moving", expected: hash("base") },
+    ]);
+    expect(events.conflict).not.toHaveBeenCalled();
+    expect(session.status).toEqual({ kind: "saved", at: NOW + SAVE_DELAY_MS });
+  });
+
+  it("checks the file again when it changed before the move", async () => {
+    const { disk, session, path, events } = setup();
+    await session.exclusive(async () => {
+      disk.files.set(path, "changed outside");
+      session.moveTo("notes/b.md", rename(disk, path, "notes/b.md"));
+    });
+    await session.settled();
+    expect(disk.reads).toEqual(["notes/b.md"]);
+    expect(events.reloaded).toHaveBeenCalledWith("changed outside");
+    expect(session.text).toBe("changed outside");
+    expect(session.hash).toBe(hash("changed outside"));
+  });
+
+  it("does not check again after moving a file that was already missing", async () => {
+    const { disk, session, path, type } = setup();
+    disk.files.delete(path);
+    await session.externalChange();
+    type("kept");
+    // The flush fails, so the file is still unknown when the step runs.
+    disk.writeOverrides.push({ kind: "error", message: "disk full" });
+    await session.exclusive(async () => session.moveTo("notes/b.md", "other"));
+    await session.settled();
+    expect(disk.reads).toEqual([path]);
+    expect(session.status.kind).toBe("failed");
+    await vi.advanceTimersByTimeAsync(2_000);
+    await session.settled();
+    expect(disk.writes.at(-1)).toEqual({ path: "notes/b.md", contents: "kept", expected: null });
+    expect(disk.files.get("notes/b.md")).toBe("kept");
+  });
+
+  it("passes failures of the step through and keeps working", async () => {
+    const { disk, session, type, path } = setup();
+    await expect(
+      session.exclusive(async () => {
+        throw new Error("rename failed");
+      }),
+    ).rejects.toThrow("rename failed");
+    type("after");
+    await vi.advanceTimersByTimeAsync(SAVE_DELAY_MS);
+    await session.settled();
+    expect(disk.files.get(path)).toBe("after");
+    expect(session.path).toBe(path);
+  });
+
+  it("exposes the hash of the disk version", async () => {
+    const { session, type } = setup();
+    expect(session.hash).toBe(hash("base"));
+    type("next");
+    await session.flush();
+    expect(session.hash).toBe(hash("next"));
+  });
+
+  it("rejects steps of a disposed session", async () => {
+    const { disk, session } = setup();
+    disk.holding = true;
+    session.edit(() => "slow");
+    const flushing = session.flush();
+    const task = vi.fn(async () => undefined);
+    const step = session.exclusive(task);
+    session.dispose();
+    disk.release();
+    await flushing;
+    await expect(step).rejects.toThrow(SESSION_CLOSED);
+    expect(task).not.toHaveBeenCalled();
+    await expect(session.exclusive(task)).rejects.toThrow(SESSION_CLOSED);
   });
 });

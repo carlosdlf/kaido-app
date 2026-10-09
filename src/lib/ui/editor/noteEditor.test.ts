@@ -125,6 +125,51 @@ describe("NoteEditor", () => {
     expect(undo(editor.view)).toBe(false);
   });
 
+  it("moves the shown note to its new path with its history", () => {
+    const { editor, onEdit } = create();
+    editor.show("a.md", "a");
+    typeAt(editor, 1, "1");
+    editor.rename("a.md", "b.md");
+    expect(editor.path).toBe("b.md");
+    editor.show("b.md", "a1");
+    expect(editor.view.state.doc.toString()).toBe("a1");
+    typeAt(editor, 2, "2");
+    expect(onEdit.mock.calls.at(-1)?.[0]).toBe("b.md");
+    expect(undo(editor.view)).toBe(true);
+    expect(undo(editor.view)).toBe(true);
+    expect(editor.view.state.doc.toString()).toBe("a");
+  });
+
+  it("moves the cached state of a note that is not shown", () => {
+    const { editor } = create();
+    editor.show("a.md", "a");
+    typeAt(editor, 1, "1");
+    editor.show("c.md", "c");
+    editor.rename("a.md", "b.md");
+    editor.rename("missing.md", "other.md");
+    editor.rename("c.md", "c.md");
+    expect(editor.path).toBe("c.md");
+    editor.show("b.md", "a1");
+    expect(undo(editor.view)).toBe(true);
+    expect(editor.view.state.doc.toString()).toBe("a");
+    editor.show("a.md", "fresh");
+    expect(undo(editor.view)).toBe(false);
+  });
+
+  it("drops the cached state at the target even when nothing moves there", () => {
+    const { editor } = create();
+    // A note once shown at b.md leaves state behind.
+    editor.show("b.md", "old");
+    typeAt(editor, 3, "!");
+    editor.show("c.md", "c");
+    // a.md has no cached state and is not shown, so nothing moves to b.md.
+    editor.rename("a.md", "b.md");
+    // Same text as the old note, so only its history would tell them apart.
+    editor.show("b.md", "old!");
+    expect(undo(editor.view)).toBe(false);
+    expect(editor.view.state.doc.toString()).toBe("old!");
+  });
+
   it("labels the text area and takes focus", () => {
     const { editor, parent } = create();
     editor.show("a.md", "text");

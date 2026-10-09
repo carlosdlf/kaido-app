@@ -159,6 +159,25 @@ export class NoteEditor {
     if (this.view.state.sliceDoc() !== text) this.#fromDisk(0, this.view.state.doc.length, next);
   }
 
+  /**
+   * Moves a note's editor state to its new path after a rename, keeping
+   * text, selection and undo history. Edits are reported under `to` from
+   * now on.
+   */
+  rename(from: string, to: string): void {
+    if (from === to) return;
+    // State left from another note at `to` never outlives the move.
+    this.#cache.delete(to);
+    if (this.#path === from) {
+      this.#path = to;
+      return;
+    }
+    const cached = this.#cache.get(from);
+    if (!cached) return;
+    this.#cache.delete(from);
+    this.#cache.set(to, cached);
+  }
+
   /** Forgets a note's editor state, e.g. after it was deleted. */
   forget(path: string): void {
     this.#cache.delete(path);

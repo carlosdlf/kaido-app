@@ -256,3 +256,111 @@ describe("MemoryStorage", () => {
     await expect(store.requestClose()).resolves.toBe(true);
   });
 });
+
+describe("MemoryStorage.renameFile", () => {
+  it("renames within the folder, keeping contents and time, and echoes both paths", async () => {
+    const store = await opened({ "inbox/a.md": "abc" });
+    const listener = vi.fn();
+    await store.watch(listener);
+    await expect(store.renameFile("inbox/a.md", "inbox/b.md")).resolves.toEqual({
+      path: "inbox/b.md",
+      size: 3,
+      modified: 1001,
+      hash: contentHash("abc"),
+    });
+    await expect(store.readFile("inbox/a.md")).rejects.toMatchObject({ kind: "NotFound" });
+    await expect(store.readFile("inbox/b.md")).resolves.toMatchObject({ contents: "abc" });
+    await Promise.resolve();
+    expect(listener).toHaveBeenCalledWith({
+      paths: ["inbox/a.md", "inbox/b.md"],
+      entries: [{ path: "inbox/b.md", size: 3, modified: 1001 }],
+      rescan: false,
+    });
+  });
+
+  it("allows case-only renames but not renaming to the same path", async () => {
+    const store = await opened({ "a.md": "x" });
+    await expect(store.renameFile("a.md", "A.md")).resolves.toMatchObject({ path: "A.md" });
+    expect(await store.listFiles()).toEqual([{ path: "A.md", size: 1, modified: 1001 }]);
+    await expect(store.renameFile("A.md", "A.md")).rejects.toMatchObject({ kind: "Conflict" });
+  });
+
+  it("checks folders case-sensitively and refuses files larger than 8 MiB", async () => {
+    const store = await opened({ "p/a.md": "x", "big.md": "a".repeat(8 * 1024 * 1024 + 1) });
+    await expect(store.renameFile("p/a.md", "P/a.md")).rejects.toMatchObject({
+      kind: "InvalidPath",
+    });
+    await expect(store.renameFile("big.md", "huge.md")).rejects.toMatchObject({
+      kind: "TooLarge",
+    });
+  });
+
+  it("never replaces an existing file", async () => {
+    const store = await opened({ "a.md": "one", "b.md": "two" });
+    await expect(store.renameFile("a.md", "b.md")).rejects.toMatchObject({ kind: "Conflict" });
+    expect((await store.readFile("a.md")).contents).toBe("one");
+    expect((await store.readFile("b.md")).contents).toBe("two");
+  });
+
+  it("reports a missing source and rejects invalid paths", async () => {
+    const store = await opened({ "inbox/a.md": "x", ".kaido/config.json": "{}" });
+    await expect(store.renameFile("inbox/x.md", "inbox/y.md")).rejects.toMatchObject({
+      kind: "NotFound",
+    });
+    await expect(store.renameFile("inbox/a.md", "api/a.md")).rejects.toMatchObject({
+      kind: "InvalidPath",
+    });
+    await expect(store.renameFile(".kaido/config.json", ".kaido/c.md")).rejects.toMatchObject({
+      kind: "InvalidPath",
+    });
+    await expect(store.renameFile("inbox/a.md", "inbox/a.txt")).rejects.toMatchObject({
+      kind: "InvalidPath",
+    });
+  });
+
+  it("requires an open workspace", async () => {
+    await expect(storage().renameFile("a.md", "b.md")).rejects.toMatchObject({
+      kind: "NoWorkspace",
+    });
+  });
+});
+
+describe("MemoryStorage.deleteFile", () => {
+  it("deletes a file with the expected hash, keeps it in the trash and echoes", async () => {
+    const store = await opened({ "inbox/a.md": "abc" });
+    const listener = vi.fn();
+    await store.watch(listener);
+    await expect(store.deleteFile("inbox/a.md", contentHash("abc"))).resolves.toBeUndefined();
+    await expect(store.readFile("inbox/a.md")).rejects.toMatchObject({ kind: "NotFound" });
+    expect(store.trash).toEqual([{ path: "inbox/a.md", contents: "abc" }]);
+    await Promise.resolve();
+    expect(listener).toHaveBeenCalledWith({ paths: ["inbox/a.md"], entries: [], rescan: false });
+  });
+
+  it("never deletes a version that was not seen", async () => {
+    const store = await opened({ "a.md": "new" });
+    await expect(store.deleteFile("a.md", contentHash("old"))).rejects.toMatchObject({
+      kind: "Conflict",
+    });
+    expect((await store.readFile("a.md")).contents).toBe("new");
+    expect(store.trash).toEqual([]);
+  });
+
+  it("reports missing files and rejects the workspace configuration", async () => {
+    const store = await opened({ ".kaido/config.json": "{}" });
+    await expect(store.deleteFile("a.md", "h")).rejects.toMatchObject({ kind: "NotFound" });
+    await expect(store.deleteFile(".kaido/config.json", contentHash("{}"))).rejects.toMatchObject({
+      kind: "InvalidPath",
+    });
+    await expect(store.deleteFile("a.txt", "h")).rejects.toMatchObject({ kind: "InvalidPath" });
+  });
+
+  it("does not echo when echoes are disabled", async () => {
+    const store = await opened({ "a.md": "x" }, false);
+    const listener = vi.fn();
+    await store.watch(listener);
+    await store.deleteFile("a.md", contentHash("x"));
+    await Promise.resolve();
+    expect(listener).not.toHaveBeenCalled();
+  });
+});

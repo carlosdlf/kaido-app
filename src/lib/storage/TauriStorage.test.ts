@@ -30,6 +30,7 @@ describe("TauriStorage", () => {
     ["listFiles", [], "list_files", undefined, [entry]],
     ["readFile", ["a.md"], "read_file", { path: "a.md" }, read],
     ["writeFile", ["a.md", "x"], "write_file", { path: "a.md", contents: "x" }, written],
+    ["renameFile", ["a.md", "b.md"], "rename_file", { from: "a.md", to: "b.md" }, written],
     ["readSettings", [], "read_settings", undefined, "{}"],
     ["readSettings", [], "read_settings", undefined, null],
   ] as const)("%s calls %s", async (method, args, command, commandArgs, response) => {
@@ -43,6 +44,24 @@ describe("TauriStorage", () => {
     invoke.mockResolvedValue(null);
     await expect(storage.writeSettings("{}")).resolves.toBeUndefined();
     expect(invoke).toHaveBeenCalledWith("write_settings", { contents: "{}" });
+  });
+
+  it("deletes files with the expected hash", async () => {
+    invoke.mockResolvedValue(null);
+    await expect(storage.deleteFile("a.md", "ab12")).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("delete_file", { path: "a.md", expectedHash: "ab12" });
+  });
+
+  it("rejects unexpected rename and delete responses", async () => {
+    invoke.mockResolvedValue({ path: "b.md" });
+    await expect(storage.renameFile("a.md", "b.md")).rejects.toMatchObject({ kind: "Io" });
+    invoke.mockResolvedValue({ deleted: true });
+    await expect(storage.deleteFile("a.md", "ab12")).rejects.toMatchObject({ kind: "Io" });
+  });
+
+  it("converts rename conflicts", async () => {
+    invoke.mockRejectedValue({ kind: "Conflict", message: "b.md already exists." });
+    await expect(storage.renameFile("a.md", "b.md")).rejects.toMatchObject({ kind: "Conflict" });
   });
 
   it("converts backend errors", async () => {

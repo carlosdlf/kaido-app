@@ -1,4 +1,4 @@
-import { isStoragePath } from "$lib/core/workspace";
+import { isStoragePath, WORKSPACE_CONFIG_PATH } from "$lib/core/workspace";
 import { StorageError } from "./errors";
 
 /** Largest file storage reads or writes: 8 MiB. */
@@ -27,5 +27,30 @@ export function checkStoragePath(path: string): void {
       "InvalidPath",
       "Only Markdown notes and the workspace configuration can be accessed.",
     );
+  }
+}
+
+/**
+ * Checks a path given to `renameFile` or `deleteFile`: like
+ * `checkStoragePath`, but only notes are accepted, never the workspace
+ * configuration file.
+ */
+export function checkNotePath(path: string): void {
+  checkStoragePath(path);
+  if (path === WORKSPACE_CONFIG_PATH) {
+    throw new StorageError("InvalidPath", "Only Markdown notes can be renamed or deleted.");
+  }
+}
+
+function folderOf(path: string): string {
+  return path.slice(0, path.lastIndexOf("/") + 1);
+}
+
+/** Checks the paths of a rename: both notes, in the same folder. */
+export function checkRenamePaths(from: string, to: string): void {
+  checkNotePath(from);
+  checkNotePath(to);
+  if (folderOf(from) !== folderOf(to)) {
+    throw new StorageError("InvalidPath", "A note can only be renamed within its folder.");
   }
 }

@@ -34,6 +34,8 @@ const ChangeEventSchema = v.object({
   rescan: v.boolean(),
 });
 const OptionalString = v.nullable(v.string());
+/** Commands without a result resolve to `null`. */
+const NoResult = v.nullish(v.never());
 
 async function call<T>(
   schema: v.GenericSchema<unknown, T>,
@@ -87,6 +89,14 @@ export class TauriStorage implements Storage {
 
   writeFile(path: string, contents: string, options?: WriteOptions): Promise<WrittenFile> {
     return call(WrittenFileSchema, "write_file", writeFileArgs(path, contents, options));
+  }
+
+  renameFile(from: string, to: string): Promise<WrittenFile> {
+    return call(WrittenFileSchema, "rename_file", { from, to });
+  }
+
+  async deleteFile(path: string, expectedHash: string): Promise<void> {
+    await call(NoResult, "delete_file", { path, expectedHash });
   }
 
   readSettings(): Promise<string | null> {
