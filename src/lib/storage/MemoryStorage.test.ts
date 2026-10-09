@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { contentHash } from "./contentHash";
 import { MemoryStorage } from "./MemoryStorage";
 
 function storage(options: ConstructorParameters<typeof MemoryStorage>[0] = {}) {
@@ -49,8 +50,8 @@ describe("MemoryStorage", () => {
 
   it("reads files, including ones not listed", async () => {
     const store = await opened({ "a.md": "text", ".kaido/config.json": "{}" });
-    await expect(store.readFile("a.md")).resolves.toBe("text");
-    await expect(store.readFile(".kaido/config.json")).resolves.toBe("{}");
+    await expect(store.readFile("a.md")).resolves.toMatchObject({ contents: "text" });
+    await expect(store.readFile(".kaido/config.json")).resolves.toMatchObject({ contents: "{}" });
     await expect(store.readFile("missing.md")).rejects.toMatchObject({ kind: "NotFound" });
     await expect(store.readFile("../x.md")).rejects.toMatchObject({ kind: "InvalidPath" });
     await expect(store.readFile("notes.txt")).rejects.toMatchObject({ kind: "InvalidPath" });
@@ -61,8 +62,13 @@ describe("MemoryStorage", () => {
     const listener = vi.fn();
     await store.watch(listener);
     const entry = await store.writeFile("inbox/new.md", "abc");
-    expect(entry).toEqual({ path: "inbox/new.md", size: 3, modified: 1002 });
-    await expect(store.readFile("inbox/new.md")).resolves.toBe("abc");
+    expect(entry).toEqual({
+      path: "inbox/new.md",
+      size: 3,
+      modified: 1002,
+      hash: contentHash("abc"),
+    });
+    await expect(store.readFile("inbox/new.md")).resolves.toMatchObject({ contents: "abc" });
     await Promise.resolve();
     expect(listener).toHaveBeenCalledWith({
       paths: ["inbox/new.md"],
@@ -84,7 +90,7 @@ describe("MemoryStorage", () => {
     const big = "a".repeat(8 * 1024 * 1024 + 1);
     const store = await opened({ "big.md": big, "edge.md": "é".repeat(4 * 1024 * 1024) });
     await expect(store.readFile("big.md")).rejects.toMatchObject({ kind: "TooLarge" });
-    await expect(store.readFile("edge.md")).resolves.toHaveLength(4 * 1024 * 1024);
+    expect((await store.readFile("edge.md")).contents).toHaveLength(4 * 1024 * 1024);
     await expect(store.writeFile("a.md", big)).rejects.toMatchObject({ kind: "TooLarge" });
     await expect(store.readFile("a.md")).rejects.toMatchObject({ kind: "NotFound" });
   });
@@ -96,7 +102,7 @@ describe("MemoryStorage", () => {
     await expect(store.writeFile("a.md", "new")).rejects.toMatchObject({
       kind: "PermissionDenied",
     });
-    await expect(store.readFile("a.md")).resolves.toBe("keep");
+    await expect(store.readFile("a.md")).resolves.toMatchObject({ contents: "keep" });
     store.setReadOnly("a.md", false);
     await expect(store.writeFile("a.md", "new")).resolves.toMatchObject({ path: "a.md" });
   });
@@ -167,7 +173,7 @@ describe("MemoryStorage", () => {
       entries: [{ path: "a.md", size: 3, modified: 1002 }],
       rescan: false,
     });
-    await expect(store.readFile("a.md")).resolves.toBe("new");
+    await expect(store.readFile("a.md")).resolves.toMatchObject({ contents: "new" });
     store.setExternal("a.md", null, false);
     expect(listener).toHaveBeenCalledTimes(1);
     await expect(store.readFile("a.md")).rejects.toMatchObject({ kind: "NotFound" });
@@ -191,5 +197,62 @@ describe("MemoryStorage", () => {
     const before = Date.now();
     const entry = await store.writeFile("a.md", "");
     expect(entry.modified).toBeGreaterThanOrEqual(before);
+  });
+
+  it("returns the hash of the contents with every read", async () => {
+    const store = await opened({ "a.md": "text" });
+    const read = await store.readFile("a.md");
+    expect(read).toEqual({ contents: "text", hash: contentHash("text") });
+    const written = await store.writeFile("a.md", "text");
+    expect(written.hash).toBe(read.hash);
+  });
+
+  it("creates only when the expected hash is null", async () => {
+    const store = await opened({ "a.md": "old" });
+    await expect(store.writeFile("a.md", "x", { expectedHash: null })).rejects.toMatchObject({
+      kind: "Conflict",
+    });
+    await expect(store.readFile("a.md")).resolves.toMatchObject({ contents: "old" });
+    await expect(store.writeFile("b.md", "new", { expectedHash: null })).resolves.toMatchObject({
+      path: "b.md",
+      hash: contentHash("new"),
+    });
+  });
+
+  it("writes only over the expected version", async () => {
+    const store = await opened({ "a.md": "old" });
+    const { hash } = await store.readFile("a.md");
+    store.setExternal("a.md", "theirs", false);
+    await expect(store.writeFile("a.md", "mine", { expectedHash: hash })).rejects.toMatchObject({
+      kind: "Conflict",
+    });
+    await expect(
+      store.writeFile("missing.md", "mine", { expectedHash: hash }),
+    ).rejects.toMatchObject({ kind: "Conflict" });
+    const current = await store.readFile("a.md");
+    await expect(
+      store.writeFile("a.md", "mine", { expectedHash: current.hash }),
+    ).resolves.toMatchObject({ hash: contentHash("mine") });
+    await expect(store.writeFile("a.md", "any", {})).resolves.toMatchObject({ path: "a.md" });
+  });
+
+  it("checks read-only files before the expected hash", async () => {
+    const store = await opened({ "a.md": "keep" });
+    store.setReadOnly("a.md");
+    await expect(store.writeFile("a.md", "x", { expectedHash: null })).rejects.toMatchObject({
+      kind: "PermissionDenied",
+    });
+  });
+
+  it("runs the close handler when asked to close", async () => {
+    const store = storage();
+    await expect(store.requestClose()).resolves.toBe(true);
+    const stop = await store.onCloseRequested(async () => false);
+    await expect(store.requestClose()).resolves.toBe(false);
+    const other = await store.onCloseRequested(async () => true);
+    stop();
+    await expect(store.requestClose()).resolves.toBe(true);
+    other();
+    await expect(store.requestClose()).resolves.toBe(true);
   });
 });

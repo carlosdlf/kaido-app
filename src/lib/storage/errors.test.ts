@@ -16,7 +16,7 @@ describe("toStorageError", () => {
     expect(error.name).toBe("StorageError");
   });
 
-  it.each(["TooLarge", "Superseded"])("knows the %s kind", (kind) => {
+  it.each(["TooLarge", "Superseded", "Conflict"])("knows the %s kind", (kind) => {
     expect(toStorageError({ kind, message: "x" }).kind).toBe(kind);
   });
 

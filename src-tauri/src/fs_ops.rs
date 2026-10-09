@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, AppResult};
 use crate::paths;
@@ -23,6 +24,48 @@ pub struct FileEntry {
     pub size: u64,
     /// Last modification time in milliseconds since the Unix epoch.
     pub modified: u64,
+}
+
+/// Contents of a workspace file and the hash of its bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileContents {
+    pub contents: String,
+    /// Lowercase hex SHA-256 of the file bytes, see [`content_hash`].
+    pub hash: String,
+}
+
+/// The entry of a file that was just written and the hash of what was
+/// written. Serialized flat: `{ path, size, modified, hash }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WrittenFile {
+    #[serde(flatten)]
+    pub entry: FileEntry,
+    pub hash: String,
+}
+
+/// Precondition checked by [`write_file`] right before the new contents
+/// replace the target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteCondition {
+    /// Write whatever is on disk.
+    Unconditional,
+    /// Only create the file: fail with `Conflict` if it already exists.
+    CreateOnly,
+    /// Only replace the file if it exists and its bytes hash to this value
+    /// (as returned by [`content_hash`]); otherwise fail with `Conflict`.
+    Matches(String),
+}
+
+/// Lowercase hex SHA-256 of `bytes`.
+pub fn content_hash(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest.iter() {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
 }
 
 /// Prefix of the temporary files created by [`atomic_write`]. It starts with
@@ -171,8 +214,8 @@ pub fn stat_entry(root: &Path, rel: &str) -> Option<FileEntry> {
     file_entry(root, &path, rel.to_owned(), true)
 }
 
-/// Reads a workspace file as UTF-8 text.
-pub fn read_file(root: &Path, rel: &str) -> AppResult<String> {
+/// Reads a workspace file as UTF-8 text, along with the hash of its bytes.
+pub fn read_file(root: &Path, rel: &str) -> AppResult<FileContents> {
     ensure_allowed(rel)?;
     let path = paths::resolve_existing(root, rel)?;
     ensure_resolved_allowed(root, &path, rel)?;
@@ -181,12 +224,26 @@ pub fn read_file(root: &Path, rel: &str) -> AppResult<String> {
             "{rel} is a folder, not a file"
         )));
     }
-    read_text(&path, rel)
+    let bytes = read_bytes(&path, rel)?;
+    let hash = content_hash(&bytes);
+    let contents = decode_utf8(bytes, rel)?;
+    Ok(FileContents { contents, hash })
 }
 
 /// Reads a file of at most [`MAX_FILE_SIZE`] bytes and decodes it as UTF-8,
 /// reporting errors with `label`.
 pub fn read_text(path: &Path, label: &str) -> AppResult<String> {
+    decode_utf8(read_bytes(path, label)?, label)
+}
+
+fn decode_utf8(bytes: Vec<u8>, label: &str) -> AppResult<String> {
+    String::from_utf8(bytes)
+        .map_err(|_| AppError::InvalidUtf8(format!("{label} is not valid UTF-8 text")))
+}
+
+/// Reads a file of at most [`MAX_FILE_SIZE`] bytes, reporting errors with
+/// `label`.
+fn read_bytes(path: &Path, label: &str) -> AppResult<Vec<u8>> {
     let io_err = |e: io::Error| AppError::from_io(&e, "read", label);
     let file = fs::File::open(path).map_err(io_err)?;
     if file.metadata().map_err(io_err)?.len() > MAX_FILE_SIZE {
@@ -200,15 +257,28 @@ pub fn read_text(path: &Path, label: &str) -> AppResult<String> {
     if bytes.len() as u64 > MAX_FILE_SIZE {
         return Err(too_large(label));
     }
-    String::from_utf8(bytes)
-        .map_err(|_| AppError::InvalidUtf8(format!("{label} is not valid UTF-8 text")))
+    Ok(bytes)
 }
 
 /// Atomically writes a workspace file, creating missing parent folders inside
-/// the workspace, and returns its new entry.
+/// the workspace, and returns its new entry with the hash of `contents`.
 ///
-/// Existing read-only files are never replaced.
-pub fn write_file(root: &Path, rel: &str, contents: &str) -> AppResult<FileEntry> {
+/// Existing read-only files are never replaced. `condition` is checked after
+/// every other validation, right before the new contents are published.
+///
+/// [`WriteCondition::CreateOnly`] is race-free where the file system supports
+/// hard links: the temporary file is linked to the target name, which fails
+/// if anything already exists there. Elsewhere it falls back to a check
+/// followed by a rename. For that fallback and for
+/// [`WriteCondition::Matches`], a change made by another process between the
+/// check and the rename is not detected; the window is a few system calls
+/// wide.
+pub fn write_file(
+    root: &Path,
+    rel: &str,
+    contents: &str,
+    condition: &WriteCondition,
+) -> AppResult<WrittenFile> {
     ensure_allowed(rel)?;
     if contents.len() as u64 > MAX_FILE_SIZE {
         return Err(too_large(rel));
@@ -222,9 +292,49 @@ pub fn write_file(root: &Path, rel: &str, contents: &str) -> AppResult<FileEntry
         fs::create_dir_all(parent)
             .map_err(|e| AppError::from_io(&e, "create the folder for", rel))?;
     }
-    write_atomically(&target, contents.as_bytes(), rel, Some(root))?;
+    write_atomically(
+        &target,
+        contents.as_bytes(),
+        rel,
+        Some(Guard { root, condition }),
+    )?;
     let meta = fs::metadata(&target).map_err(|e| AppError::from_io(&e, "read", rel))?;
-    Ok(entry(rel.to_owned(), &meta))
+    Ok(WrittenFile {
+        entry: entry(rel.to_owned(), &meta),
+        hash: content_hash(contents.as_bytes()),
+    })
+}
+
+/// Checks `condition` against the current bytes of `target`.
+fn check_condition(target: &Path, condition: &WriteCondition, label: &str) -> AppResult<()> {
+    match condition {
+        WriteCondition::Unconditional => Ok(()),
+        WriteCondition::CreateOnly => match fs::metadata(target) {
+            Ok(_) => Err(AppError::Conflict(format!("{label} already exists"))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(AppError::from_io(&e, "check", label)),
+        },
+        WriteCondition::Matches(expected) => match read_bytes(target, label) {
+            Ok(bytes) if content_hash(&bytes) == *expected => Ok(()),
+            // A file over the size limit never had its hash handed out.
+            Ok(_) | Err(AppError::TooLarge(_)) => Err(AppError::Conflict(format!(
+                "{label} was changed by another program"
+            ))),
+            Err(AppError::NotFound(_)) => Err(AppError::Conflict(format!(
+                "{label} was removed by another program"
+            ))),
+            Err(e) => Err(e),
+        },
+    }
+}
+
+/// Checks run by [`write_atomically`] right before publishing the file.
+#[derive(Clone, Copy)]
+struct Guard<'a> {
+    /// The target's folder must still resolve inside this workspace root.
+    root: &'a Path,
+    /// Precondition on the target's current state.
+    condition: &'a WriteCondition,
 }
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -242,36 +352,79 @@ fn temp_path(target: &Path) -> AppResult<PathBuf> {
 ///
 /// The data goes to a hidden temporary file in the same folder, which is
 /// flushed to disk and then renamed over the target. On Unix the folder is
-/// synced too (best effort) so the rename survives a crash. The temporary
+/// synced too (best effort) so the new entry survives a crash. The temporary
 /// file is removed if anything fails. `label` names the file in errors.
 pub fn atomic_write(target: &Path, bytes: &[u8], label: &str) -> AppResult<()> {
     write_atomically(target, bytes, label, None)
 }
 
-/// [`atomic_write`], optionally checking right before the rename that the
-/// target's folder still resolves inside `confine`. This narrows the window
-/// in which a folder swapped for a symlink could redirect the write.
+/// [`atomic_write`], optionally running the checks of `guard` right before
+/// publishing: the target's folder must still resolve inside the workspace
+/// (narrowing the window in which a folder swapped for a symlink could
+/// redirect the write) and the write condition must hold. A create-only
+/// write is published without ever replacing an existing target.
 fn write_atomically(
     target: &Path,
     bytes: &[u8],
     label: &str,
-    confine: Option<&Path>,
+    guard: Option<Guard<'_>>,
 ) -> AppResult<()> {
     let temp = temp_path(target)?;
     let io_err = |e: io::Error| AppError::from_io(&e, "write", label);
+    let create_only = guard.is_some_and(|g| *g.condition == WriteCondition::CreateOnly);
     let result = write_temp(&temp, target, bytes)
         .map_err(io_err)
-        .and_then(|()| match confine {
-            Some(root) => ensure_parent_inside(root, target, label),
+        .and_then(|()| match guard {
+            Some(guard) => ensure_parent_inside(guard.root, target, label)
+                .and_then(|()| check_condition(target, guard.condition, label)),
             None => Ok(()),
         })
-        .and_then(|()| fs::rename(&temp, target).map_err(io_err));
+        .and_then(|()| {
+            #[cfg(test)]
+            tests::run_before_publish_hook();
+            if create_only {
+                publish_new(&temp, target, label, |from, to| fs::hard_link(from, to))
+            } else {
+                fs::rename(&temp, target).map_err(io_err)
+            }
+        });
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     } else {
         sync_parent(target);
     }
     result
+}
+
+/// Publishes `temp` as `target` only if nothing exists at `target`, then
+/// removes `temp`.
+///
+/// Linking is atomic and never replaces an existing entry, so a file created
+/// by another process at any point before the link wins and the write fails
+/// with `Conflict`. If the file system cannot create the link (some network
+/// and FAT-style file systems), this falls back to checking for the target
+/// and renaming, which leaves a small race window. On failure `temp` is left
+/// for the caller to remove.
+fn publish_new(
+    temp: &Path,
+    target: &Path,
+    label: &str,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> AppResult<()> {
+    match link(temp, target) {
+        Ok(()) => {
+            // The contents are published; a temp file that cannot be removed
+            // here is cleaned up later by the stale temp sweep.
+            let _ = fs::remove_file(temp);
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            Err(AppError::Conflict(format!("{label} already exists")))
+        }
+        Err(_) => check_condition(target, &WriteCondition::CreateOnly, label).and_then(|()| {
+            fs::rename(temp, target).map_err(|e| AppError::from_io(&e, "write", label))
+        }),
+    }
 }
 
 fn ensure_parent_inside(root: &Path, target: &Path, label: &str) -> AppResult<()> {
@@ -377,7 +530,26 @@ fn sync_parent(_target: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use tempfile::TempDir;
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        /// Runs once inside `write_atomically`, after the write condition was
+        /// checked and right before the file is published.
+        static BEFORE_PUBLISH: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn run_before_publish_hook() {
+        if let Some(hook) = BEFORE_PUBLISH.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    fn before_publish(hook: impl FnOnce() + 'static) {
+        BEFORE_PUBLISH.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
 
     fn workspace() -> (TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -389,6 +561,14 @@ mod tests {
         let path = root.join(rel);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, contents).unwrap();
+    }
+
+    fn write(root: &Path, rel: &str, contents: &str) -> AppResult<FileEntry> {
+        write_file(root, rel, contents, &WriteCondition::Unconditional).map(|w| w.entry)
+    }
+
+    fn read(root: &Path, rel: &str) -> AppResult<String> {
+        read_file(root, rel).map(|f| f.contents)
     }
 
     fn listed(root: &Path) -> Vec<String> {
@@ -525,7 +705,7 @@ mod tests {
     fn reads_utf8_files() {
         let (_dir, root) = workspace();
         put(&root, "p/a.md", "# Título\n");
-        assert_eq!(read_file(&root, "p/a.md").unwrap(), "# Título\n");
+        assert_eq!(read(&root, "p/a.md").unwrap(), "# Título\n");
     }
 
     #[test]
@@ -533,7 +713,7 @@ mod tests {
         let (_dir, root) = workspace();
         fs::create_dir(root.join("p")).unwrap();
         fs::write(root.join("bin.md"), [0xff, 0xfe, 0x00]).unwrap();
-        let err = |rel| read_file(&root, rel).unwrap_err();
+        let err = |rel| read(&root, rel).unwrap_err();
         assert_eq!(err("missing.md").kind(), "NotFound");
         assert_eq!(err("p").kind(), "InvalidPath");
         assert_eq!(err("bin.md").kind(), "InvalidUtf8");
@@ -556,7 +736,7 @@ mod tests {
             return;
         }
         fs::set_permissions(root.join("a.md"), fs::Permissions::from_mode(0o000)).unwrap();
-        let result = read_file(&root, "a.md");
+        let result = read(&root, "a.md");
         assert_eq!(result.unwrap_err().kind(), "PermissionDenied");
     }
 
@@ -569,16 +749,13 @@ mod tests {
         put(&outside, "secret.md", "secret");
         symlink(outside.join("secret.md"), root.join("s.md")).unwrap();
         symlink(&outside, root.join("out")).unwrap();
+        assert_eq!(read(&root, "s.md").unwrap_err().kind(), "OutsideWorkspace");
         assert_eq!(
-            read_file(&root, "s.md").unwrap_err().kind(),
+            write(&root, "s.md", "x").unwrap_err().kind(),
             "OutsideWorkspace"
         );
         assert_eq!(
-            write_file(&root, "s.md", "x").unwrap_err().kind(),
-            "OutsideWorkspace"
-        );
-        assert_eq!(
-            write_file(&root, "out/new.md", "x").unwrap_err().kind(),
+            write(&root, "out/new.md", "x").unwrap_err().kind(),
             "OutsideWorkspace"
         );
         assert_eq!(
@@ -591,7 +768,7 @@ mod tests {
     #[test]
     fn writes_new_files_and_creates_folders() {
         let (_dir, root) = workspace();
-        let written = write_file(&root, "proj/sub/new.md", "hello").unwrap();
+        let written = write(&root, "proj/sub/new.md", "hello").unwrap();
         assert_eq!(written.path, "proj/sub/new.md");
         assert_eq!(written.size, 5);
         assert!(written.modified > 0);
@@ -606,9 +783,9 @@ mod tests {
     fn overwrites_existing_files() {
         let (_dir, root) = workspace();
         put(&root, "a.md", "old contents that are longer");
-        let written = write_file(&root, "a.md", "new").unwrap();
+        let written = write(&root, "a.md", "new").unwrap();
         assert_eq!(written.size, 3);
-        assert_eq!(read_file(&root, "a.md").unwrap(), "new");
+        assert_eq!(read(&root, "a.md").unwrap(), "new");
         assert!(leftovers(&root).is_empty());
     }
 
@@ -619,7 +796,7 @@ mod tests {
         let (_dir, root) = workspace();
         put(&root, "a.md", "old");
         fs::set_permissions(root.join("a.md"), fs::Permissions::from_mode(0o600)).unwrap();
-        write_file(&root, "a.md", "new").unwrap();
+        write(&root, "a.md", "new").unwrap();
         let mode = fs::metadata(root.join("a.md"))
             .unwrap()
             .permissions()
@@ -634,7 +811,7 @@ mod tests {
         let (_dir, root) = workspace();
         put(&root, "real/a.md", "old");
         symlink(root.join("real/a.md"), root.join("link.md")).unwrap();
-        let written = write_file(&root, "link.md", "new").unwrap();
+        let written = write(&root, "link.md", "new").unwrap();
         assert_eq!(written.path, "link.md");
         assert_eq!(fs::read_to_string(root.join("real/a.md")).unwrap(), "new");
         assert!(
@@ -650,7 +827,7 @@ mod tests {
         let (_dir, root) = workspace();
         put(&root, "file.md", "x");
         fs::create_dir(root.join("folder")).unwrap();
-        let err = |rel| write_file(&root, rel, "x").unwrap_err().kind();
+        let err = |rel| write(&root, rel, "x").unwrap_err().kind();
         assert_eq!(err("../escape.md"), "InvalidPath");
         assert_eq!(err("/abs.md"), "InvalidPath");
         assert_eq!(err(""), "InvalidPath");
@@ -669,8 +846,8 @@ mod tests {
             return;
         }
         fs::set_permissions(root.join("ro"), fs::Permissions::from_mode(0o500)).unwrap();
-        let result = write_file(&root, "ro/a.md", "new");
-        let nested = write_file(&root, "ro/sub/b.md", "new");
+        let result = write(&root, "ro/a.md", "new");
+        let nested = write(&root, "ro/sub/b.md", "new");
         fs::set_permissions(root.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(result.unwrap_err().kind(), "PermissionDenied");
         assert_eq!(nested.unwrap_err().kind(), "PermissionDenied");
@@ -685,7 +862,7 @@ mod tests {
         let mut perms = fs::metadata(root.join("a.md")).unwrap().permissions();
         perms.set_readonly(true);
         fs::set_permissions(root.join("a.md"), perms).unwrap();
-        let err = write_file(&root, "a.md", "new").unwrap_err();
+        let err = write(&root, "a.md", "new").unwrap_err();
         assert_eq!(err.kind(), "PermissionDenied");
         assert_eq!(fs::read_to_string(root.join("a.md")).unwrap(), "old");
         assert!(leftovers(&root).is_empty());
@@ -719,13 +896,9 @@ mod tests {
             "p/.kaido/config.json",
             ".KAIDO/config.json",
         ] {
+            assert_eq!(read(&root, rel).unwrap_err().kind(), "InvalidPath", "{rel}");
             assert_eq!(
-                read_file(&root, rel).unwrap_err().kind(),
-                "InvalidPath",
-                "{rel}"
-            );
-            assert_eq!(
-                write_file(&root, rel, "x").unwrap_err().kind(),
+                write(&root, rel, "x").unwrap_err().kind(),
                 "InvalidPath",
                 "{rel}"
             );
@@ -735,10 +908,10 @@ mod tests {
             "[core]"
         );
         assert!(!root.join(".git/hooks").exists());
-        assert_eq!(read_file(&root, ".kaido/config.json").unwrap(), "{}");
-        write_file(&root, ".kaido/config.json", r#"{"version":1}"#).unwrap();
+        assert_eq!(read(&root, ".kaido/config.json").unwrap(), "{}");
+        write(&root, ".kaido/config.json", r#"{"version":1}"#).unwrap();
         assert_eq!(
-            read_file(&root, ".kaido/config.json").unwrap(),
+            read(&root, ".kaido/config.json").unwrap(),
             r#"{"version":1}"#
         );
     }
@@ -749,17 +922,17 @@ mod tests {
         let limit = usize::try_from(MAX_FILE_SIZE).unwrap();
         let at_limit = "a".repeat(limit);
         assert_eq!(
-            write_file(&root, "big.md", &at_limit).unwrap().size,
+            write(&root, "big.md", &at_limit).unwrap().size,
             MAX_FILE_SIZE
         );
-        assert_eq!(read_file(&root, "big.md").unwrap().len(), limit);
+        assert_eq!(read(&root, "big.md").unwrap().len(), limit);
 
         let over = "a".repeat(limit + 1);
-        let err = write_file(&root, "over.md", &over).unwrap_err();
+        let err = write(&root, "over.md", &over).unwrap_err();
         assert_eq!(err.kind(), "TooLarge");
         assert!(!root.join("over.md").exists());
         fs::write(root.join("over.md"), &over).unwrap();
-        assert_eq!(read_file(&root, "over.md").unwrap_err().kind(), "TooLarge");
+        assert_eq!(read(&root, "over.md").unwrap_err().kind(), "TooLarge");
     }
 
     #[cfg(unix)]
@@ -771,15 +944,19 @@ mod tests {
         // Simulates a folder replaced by a link after it was resolved.
         symlink(&outside, root.join("swapped")).unwrap();
         let target = root.join("swapped").join("a.md");
-        let err = write_atomically(&target, b"x", "swapped/a.md", Some(&root)).unwrap_err();
+        let guard = Some(Guard {
+            root: &root,
+            condition: &WriteCondition::Unconditional,
+        });
+        let err = write_atomically(&target, b"x", "swapped/a.md", guard).unwrap_err();
         assert_eq!(err.kind(), "OutsideWorkspace");
         assert!(!outside.join("a.md").exists());
         assert!(leftovers(&outside).is_empty());
         // The same write inside the workspace goes through.
         fs::create_dir(root.join("real")).unwrap();
-        write_atomically(&root.join("real/a.md"), b"x", "real/a.md", Some(&root)).unwrap();
+        write_atomically(&root.join("real/a.md"), b"x", "real/a.md", guard).unwrap();
         let gone = root.join("gone").join("a.md");
-        let err = write_atomically(&gone, b"x", "gone/a.md", Some(&root)).unwrap_err();
+        let err = write_atomically(&gone, b"x", "gone/a.md", guard).unwrap_err();
         assert_eq!(err.kind(), "NotFound");
     }
 
@@ -939,13 +1116,9 @@ mod tests {
             "inbox/data.md",
             "gitdir/notes.md",
         ] {
+            assert_eq!(read(&root, rel).unwrap_err().kind(), "InvalidPath", "{rel}");
             assert_eq!(
-                read_file(&root, rel).unwrap_err().kind(),
-                "InvalidPath",
-                "{rel}"
-            );
-            assert_eq!(
-                write_file(&root, rel, "x").unwrap_err().kind(),
+                write(&root, rel, "x").unwrap_err().kind(),
                 "InvalidPath",
                 "{rel}"
             );
@@ -963,20 +1136,20 @@ mod tests {
             fs::read_to_string(root.join(".git/notes.md")).unwrap(),
             "git"
         );
-        let err = write_file(&root, "gitdir/new.md", "x").unwrap_err();
+        let err = write(&root, "gitdir/new.md", "x").unwrap_err();
         assert_eq!(err.kind(), "InvalidPath");
         assert!(!root.join(".git/new.md").exists());
         assert!(leftovers(&root.join(".git")).is_empty());
 
         // Links to notes (or the config file) keep working.
-        assert_eq!(read_file(&root, "inbox/alias.md").unwrap(), "real");
-        write_file(&root, "inbox/alias.md", "new").unwrap();
+        assert_eq!(read(&root, "inbox/alias.md").unwrap(), "real");
+        write(&root, "inbox/alias.md", "new").unwrap();
         assert_eq!(
             fs::read_to_string(root.join("inbox/real.md")).unwrap(),
             "new"
         );
         assert_eq!(stat_entry(&root, "inbox/alias.md").unwrap().size, 3);
-        assert_eq!(read_file(&root, "inbox/config.md").unwrap(), "{}");
+        assert_eq!(read(&root, "inbox/config.md").unwrap(), "{}");
     }
 
     #[cfg(unix)]
@@ -991,5 +1164,254 @@ mod tests {
         symlink(root.join("real.md"), root.join("in.md")).unwrap();
         assert_eq!(stat_entry(&root, "out.md"), None);
         assert_eq!(stat_entry(&root, "in.md").unwrap().size, 3);
+    }
+
+    #[test]
+    fn content_hash_is_lowercase_hex_sha256() {
+        assert_eq!(
+            content_hash(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            content_hash(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn read_file_returns_the_hash_of_the_bytes() {
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "abc");
+        let read = read_file(&root, "a.md").unwrap();
+        assert_eq!(read.contents, "abc");
+        assert_eq!(read.hash, content_hash(b"abc"));
+        let json = serde_json::to_value(&read).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "contents": "abc", "hash": content_hash(b"abc") })
+        );
+    }
+
+    #[test]
+    fn written_file_serializes_flat_with_its_hash() {
+        let (_dir, root) = workspace();
+        let written = write_file(&root, "a.md", "abc", &WriteCondition::Unconditional).unwrap();
+        assert_eq!(written.hash, content_hash(b"abc"));
+        let json = serde_json::to_value(&written).unwrap();
+        assert_eq!(json["path"], "a.md");
+        assert_eq!(json["size"], 3);
+        assert!(json["modified"].as_u64().unwrap() > 0);
+        assert_eq!(json["hash"], content_hash(b"abc"));
+        assert_eq!(json.as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn unconditional_writes_create_and_replace() {
+        let (_dir, root) = workspace();
+        let cond = WriteCondition::Unconditional;
+        write_file(&root, "a.md", "one", &cond).unwrap();
+        let written = write_file(&root, "a.md", "two", &cond).unwrap();
+        assert_eq!(read(&root, "a.md").unwrap(), "two");
+        assert_eq!(written.hash, read_file(&root, "a.md").unwrap().hash);
+    }
+
+    #[test]
+    fn create_only_writes_new_files() {
+        let (_dir, root) = workspace();
+        let written = write_file(&root, "p/new.md", "hi", &WriteCondition::CreateOnly).unwrap();
+        assert_eq!(written.entry.size, 2);
+        assert_eq!(written.hash, content_hash(b"hi"));
+        assert_eq!(read(&root, "p/new.md").unwrap(), "hi");
+        assert!(leftovers(&root.join("p")).is_empty());
+    }
+
+    #[test]
+    fn create_only_conflicts_when_the_target_appears_before_publishing() {
+        let (_dir, root) = workspace();
+        let target = root.join("a.md");
+        before_publish(move || fs::write(target, "theirs").unwrap());
+        let err = write_file(&root, "a.md", "mine", &WriteCondition::CreateOnly).unwrap_err();
+        assert_eq!(err.kind(), "Conflict");
+        assert_eq!(err.to_string(), "a.md already exists");
+        assert_eq!(read(&root, "a.md").unwrap(), "theirs");
+        assert!(leftovers(&root).is_empty());
+    }
+
+    #[test]
+    fn unconditional_write_replaces_a_target_that_appears_before_publishing() {
+        let (_dir, root) = workspace();
+        let target = root.join("a.md");
+        before_publish(move || fs::write(target, "theirs").unwrap());
+        write(&root, "a.md", "mine").unwrap();
+        assert_eq!(read(&root, "a.md").unwrap(), "mine");
+        assert!(leftovers(&root).is_empty());
+    }
+
+    fn unsupported(_: &Path, _: &Path) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    #[test]
+    fn create_only_falls_back_to_rename_without_hard_links() {
+        let (_dir, root) = workspace();
+        let target = root.join("a.md");
+        let temp = temp_path(&target).unwrap();
+        write_temp(&temp, &target, b"mine").unwrap();
+        publish_new(&temp, &target, "a.md", unsupported).unwrap();
+        assert_eq!(read(&root, "a.md").unwrap(), "mine");
+        assert!(leftovers(&root).is_empty());
+    }
+
+    #[test]
+    fn create_only_fallback_still_refuses_an_existing_target() {
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "theirs");
+        let target = root.join("a.md");
+        let temp = temp_path(&target).unwrap();
+        write_temp(&temp, &target, b"mine").unwrap();
+        let err = publish_new(&temp, &target, "a.md", unsupported).unwrap_err();
+        assert_eq!(err.kind(), "Conflict");
+        assert_eq!(read(&root, "a.md").unwrap(), "theirs");
+        // The caller removes the temp file on failure.
+        assert!(temp.exists());
+    }
+
+    #[test]
+    fn create_only_reports_a_failed_fallback_rename() {
+        let (_dir, root) = workspace();
+        let target = root.join("a.md");
+        let temp = temp_path(&target).unwrap();
+        // Nothing to rename: the fallback surfaces the I/O error.
+        let err = publish_new(&temp, &target, "a.md", unsupported).unwrap_err();
+        assert_eq!(err.kind(), "NotFound");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn create_only_conflicts_with_an_existing_file() {
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "theirs");
+        let err = write_file(&root, "a.md", "mine", &WriteCondition::CreateOnly).unwrap_err();
+        assert_eq!(err.kind(), "Conflict");
+        assert_eq!(err.to_string(), "a.md already exists");
+        assert_eq!(read(&root, "a.md").unwrap(), "theirs");
+        assert!(leftovers(&root).is_empty());
+    }
+
+    #[test]
+    fn matching_hash_replaces_the_file() {
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "old");
+        let base = read_file(&root, "a.md").unwrap().hash;
+        let written =
+            write_file(&root, "a.md", "new", &WriteCondition::Matches(base.clone())).unwrap();
+        assert_eq!(read(&root, "a.md").unwrap(), "new");
+        assert_eq!(written.hash, content_hash(b"new"));
+        assert_ne!(written.hash, base);
+        // The returned hash is the base for the next conditional write.
+        write_file(
+            &root,
+            "a.md",
+            "newer",
+            &WriteCondition::Matches(written.hash),
+        )
+        .unwrap();
+        assert_eq!(read(&root, "a.md").unwrap(), "newer");
+    }
+
+    #[test]
+    fn different_hash_is_a_conflict() {
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "old");
+        let base = read_file(&root, "a.md").unwrap().hash;
+        put(&root, "a.md", "changed elsewhere");
+        let err = write_file(&root, "a.md", "mine", &WriteCondition::Matches(base)).unwrap_err();
+        assert_eq!(err.kind(), "Conflict");
+        assert_eq!(err.to_string(), "a.md was changed by another program");
+        assert_eq!(read(&root, "a.md").unwrap(), "changed elsewhere");
+        assert!(leftovers(&root).is_empty());
+        // Hashes are compared exactly.
+        let upper = content_hash(b"changed elsewhere").to_uppercase();
+        let err = write_file(&root, "a.md", "mine", &WriteCondition::Matches(upper)).unwrap_err();
+        assert_eq!(err.kind(), "Conflict");
+    }
+
+    #[test]
+    fn expected_hash_on_a_missing_file_is_a_conflict() {
+        let (_dir, root) = workspace();
+        let cond = WriteCondition::Matches(content_hash(b"old"));
+        let err = write_file(&root, "p/gone.md", "mine", &cond).unwrap_err();
+        assert_eq!(err.kind(), "Conflict");
+        assert_eq!(err.to_string(), "p/gone.md was removed by another program");
+        assert!(!root.join("p/gone.md").exists());
+        assert!(leftovers(&root.join("p")).is_empty());
+    }
+
+    #[test]
+    fn expected_hash_on_a_file_over_the_limit_is_a_conflict() {
+        let (_dir, root) = workspace();
+        let limit = usize::try_from(MAX_FILE_SIZE).unwrap();
+        let over = "a".repeat(limit + 1);
+        fs::write(root.join("big.md"), &over).unwrap();
+        let cond = WriteCondition::Matches(content_hash(over.as_bytes()));
+        let err = write_file(&root, "big.md", "small", &cond).unwrap_err();
+        assert_eq!(err.kind(), "Conflict");
+        assert_eq!(
+            fs::metadata(root.join("big.md")).unwrap().len(),
+            MAX_FILE_SIZE + 1
+        );
+    }
+
+    #[test]
+    fn other_validation_runs_before_the_condition() {
+        let (_dir, root) = workspace();
+        put(&root, "ro.md", "old");
+        let mut perms = fs::metadata(root.join("ro.md")).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(root.join("ro.md"), perms).unwrap();
+        let wrong = WriteCondition::Matches("0".repeat(64));
+        for cond in [WriteCondition::CreateOnly, wrong.clone()] {
+            let err = |rel| write_file(&root, rel, "x", &cond).unwrap_err().kind();
+            assert_eq!(err("ro.md"), "PermissionDenied");
+            assert_eq!(err("../x.md"), "InvalidPath");
+            assert_eq!(err("notes.txt"), "InvalidPath");
+        }
+        let limit = usize::try_from(MAX_FILE_SIZE).unwrap();
+        let over = "a".repeat(limit + 1);
+        let err = write_file(&root, "big.md", &over, &wrong).unwrap_err();
+        assert_eq!(err.kind(), "TooLarge");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expected_hash_on_an_unreadable_file_reports_the_read_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, root) = workspace();
+        put(&root, "a.md", "old");
+        if crate::test_support::skip_if_privileged("expected_hash_on_an_unreadable_file") {
+            return;
+        }
+        fs::set_permissions(root.join("a.md"), fs::Permissions::from_mode(0o200)).unwrap();
+        let cond = WriteCondition::Matches(content_hash(b"old"));
+        let result = write_file(&root, "a.md", "new", &cond);
+        fs::set_permissions(root.join("a.md"), fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(result.unwrap_err().kind(), "PermissionDenied");
+        assert_eq!(read(&root, "a.md").unwrap(), "old");
+        assert!(leftovers(&root).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conditions_apply_to_the_target_of_an_inside_symlink() {
+        use std::os::unix::fs::symlink;
+        let (_dir, root) = workspace();
+        put(&root, "real.md", "old");
+        symlink(root.join("real.md"), root.join("link.md")).unwrap();
+        let err = write_file(&root, "link.md", "x", &WriteCondition::CreateOnly).unwrap_err();
+        assert_eq!(err.kind(), "Conflict");
+        assert!(leftovers(&root).is_empty());
+        let cond = WriteCondition::Matches(content_hash(b"old"));
+        write_file(&root, "link.md", "new", &cond).unwrap();
+        assert_eq!(fs::read_to_string(root.join("real.md")).unwrap(), "new");
     }
 }

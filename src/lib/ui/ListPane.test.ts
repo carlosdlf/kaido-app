@@ -22,6 +22,7 @@ function renderList(items: ListItem[], selected = "") {
     state.selected = id;
     view.rerender({ selected: id });
   });
+  const oncreate = vi.fn();
   const view = render(ListPane, {
     title: "p/",
     summary: "",
@@ -30,11 +31,13 @@ function renderList(items: ListItem[], selected = "") {
     now: 0,
     selected,
     onselect,
+    oncreate,
+    createShortcut: { aria: "Control+N", hint: "^N" },
   });
   const list = () => within(screen.getByRole("region"));
   const rendered = () => list().getAllByRole("listitem");
   const viewport = () => screen.getByRole("list").parentElement as HTMLElement;
-  return { view, onselect, list, rendered, viewport, state };
+  return { view, onselect, oncreate, list, rendered, viewport, state };
 }
 
 describe("ListPane virtualization", () => {
@@ -179,5 +182,19 @@ describe("ListPane virtualization", () => {
     viewport().scrollTop = 2 * ROW;
     await fireEvent.scroll(viewport());
     expect(row).toHaveFocus();
+  });
+});
+
+describe("ListPane new note button", () => {
+  it("is a labelled button that announces its shortcut", async () => {
+    const { oncreate } = renderList(notes(2));
+    const button = screen.getByRole("button", { name: "New note" });
+    expect(button).toHaveAttribute("aria-keyshortcuts", "Control+N");
+    expect(button).toHaveTextContent("^N");
+    await userEvent.click(button);
+    expect(oncreate).toHaveBeenCalledOnce();
+    button.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(oncreate).toHaveBeenCalledTimes(2);
   });
 });

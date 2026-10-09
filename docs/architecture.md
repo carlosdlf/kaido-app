@@ -115,16 +115,18 @@ All platform access goes through the `Storage` interface (`src/lib/storage/types
 | `pickWorkspaceFolder()` | Shows the native folder picker; resolves to an absolute path or `null` |
 | `openWorkspace(path)` | Opens an existing folder, replacing the current workspace and its watcher |
 | `listFiles()` | Lists every listable Markdown file, sorted by path |
-| `readFile(path)` / `writeFile(path, contents)` | Reads or atomically writes a note or `.kaido/config.json` |
+| `readFile(path)` | Reads a note or `.kaido/config.json`; resolves to `{ contents, hash }` |
+| `writeFile(path, contents, { expectedHash? })` | Atomically writes a note or `.kaido/config.json`; resolves to its `FileEntry` plus the new `hash`. See [Conditional writes](#conditional-writes) |
 | `readSettings()` / `writeSettings(contents)` | Reads or writes the raw device `settings.json` (`null` if missing) |
 | `watch(listener)` | Subscribes to workspace changes, including the app's own writes |
+| `onCloseRequested(handler)` | Runs `handler` before the window closes; it resolves to `false` to keep the window open |
 
 `createStorage()` in `src/lib/storage/index.ts` picks the backend:
 
 | Backend | Used for |
 |---|---|
 | `TauriStorage` | The desktop app. Calls the Rust commands and listens to the watcher event. Responses are validated with valibot; an unexpected response becomes an `Io` error, and a malformed change event is treated as a rescan. |
-| `MemoryStorage` | Tests and `pnpm dev` in a browser (serves a sample workspace). Follows the same path, size and read-only rules as the desktop backend and can simulate external edits. |
+| `MemoryStorage` | Tests and `pnpm dev` in a browser (serves a sample workspace). Follows the same path, size, read-only and conditional write rules as the desktop backend and can simulate external edits. Its hash is a fast non-cryptographic content hash; like the desktop hash, equal contents always give equal hashes. |
 
 ### Commands
 
@@ -135,12 +137,24 @@ The Rust commands live in `src-tauri/src/commands.rs`. Each one runs its disk wo
 | `pick_workspace_folder` | – | `string \| null` |
 | `open_workspace` | `path` (absolute) | `{ root }`, the canonical absolute root |
 | `list_files` | – | `FileEntry[]` |
-| `read_file` | `path` | `string` (UTF-8) |
-| `write_file` | `path`, `contents` | `FileEntry` |
+| `read_file` | `path` | `{ contents, hash }` |
+| `write_file` | `path`, `contents`, optional `expectedHash` | `FileEntry` and `hash` |
 | `read_settings` | – | `string \| null` |
 | `write_settings` | `contents` | – |
 
-`FileEntry` is `{ path, size, modified }`, with `modified` in milliseconds since the Unix epoch.
+`FileEntry` is `{ path, size, modified }`, with `modified` in milliseconds since the Unix epoch. `hash` is the lowercase hex SHA-256 of the file's bytes; the frontend only compares hashes and never computes them.
+
+### Conditional writes
+
+`expectedHash` makes a write safe against changes made outside the app:
+
+| `expectedHash` | Writes when |
+|---|---|
+| omitted | Always (used for `.kaido/config.json`) |
+| `null` | The file does not exist yet |
+| a hash | The file exists and its current hash matches |
+
+Otherwise the write fails with `Conflict` and the file is left untouched. The check runs right before the atomic rename; a change landing between the check and the rename is not detected.
 
 Calls to `open_workspace` run one at a time and the most recently issued one wins: an older call still waiting fails with `Superseded`, which the UI ignores. A failed open keeps the previous workspace.
 
@@ -159,6 +173,7 @@ Errors cross the boundary as `{ kind, message }` and become a `StorageError` in 
 | `TooLarge` | The file or contents exceed 8 MiB |
 | `PermissionDenied` | The OS denied access, or the target file is read-only |
 | `Superseded` | A newer `open_workspace` call overtook this one |
+| `Conflict` | A conditional write found the file missing, present or changed (see [Conditional writes](#conditional-writes)) |
 | `Io` | Any other failure |
 
 ### Change event
@@ -173,7 +188,7 @@ The watcher emits `workspace://changed` with this payload:
 }
 ```
 
-A path in `paths` without an entry in `entries` was removed. `paths` covers listable Markdown files and `.kaido/config.json`. The app's own writes are reported like any other change; the core (`applyChange`) skips entries whose size and modification time did not change.
+A path in `paths` without an entry in `entries` was removed. `paths` covers listable Markdown files and `.kaido/config.json`. The app's own writes are reported like any other change; the core (`applyChange`) skips entries whose size and modification time did not change, and an open note recognizes its own saves by their hash.
 
 ### File access rules
 
@@ -248,7 +263,32 @@ Change events are queued until the initial load finishes, then applied one at a 
 - Other events update the listing from `entries` without a new listing, re-read summaries of changed files, and reload the open note if it was touched.
 - If the open note is deleted it is shown as missing; a file over 8 MiB is shown as too large to open.
 
-Opening another workspace discards all pending work from the previous one.
+Opening another workspace drops background work of the previous one (queued summary reads, change events still waiting). Unsaved edits are handled as described in [Editing and autosave](#editing-and-autosave).
+
+## Editing and autosave
+
+The editor (`src/lib/ui/EditorPane.svelte`, `src/lib/ui/editor/`) is CodeMirror 6 with Markdown highlighting. One editor view is shared by all notes; each recently opened note keeps its own editor state (text, selection, undo history) in a small cache, so switching back restores it. Markdown markers stay visible but dimmed, headings are sized, prose uses Geist and code JetBrains Mono. Languages for fenced code blocks are loaded on demand.
+
+Tables use the monospace font so aligned columns line up. Inside a table, `Tab` aligns the columns (keeping `:---`, `---:` and `:---:` alignment markers) and moves to the next cell, adding a row after the last one; `Shift+Tab` moves to the previous cell. As in GFM, every `|` splits cells, also inside code spans, unless it is escaped (`\|`). The parsing and formatting live in `src/lib/core/markdownTable.ts`. Outside tables, `Tab` moves focus out of the editor.
+
+Saving is handled per note by `SaveSession` (`src/lib/core/saveMachine.ts`), a platform-independent state machine that gets storage access and timers passed in:
+
+- An edit only records how to read the new text and restarts a 500 ms timer. Nothing is copied, compared or written while typing.
+- Selecting another note, leaving the window and closing the app save immediately.
+- At most one write per note is in flight. Edits made during a write are saved after it.
+- Every write passes the hash of the last known disk version as `expectedHash` (or `null` if the file was deleted), so a newer version on disk is never overwritten.
+- When the watcher reports the open note, the file is read again. The same hash as the last save is the app's own write and is ignored. Without unsaved edits, the new version replaces the editor text. With unsaved edits, both versions are kept.
+- **Keeping both versions.** The disk version is written next to the note as `<name> (conflict YYYY-MM-DD HHmm).md` (with ` 2`, ` 3`… if taken), then the editor text replaces the note. If the file changes again meanwhile, this is retried up to three times. Once a version is kept in a copy, later retries only write the editor text, so the same version is never copied twice. A notice names the copy.
+- A note deleted outside the app is shown as missing, unless it has unsaved edits; then the next save creates it again.
+- Other failures keep the text, show `save failed — retrying` in the header and retry with a growing delay, and on the next edit.
+
+The header shows `saved · 2m ago`, `saving…`, `unsaved` or `save failed — retrying`. Notes with pending saves stay in memory until they are written, and an edit that arrives for a note just left is still saved to it.
+
+Line endings are kept as they are: each note is edited with the line separator it uses (`\n`, `\r\n` or `\r`, taken from its first line break), new lines and pasted text use it too, and a note that is shown but not edited is never rewritten.
+
+**Switching workspaces and closing.** Before another workspace opens, pending saves are written in the current one (waiting at most a few seconds). If some edits are still unsaved after that, because saving failed or took too long, the switch is refused: the current workspace and editor stay as they are and a notice names the notes. Closing the window works the same way, and also counts saves of a previous workspace that are still running. Trying the same action again right away goes ahead without the unsaved edits. That consent only covers the very next attempt: any edit, any successful save, or a check that finds nothing unsaved withdraws it.
+
+**New notes.** `Ctrl+N` (`Cmd+N` on macOS) or the `+ new note` button in the list pane creates an empty note in the selected project, or in `inbox/` when All tasks is selected (`src/lib/core/newNote.ts`). It is named `untitled.md`, then `untitled 2.md`, `untitled 3.md`…, skipping names already in the workspace (compared case-insensitively) or hidden by the ignore patterns. The file is written with `expectedHash: null`; if a file with that name appeared on disk meanwhile, the next name is tried, a few times at most. The note is added to the model, selected and opened with the editor focused right away, without waiting for the watcher; its autosave starts from the hash of that first write. A failure shows a notice and changes nothing else.
 
 ## Sync
 

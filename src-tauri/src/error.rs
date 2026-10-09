@@ -29,6 +29,8 @@ pub enum AppError {
     PermissionDenied(String),
     #[error("{0}")]
     TooLarge(String),
+    #[error("{0}")]
+    Conflict(String),
     #[error("superseded by a newer request to open a workspace")]
     Superseded,
     #[error("{0}")]
@@ -47,6 +49,7 @@ impl AppError {
             AppError::InvalidUtf8(_) => "InvalidUtf8",
             AppError::PermissionDenied(_) => "PermissionDenied",
             AppError::TooLarge(_) => "TooLarge",
+            AppError::Conflict(_) => "Conflict",
             AppError::Superseded => "Superseded",
             AppError::Io(_) => "Io",
         }
@@ -98,6 +101,12 @@ mod tests {
             json,
             serde_json::json!({ "kind": "NoWorkspace", "message": "no workspace is open" })
         );
+        let json = serde_json::to_value(AppError::Conflict("a.md already exists".into()))
+            .unwrap_or_default();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "Conflict", "message": "a.md already exists" })
+        );
     }
 
     #[test]
@@ -117,6 +126,7 @@ mod tests {
                 "PermissionDenied",
             ),
             (AppError::TooLarge(String::new()), "TooLarge"),
+            (AppError::Conflict(String::new()), "Conflict"),
             (AppError::Superseded, "Superseded"),
             (AppError::Io(String::new()), "Io"),
         ];

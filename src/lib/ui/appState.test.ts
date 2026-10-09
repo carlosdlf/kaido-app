@@ -342,7 +342,7 @@ describe("AppState selection", () => {
     const { storage, app } = await started();
     let release: () => void = () => undefined;
     vi.spyOn(storage, "readFile").mockImplementationOnce(
-      () => new Promise((resolve) => (release = () => resolve("late"))),
+      () => new Promise((resolve) => (release = () => resolve({ contents: "late", hash: "x" }))),
     );
     app.selectItem("api/deploy.md");
     app.selectItem("inbox/idea.md");
@@ -737,7 +737,10 @@ describe("AppState review fixes", () => {
     let releaseOld: () => void = () => undefined;
     vi.spyOn(storage, "readFile").mockImplementationOnce(
       (path) =>
-        new Promise((resolve) => (releaseOld = () => resolve(read(path).then(() => "old")))),
+        new Promise(
+          (resolve) =>
+            (releaseOld = () => resolve(read(path).then(() => ({ contents: "old", hash: "x" })))),
+        ),
     );
     app.selectItem("api/deploy.md");
     storage.setExternal("api/deploy.md", "# New");

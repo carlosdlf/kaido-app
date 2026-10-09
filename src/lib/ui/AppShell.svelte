@@ -8,11 +8,14 @@
     sidebarEntries,
     totalOpen,
   } from "$lib/core/views";
+  import { isNewNoteShortcut, newNoteShortcutLabels } from "$lib/core/newNote";
   import type { AppState } from "./appState.svelte";
   import EditorPane from "./EditorPane.svelte";
   import ListPane from "./ListPane.svelte";
   import Sidebar from "./Sidebar.svelte";
   import StartScreen from "./StartScreen.svelte";
+  import Toasts from "./Toasts.svelte";
+  import { isMac } from "./platform";
 
   let { app }: { app: AppState } = $props();
 
@@ -30,10 +33,30 @@
     app.phase.kind === "ready" ? (app.phase.root.split(/[\\/]/).filter(Boolean).pop() ?? "") : "",
   );
 
+  const mac = isMac();
+  const newNoteShortcut = newNoteShortcutLabels(mac);
+
   function pick() {
     void app.pickWorkspace();
   }
+
+  function createNote() {
+    void app.createNote();
+  }
+
+  function handleKeydown(event: KeyboardEvent) {
+    if (event.defaultPrevented || event.isComposing || !isNewNoteShortcut(event, mac)) return;
+    // Keep the webview from opening a window; holding the keys creates one note.
+    event.preventDefault();
+    if (event.repeat || app.phase.kind !== "ready") return;
+    createNote();
+  }
 </script>
+
+<!-- Save pending edits as soon as the user leaves the window. -->
+<svelte:window onblur={() => void app.flush()} onkeydown={handleKeydown} />
+
+<Toasts toasts={app.toasts} ondismiss={(id) => app.dismissToast(id)} />
 
 {#if app.phase.kind === "ready"}
   <div class="shell">
@@ -55,8 +78,16 @@
       {now}
       selected={app.item}
       onselect={(id) => app.selectItem(id)}
+      oncreate={createNote}
+      createShortcut={newNoteShortcut}
     />
-    <EditorPane doc={app.document} {now} />
+    <EditorPane
+      doc={app.document}
+      status={app.saveStatus}
+      {now}
+      focusRequest={app.editorFocusRequest}
+      onedit={(path, read) => app.edit(path, read)}
+    />
   </div>
 {:else if app.phase.kind === "no-workspace"}
   <StartScreen

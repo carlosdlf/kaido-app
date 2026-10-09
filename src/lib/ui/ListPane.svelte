@@ -15,9 +15,23 @@
     now: number;
     selected: string;
     onselect: (id: string) => void;
+    /** Creates a new note. */
+    oncreate: () => void;
+    /** The new note shortcut, for assistive technology and as a visible hint. */
+    createShortcut: { aria: string; hint: string };
   }
 
-  let { title, summary, items, emptyMessage, now, selected, onselect }: Props = $props();
+  let {
+    title,
+    summary,
+    items,
+    emptyMessage,
+    now,
+    selected,
+    onselect,
+    oncreate,
+    createShortcut,
+  }: Props = $props();
 
   /** Rows rendered above and below the visible ones. */
   const OVERSCAN = 8;
@@ -157,10 +171,16 @@
     {/if}
   </div>
 
-  <button type="button" class="row add" aria-keyshortcuts="Control+N">
+  <button
+    type="button"
+    class="row add"
+    aria-label="New note"
+    aria-keyshortcuts={createShortcut.aria}
+    onclick={oncreate}
+  >
     <span aria-hidden="true">+</span>
     <span class="name">new note</span>
-    <kbd aria-hidden="true">^N</kbd>
+    <kbd aria-hidden="true">{createShortcut.hint}</kbd>
   </button>
 </section>
 

@@ -52,7 +52,7 @@ export default defineConfig({
           name: "ui",
           include: ["src/lib/ui/**/*.test.ts", "src/App.test.ts"],
           environment: "jsdom",
-          setupFiles: ["@testing-library/jest-dom/vitest"],
+          setupFiles: ["src/lib/ui/testing/setup.ts"],
         },
       },
     ],

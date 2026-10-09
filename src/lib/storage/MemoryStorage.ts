@@ -3,7 +3,8 @@
  * browser. It follows the same rules as the desktop backend: relative paths,
  * Markdown-only listings that skip hidden folders and `node_modules`, and
  * change notifications (with fresh metadata) for writes and simulated
- * external edits of listed files and the workspace configuration.
+ * external edits of listed files and the workspace configuration, and
+ * conditional writes based on content hashes.
  */
 
 import {
@@ -12,9 +13,19 @@ import {
   type ChangeEvent,
   type FileEntry,
 } from "$lib/core/workspace";
+import { contentHash } from "./contentHash";
 import { StorageError } from "./errors";
 import { checkStoragePath, MAX_FILE_BYTES } from "./paths";
-import type { ChangeListener, OpenedWorkspace, Storage, Unsubscribe } from "./types";
+import type {
+  ChangeListener,
+  CloseHandler,
+  FileContents,
+  OpenedWorkspace,
+  Storage,
+  Unsubscribe,
+  WriteOptions,
+  WrittenFile,
+} from "./types";
 
 interface StoredFile {
   contents: string;
@@ -54,6 +65,7 @@ export class MemoryStorage implements Storage {
   pick: string | null;
   root: string | null = null;
   readonly #listeners = new Set<ChangeListener>();
+  #closeHandler: CloseHandler | null = null;
   readonly #now: () => number;
   readonly #echoWrites: boolean;
 
@@ -117,31 +129,46 @@ export class MemoryStorage implements Storage {
     return entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   }
 
-  async readFile(path: string): Promise<string> {
+  async readFile(path: string): Promise<FileContents> {
     checkStoragePath(path);
     const file = this.#files().get(path);
     if (!file) throw new StorageError("NotFound", `${path} does not exist.`);
     if (byteLength(file.contents) > MAX_FILE_BYTES) {
       throw new StorageError("TooLarge", `${path} is larger than 8 MiB.`);
     }
-    return file.contents;
+    return { contents: file.contents, hash: contentHash(file.contents) };
   }
 
-  async writeFile(path: string, contents: string): Promise<FileEntry> {
+  async writeFile(
+    path: string,
+    contents: string,
+    options: WriteOptions = {},
+  ): Promise<WrittenFile> {
     checkStoragePath(path);
     const files = this.#files();
     if (byteLength(contents) > MAX_FILE_BYTES) {
       throw new StorageError("TooLarge", "The contents are larger than 8 MiB.");
     }
-    if (files.get(path)?.readOnly) {
+    const existing = files.get(path);
+    if (existing?.readOnly) {
       throw new StorageError("PermissionDenied", `${path} is read-only.`);
+    }
+    const expected = options.expectedHash;
+    if (expected === null && existing) {
+      throw new StorageError("Conflict", `${path} already exists.`);
+    }
+    if (
+      typeof expected === "string" &&
+      (!existing || contentHash(existing.contents) !== expected)
+    ) {
+      throw new StorageError("Conflict", `${path} changed on disk.`);
     }
     const file = { contents, modified: this.#now() };
     files.set(path, file);
     if (this.#echoWrites) {
       queueMicrotask(() => this.emitChange({ paths: [path] }));
     }
-    return this.#entry(path, file);
+    return { ...this.#entry(path, file), hash: contentHash(contents) };
   }
 
   async readSettings(): Promise<string | null> {
@@ -157,6 +184,18 @@ export class MemoryStorage implements Storage {
     return () => {
       this.#listeners.delete(listener);
     };
+  }
+
+  async onCloseRequested(handler: CloseHandler): Promise<Unsubscribe> {
+    this.#closeHandler = handler;
+    return () => {
+      if (this.#closeHandler === handler) this.#closeHandler = null;
+    };
+  }
+
+  /** Simulates the user closing the window; resolves to whether it may close. */
+  async requestClose(): Promise<boolean> {
+    return this.#closeHandler ? this.#closeHandler() : true;
   }
 
   /** Notifies watchers, as the file watcher would. */

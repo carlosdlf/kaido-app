@@ -1,5 +1,7 @@
-import { render, screen, within } from "@testing-library/svelte";
+import { createEvent, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import userEvent from "@testing-library/user-event";
+import { undo } from "@codemirror/commands";
+import { EditorView } from "@codemirror/view";
 import { describe, expect, it, vi } from "vitest";
 import { MemoryStorage, StorageError } from "$lib/storage";
 import { AppState } from "./appState.svelte";
@@ -46,7 +48,7 @@ function setup(
         : options.settings,
     pick: options.pick ?? null,
   });
-  const app = new AppState(storage, { defer: (task) => task() });
+  const app = new AppState(storage, { defer: (task) => task(), saveDelay: 10 });
   render(AppShell, { app });
   return { storage, app };
 }
@@ -62,6 +64,19 @@ async function ready(options: Parameters<typeof setup>[0] = {}) {
 const nav = () => within(screen.getByRole("navigation", { name: "Workspace" }));
 const list = () => within(screen.getByRole("region"));
 const editor = () => within(screen.getByRole("main", { name: "Editor" }));
+const textbox = () => editor().getByRole("textbox", { name: "Note text", hidden: true });
+const editorText = () => {
+  const view = EditorView.findFromDOM(textbox());
+  if (!view) throw new Error("No editor view");
+  return view;
+};
+/** Types at the end of the note, like a user would. */
+const typeAtEnd = (text: string) => {
+  const view = editorText();
+  view.dispatch({ changes: { from: view.state.doc.length, insert: text }, userEvent: "input" });
+};
+const fileText = async (storage: MemoryStorage, path: string) =>
+  (await storage.readFile(path)).contents;
 
 describe("AppShell without a workspace", () => {
   it("offers to open a folder and remembers the choice", async () => {
@@ -133,11 +148,11 @@ describe("AppShell with a workspace", () => {
     expect(screen.getByText("~/notes")).toBeInTheDocument();
     expect(list().getByRole("heading", { name: "~/inbox" })).toBeInTheDocument();
     expect(list().getByText("1 note · 2 tasks")).toBeInTheDocument();
-    expect(editor().getAllByRole("checkbox")).toHaveLength(3);
-    expect(editor().getByText("#ops")).toHaveClass("tag");
+    expect(editorText().state.doc.toString()).toBe(files["inbox/tasks.md"]);
+    expect(textbox()).toHaveTextContent("- [ ] renew TLS #ops");
   });
 
-  it("shows note names, titles and a read-only note", async () => {
+  it("shows note names, titles and the note in the editor", async () => {
     const user = userEvent.setup();
     await ready();
     await user.click(nav().getByRole("button", { name: /api-payments/ }));
@@ -146,22 +161,28 @@ describe("AppShell with a workspace", () => {
     ).toBeInTheDocument();
 
     await user.click(list().getByRole("button", { name: /deploy\.md/ }));
-    expect(await editor().findByRole("heading", { level: 1 })).toHaveTextContent("Deploy");
-    expect(editor().getByRole("heading", { level: 2 })).toHaveTextContent("Release");
-    expect(editor().getByRole("heading", { level: 3 })).toHaveTextContent("Notes");
-    expect(editor().getByText("main").tagName).toBe("CODE");
-    expect(editor().getByText("pnpm build").tagName).toBe("PRE");
-    expect(editor().getByText("first")).toBeInTheDocument();
-    const boxes = editor().getAllByRole<HTMLInputElement>("checkbox");
-    expect(boxes.map((box) => box.checked)).toEqual([true, false]);
-    expect(editor().getByText(/read-only/)).toBeInTheDocument();
+    await vi.waitFor(() => expect(textbox()).toHaveTextContent("# Deploy"));
+    const content = textbox();
+    // Markers stay visible, dimmed, inside sized headings.
+    const text = (selector: string) =>
+      [...content.querySelectorAll(selector)].map((element) => element.textContent).join("");
+    expect(text(".cm-md-h1")).toBe("# Deploy");
+    expect(text(".cm-md-h1.cm-md-mark")).toBe("#");
+    expect(text(".cm-md-h2")).toBe("## Release");
+    expect(content.querySelector(".cm-md-code")).toHaveTextContent("main");
+    expect(content.querySelector(".cm-md-codeblock")).toHaveTextContent("```sh");
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(editor().getByText(/^saved · /)).toBeInTheDocument();
+    expect(editor().getByText("deploy.md")).toBeInTheDocument();
   });
 
   it("shows an empty note", async () => {
     const user = userEvent.setup();
     await ready();
     await user.click(nav().getByRole("button", { name: /dotfiles/ }));
-    expect(await editor().findByText("This note is empty.")).toBeInTheDocument();
+    await vi.waitFor(() => expect(editor().getByText("bootstrap.md")).toBeInTheDocument());
+    expect(textbox()).toBeVisible();
+    expect(editorText().state.doc.length).toBe(0);
   });
 
   it("shows an empty workspace", async () => {
@@ -207,7 +228,7 @@ describe("AppShell with a workspace", () => {
     expect(tasks).toHaveFocus();
     expect(tasks).toHaveAttribute("aria-current", "true");
     await user.keyboard("{Enter}");
-    expect(await editor().findAllByRole("checkbox")).toHaveLength(3);
+    await vi.waitFor(() => expect(textbox()).toHaveTextContent("try pino"));
   });
 
   it("ignores arrow keys on buttons that are not folders", async () => {
@@ -224,7 +245,7 @@ describe("AppShell with a workspace", () => {
     const { storage, app } = await ready();
     storage.setExternal("inbox/tasks.md", "- [ ] a\n- [ ] b\n- [ ] c\n- [ ] d\n");
     await app.settled();
-    expect(await editor().findAllByRole("checkbox")).toHaveLength(4);
+    await vi.waitFor(() => expect(textbox()).toHaveTextContent("- [ ] d"));
     expect(nav().getByRole("button", { name: /inbox/ })).toHaveTextContent("[4]");
   });
 
@@ -314,5 +335,165 @@ describe("AppShell with a workspace", () => {
     await user.click(within(notice).getByRole("button", { name: "Open folder…" }));
     await app.settled();
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+describe("AppShell editing", () => {
+  it("saves typed text and shows the save state", async () => {
+    const { storage } = await ready();
+    typeAtEnd("- [ ] new task\n");
+    expect(await editor().findByText("unsaved")).toBeInTheDocument();
+    await vi.waitFor(async () =>
+      expect(await fileText(storage, "inbox/tasks.md")).toContain("- [ ] new task"),
+    );
+    await vi.waitFor(() => expect(editor().getByText("saved · just now")).toBeInTheDocument());
+    await vi.waitFor(() =>
+      expect(nav().getByRole("button", { name: /inbox/ })).toHaveTextContent("[3]"),
+    );
+  });
+
+  it("keeps the line breaks of a CRLF note", async () => {
+    const crlf = "- [ ] one\r\n- [ ] two\r\n";
+    const { storage } = await ready({ files: { "inbox/tasks.md": crlf } });
+    await vi.waitFor(() => expect(textbox()).toHaveTextContent("- [ ] two"));
+    expect(editor().getByText(/^saved · /)).toBeInTheDocument();
+    expect(undo(editorText())).toBe(false);
+    typeAtEnd("x");
+    await vi.waitFor(async () =>
+      expect(await fileText(storage, "inbox/tasks.md")).toBe(`${crlf}x`),
+    );
+  });
+
+  it("keeps undo history when switching notes", async () => {
+    const user = userEvent.setup();
+    const { storage } = await ready();
+    typeAtEnd("extra");
+    await user.click(list().getByRole("button", { name: /reading-list\.md/ }));
+    await vi.waitFor(() => expect(textbox()).toHaveTextContent("# Reading list"));
+    // Switching saved the first note right away.
+    expect(await fileText(storage, "inbox/tasks.md")).toContain("extra");
+
+    await user.click(list().getByRole("button", { name: /tasks\.md/ }));
+    await vi.waitFor(() => expect(textbox()).toHaveTextContent("extra"));
+    expect(undo(editorText())).toBe(true);
+    expect(editorText().state.doc.toString()).toBe(files["inbox/tasks.md"]);
+    await vi.waitFor(async () =>
+      expect(await fileText(storage, "inbox/tasks.md")).toBe(files["inbox/tasks.md"]),
+    );
+  });
+
+  it("saves when the window loses focus", async () => {
+    const storage = new MemoryStorage({
+      folders: { [ROOT]: { ...files } },
+      settings: JSON.stringify({ version: 1, workspace: ROOT }),
+    });
+    const app = new AppState(storage, { defer: (task) => task(), saveDelay: 60_000 });
+    render(AppShell, { app });
+    await app.start();
+    await app.settled();
+    await vi.waitFor(() => expect(textbox()).toBeInTheDocument());
+    typeAtEnd("on blur");
+    window.dispatchEvent(new FocusEvent("blur"));
+    await vi.waitFor(async () =>
+      expect(await fileText(storage, "inbox/tasks.md")).toContain("on blur"),
+    );
+  });
+
+  it("keeps both versions on a conflict and says so", async () => {
+    const user = userEvent.setup();
+    const { storage, app } = await ready();
+    vi.spyOn(storage, "writeFile").mockRejectedValueOnce(new StorageError("Io", "disk busy"));
+    typeAtEnd("mine");
+    expect(
+      await editor().findByText("save failed — retrying", {}, { timeout: 2_000 }),
+    ).toHaveAttribute("title", "disk busy");
+    storage.setExternal("inbox/tasks.md", "theirs\n");
+    await app.settled();
+    const toast = await screen.findByText(
+      /^Changed outside Kaido — the other version was saved as tasks \(conflict \d{4}-\d\d-\d\d \d{4}\)\.md$/,
+    );
+    expect(toast.closest("[role=status]")).not.toBeNull();
+    expect(await fileText(storage, "inbox/tasks.md")).toContain("mine");
+    expect(editorText().state.doc.toString()).toContain("mine");
+    await user.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByText(/Changed outside Kaido/)).toBeNull();
+  });
+
+  it("hides the editor for a missing note", async () => {
+    const { storage, app } = await ready();
+    storage.setExternal("inbox/tasks.md", null);
+    await app.settled();
+    expect(await editor().findByRole("status")).toHaveTextContent("This file no longer exists.");
+    expect(textbox()).not.toBeVisible();
+  });
+});
+
+describe("AppShell new note", () => {
+  it("creates a note with Ctrl+N and focuses the editor", async () => {
+    const user = userEvent.setup();
+    const { storage, app } = await ready();
+    await user.click(nav().getByRole("button", { name: /api-payments/ }));
+    await app.settled();
+
+    await user.keyboard("{Control>}n{/Control}");
+    await app.settled();
+
+    expect(await fileText(storage, "api-payments/untitled.md")).toBe("");
+    expect(list().getByRole("button", { name: /untitled\.md/ })).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+    expect(editor().getByText("untitled.md")).toBeInTheDocument();
+    await waitFor(() => expect(textbox()).toHaveFocus());
+
+    // Typing goes straight into the new note and is saved.
+    typeAtEnd("# Plan");
+    await waitFor(async () =>
+      expect(await fileText(storage, "api-payments/untitled.md")).toBe("# Plan"),
+    );
+  });
+
+  it("works while typing in the editor and ignores held keys", async () => {
+    const { app } = await ready();
+    const create = vi.spyOn(app, "createNote");
+    textbox().focus();
+    fireEvent.keyDown(textbox(), { key: "n", ctrlKey: true, repeat: true });
+    expect(create).not.toHaveBeenCalled();
+    const event = createEvent.keyDown(textbox(), { key: "n", ctrlKey: true });
+    fireEvent(textbox(), event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(create).toHaveBeenCalledOnce();
+    await app.settled();
+    // Other modifiers are left alone.
+    fireEvent.keyDown(window, { key: "n", ctrlKey: true, shiftKey: true });
+    fireEvent.keyDown(window, { key: "n", metaKey: true });
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it("creates a note in the inbox from the button", async () => {
+    const user = userEvent.setup();
+    const { storage, app } = await ready();
+    await user.click(nav().getByRole("button", { name: /all-tasks/ }));
+    const button = list().getByRole("button", { name: "New note" });
+    expect(button).toHaveAttribute("aria-keyshortcuts", "Control+N");
+    await user.click(button);
+    await app.settled();
+    expect(await fileText(storage, "inbox/untitled.md")).toBe("");
+    expect(app.folder).toBe("inbox");
+    await waitFor(() => expect(textbox()).toHaveFocus());
+  });
+
+  it("shows a toast when the note cannot be created", async () => {
+    const user = userEvent.setup();
+    const { storage, app } = await ready();
+    vi.spyOn(storage, "writeFile").mockRejectedValueOnce(
+      new StorageError("PermissionDenied", "inbox is read-only."),
+    );
+    await user.click(list().getByRole("button", { name: "New note" }));
+    await app.settled();
+    expect(
+      await screen.findByText("The note could not be created: inbox is read-only."),
+    ).toBeInTheDocument();
+    expect(app.item).toBe("inbox/tasks.md");
   });
 });

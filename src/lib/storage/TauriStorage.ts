@@ -2,15 +2,32 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as v from "valibot";
 import type { ChangeEvent, FileEntry } from "$lib/core/workspace";
 import { StorageError, toStorageError } from "./errors";
-import type { ChangeListener, OpenedWorkspace, Storage, Unsubscribe } from "./types";
+import type {
+  ChangeListener,
+  CloseHandler,
+  FileContents,
+  OpenedWorkspace,
+  Storage,
+  Unsubscribe,
+  WriteOptions,
+  WrittenFile,
+} from "./types";
 
 export const CHANGE_EVENT = "workspace://changed";
 
 const FileEntrySchema = v.object({ path: v.string(), size: v.number(), modified: v.number() });
 const OpenedSchema = v.object({ root: v.string() });
+const FileContentsSchema = v.object({ contents: v.string(), hash: v.string() });
+const WrittenFileSchema = v.object({
+  path: v.string(),
+  size: v.number(),
+  modified: v.number(),
+  hash: v.string(),
+});
 const ChangeEventSchema = v.object({
   paths: v.array(v.string()),
   entries: v.array(FileEntrySchema),
@@ -36,6 +53,21 @@ async function call<T>(
   return parsed.output;
 }
 
+/**
+ * Arguments of `write_file`. The `expectedHash` key is left out for an
+ * unconditional write, `null` means create only, and a string must match
+ * the hash of the file on disk.
+ */
+export function writeFileArgs(
+  path: string,
+  contents: string,
+  options: WriteOptions = {},
+): Record<string, unknown> {
+  const args: Record<string, unknown> = { path, contents };
+  if (options.expectedHash !== undefined) args["expectedHash"] = options.expectedHash;
+  return args;
+}
+
 export class TauriStorage implements Storage {
   pickWorkspaceFolder(): Promise<string | null> {
     return call(OptionalString, "pick_workspace_folder");
@@ -49,12 +81,12 @@ export class TauriStorage implements Storage {
     return call(v.array(FileEntrySchema), "list_files");
   }
 
-  readFile(path: string): Promise<string> {
-    return call(v.string(), "read_file", { path });
+  readFile(path: string): Promise<FileContents> {
+    return call(FileContentsSchema, "read_file", { path });
   }
 
-  writeFile(path: string, contents: string): Promise<FileEntry> {
-    return call(FileEntrySchema, "write_file", { path, contents });
+  writeFile(path: string, contents: string, options?: WriteOptions): Promise<WrittenFile> {
+    return call(WrittenFileSchema, "write_file", writeFileArgs(path, contents, options));
   }
 
   readSettings(): Promise<string | null> {
@@ -74,6 +106,22 @@ export class TauriStorage implements Storage {
           ? parsed.output
           : { paths: [], entries: [], rescan: true };
         listener(change);
+      });
+    } catch (error) {
+      throw toStorageError(error);
+    }
+  }
+
+  async onCloseRequested(handler: CloseHandler): Promise<Unsubscribe> {
+    try {
+      return await getCurrentWindow().onCloseRequested(async (event) => {
+        let close = true;
+        try {
+          close = await handler();
+        } catch {
+          // A failing handler must never trap the user in the app.
+        }
+        if (!close) event.preventDefault();
       });
     } catch (error) {
       throw toStorageError(error);

@@ -10,6 +10,7 @@ export const STORAGE_ERROR_KINDS = [
   "TooLarge",
   "Superseded",
   "PermissionDenied",
+  "Conflict",
   "Io",
 ] as const;
 

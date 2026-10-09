@@ -3,12 +3,12 @@
 //! blocking thread so the UI never waits on disk I/O.
 
 use serde::Serialize;
-use tauri::ipc::Invoke;
+use tauri::ipc::{Invoke, InvokeBody, Request};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::error::{AppError, AppResult};
-use crate::fs_ops::{self, FileEntry};
+use crate::fs_ops::{self, FileContents, FileEntry, WriteCondition, WrittenFile};
 use crate::settings::{self, SettingsDir};
 use crate::state::AppState;
 
@@ -85,19 +85,48 @@ pub async fn list_files(state: State<'_, AppState>) -> AppResult<Vec<FileEntry>>
 }
 
 #[tauri::command]
-pub async fn read_file(state: State<'_, AppState>, path: String) -> AppResult<String> {
+pub async fn read_file(state: State<'_, AppState>, path: String) -> AppResult<FileContents> {
     let root = state.root()?;
     blocking(move || fs_ops::read_file(&root, &path)).await
+}
+
+/// Name of the optional `write_file` argument holding the write condition.
+const EXPECTED_HASH_KEY: &str = "expectedHash";
+
+/// Reads the `expectedHash` argument of `write_file` from the raw request.
+///
+/// The argument has three states: missing (unconditional write), `null`
+/// (create only) and a string (replace only if the current hash matches).
+/// Tauri deserializes a missing key and `null` both as `None`, even for a
+/// nested `Option<Option<_>>`, so the request body is inspected directly to
+/// tell them apart. Any other JSON type is rejected.
+fn write_condition(body: &InvokeBody) -> AppResult<WriteCondition> {
+    let value = match body {
+        InvokeBody::Json(args) => args.get(EXPECTED_HASH_KEY),
+        InvokeBody::Raw(_) => None,
+    };
+    match value {
+        None => Ok(WriteCondition::Unconditional),
+        Some(serde_json::Value::Null) => Ok(WriteCondition::CreateOnly),
+        Some(serde_json::Value::String(hash)) => Ok(WriteCondition::Matches(hash.clone())),
+        // No error kind describes a malformed request, and `InvalidPath`
+        // would point at the wrong argument; the message says what is wrong.
+        Some(_) => Err(AppError::Io(format!(
+            "invalid write_file request: {EXPECTED_HASH_KEY} must be a string or null"
+        ))),
+    }
 }
 
 #[tauri::command]
 pub async fn write_file(
     state: State<'_, AppState>,
+    request: Request<'_>,
     path: String,
     contents: String,
-) -> AppResult<FileEntry> {
+) -> AppResult<WrittenFile> {
+    let condition = write_condition(request.body())?;
     let root = state.root()?;
-    blocking(move || fs_ops::write_file(&root, &path, &contents)).await
+    blocking(move || fs_ops::write_file(&root, &path, &contents, &condition)).await
 }
 
 #[tauri::command]
@@ -234,14 +263,19 @@ mod tests {
         assert_eq!(entry["path"], "inbox/note.md");
         assert_eq!(entry["size"], 5);
         assert!(entry["modified"].as_u64().unwrap() > 0);
+        let hash = fs_ops::content_hash(b"# Hi\n");
+        assert_eq!(entry["hash"], hash);
 
-        let text = invoke(
+        let read = invoke(
             &webview,
             "read_file",
             serde_json::json!({ "path": "inbox/note.md" }),
         )
         .unwrap();
-        assert_eq!(text, "# Hi\n");
+        assert_eq!(
+            read,
+            serde_json::json!({ "contents": "# Hi\n", "hash": hash })
+        );
 
         let list = invoke(&webview, "list_files", serde_json::json!({})).unwrap();
         assert_eq!(list.as_array().unwrap().len(), 1);
@@ -269,6 +303,78 @@ mod tests {
             entries.iter().any(|e| e["path"] == "inbox/note.md"),
             "{payload}"
         );
+    }
+
+    #[test]
+    fn expected_hash_argument_has_three_states() {
+        let condition = |args: serde_json::Value| write_condition(&InvokeBody::Json(args));
+        let base = serde_json::json!({ "path": "a.md", "contents": "x" });
+        assert_eq!(condition(base).unwrap(), WriteCondition::Unconditional);
+        let null = serde_json::json!({ "path": "a.md", "contents": "x", "expectedHash": null });
+        assert_eq!(condition(null).unwrap(), WriteCondition::CreateOnly);
+        let hash = serde_json::json!({ "path": "a.md", "contents": "x", "expectedHash": "ab" });
+        assert_eq!(
+            condition(hash).unwrap(),
+            WriteCondition::Matches("ab".into())
+        );
+        for bad in [
+            serde_json::json!(1),
+            serde_json::json!({}),
+            serde_json::json!([]),
+        ] {
+            let err = condition(serde_json::json!({ "expectedHash": bad })).unwrap_err();
+            assert_eq!(err.kind(), "Io");
+            assert_eq!(
+                err.to_string(),
+                "invalid write_file request: expectedHash must be a string or null"
+            );
+        }
+        assert_eq!(
+            write_condition(&InvokeBody::Raw(Vec::new())).unwrap(),
+            WriteCondition::Unconditional
+        );
+    }
+
+    #[test]
+    fn conditional_writes_through_ipc() {
+        let (_app, webview, _settings) = app();
+        let dir = tempfile::tempdir().unwrap();
+        let open = serde_json::json!({ "path": dir.path() });
+        invoke(&webview, "open_workspace", open).unwrap();
+        let write = |args: serde_json::Value| invoke(&webview, "write_file", args);
+
+        let created = write(serde_json::json!({
+            "path": "a.md", "contents": "one", "expectedHash": null
+        }))
+        .unwrap();
+        assert_eq!(created["hash"], fs_ops::content_hash(b"one"));
+        let again = write(serde_json::json!({
+            "path": "a.md", "contents": "two", "expectedHash": null
+        }));
+        assert_eq!(error_kind(again), "Conflict");
+
+        let replaced = write(serde_json::json!({
+            "path": "a.md", "contents": "two", "expectedHash": created["hash"]
+        }))
+        .unwrap();
+        assert_eq!(replaced["hash"], fs_ops::content_hash(b"two"));
+        let stale = write(serde_json::json!({
+            "path": "a.md", "contents": "three", "expectedHash": created["hash"]
+        }));
+        assert_eq!(error_kind(stale), "Conflict");
+        let missing = write(serde_json::json!({
+            "path": "b.md", "contents": "x", "expectedHash": created["hash"]
+        }));
+        assert_eq!(error_kind(missing), "Conflict");
+        let bad = write(serde_json::json!({
+            "path": "a.md", "contents": "x", "expectedHash": 7
+        }));
+        assert_eq!(error_kind(bad), "Io");
+
+        write(serde_json::json!({ "path": "a.md", "contents": "four" })).unwrap();
+        let read = invoke(&webview, "read_file", serde_json::json!({ "path": "a.md" })).unwrap();
+        assert_eq!(read["contents"], "four");
+        assert!(!dir.path().join("b.md").exists());
     }
 
     #[test]

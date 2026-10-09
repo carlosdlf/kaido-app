@@ -713,7 +713,13 @@ mod tests {
         fs::write(root.join("p/image.png"), "x").unwrap();
         fs::write(root.join(".git/index.md"), "x").unwrap();
         fs::write(root.join("node_modules/readme.md"), "x").unwrap();
-        crate::fs_ops::write_file(&root, "p/c.md", "c").unwrap();
+        crate::fs_ops::write_file(
+            &root,
+            "p/c.md",
+            "c",
+            &crate::fs_ops::WriteCondition::Unconditional,
+        )
+        .unwrap();
 
         let expected: BTreeSet<String> = ["p/a.md", "p/b.MD", "p/c.md"]
             .iter()
@@ -884,7 +890,13 @@ mod tests {
         fs::create_dir(root.join(".kaido/cache")).unwrap();
         fs::write(root.join(".kaido/cache/index.json"), "x").unwrap();
         fs::write(root.join(".kaido/other.json"), "x").unwrap();
-        crate::fs_ops::write_file(&root, ".kaido/config.json", r#"{"version":1}"#).unwrap();
+        crate::fs_ops::write_file(
+            &root,
+            ".kaido/config.json",
+            r#"{"version":1}"#,
+            &crate::fs_ops::WriteCondition::Unconditional,
+        )
+        .unwrap();
 
         let has_entry = |b: &[ChangeBatch]| {
             b.iter().any(|b| {
