@@ -90,6 +90,8 @@
   --pane-header-height: 41px;
   --note-max-width: 720px;
   --checkbox-size: 15px;
+  /* Line icons (Lucide), drawn with the current text color. */
+  --icon-size: 14px;
   --selection-bar-width: 2px;
   --focus-ring-width: 2px;
 

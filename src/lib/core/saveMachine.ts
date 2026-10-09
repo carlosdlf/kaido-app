@@ -12,8 +12,10 @@
  * When the file changes on disk:
  * - the same hash as the base is the echo of our own write and is ignored;
  * - without unsaved edits the new version replaces the buffer;
- * - with unsaved edits both versions are kept: the disk version is written
- *   to a conflict copy next to the file and the buffer then replaces it.
+ * - with unsaved edits, a session with a `rebase` hook first tries (once) to
+ *   apply its edits again on top of the disk version; otherwise both
+ *   versions are kept: the disk version is written to a conflict copy next
+ *   to the file and the buffer then replaces it.
  *
  * Renaming or deleting the file runs as an exclusive step (`exclusive`)
  * after pending edits are saved, so no write races it; a rename then moves
@@ -78,6 +80,8 @@ export interface SaveEvents {
   removed?(): void;
   /** The disk version was kept as `copyPath` before the buffer replaced it. */
   conflict?(copyPath: string): void;
+  /** The buffer's edits were applied again on top of a newer disk version (see `rebase`). */
+  rebased?(contents: string): void;
 }
 
 export interface SaveSessionOptions {
@@ -92,6 +96,12 @@ export interface SaveSessionOptions {
   events?: SaveEvents;
   saveDelay?: number;
   retryDelays?: readonly number[];
+  /**
+   * Applies the session's edits again on top of a newer disk version found
+   * by a conflict; returns the new buffer, or `null` if they no longer
+   * apply. Tried once per session, before a conflict copy is written.
+   */
+  rebase?: (disk: string) => string | null;
 }
 
 const MARKDOWN_EXTENSION = /\.md$/i;
@@ -180,6 +190,8 @@ export class SaveSession {
   readonly #events: SaveEvents;
   readonly #saveDelay: number;
   readonly #retryDelays: readonly number[];
+  readonly #rebase: ((disk: string) => string | null) | null;
+  #rebaseTried = false;
 
   #timer: TimerHandle = null;
   #timerSet = false;
@@ -203,6 +215,7 @@ export class SaveSession {
     this.#events = options.events ?? {};
     this.#saveDelay = options.saveDelay ?? SAVE_DELAY_MS;
     this.#retryDelays = options.retryDelays ?? RETRY_DELAYS_MS;
+    this.#rebase = options.rebase ?? null;
   }
 
   /** Path of the document; changes with `moveTo`. */
@@ -429,7 +442,7 @@ export class SaveSession {
         this.#fail(disk.message);
         return;
       }
-      const contents = this.text;
+      let contents = this.text;
       let expected: string | null = null;
       if (disk.kind === "ok") {
         if (disk.contents === contents) {
@@ -437,8 +450,20 @@ export class SaveSession {
           this.#settle();
           return;
         }
-        // A version that is already the base was kept before (or is ours).
-        if (disk.hash !== this.#baseHash) {
+        const rebased = disk.hash === this.#baseHash ? null : this.#tryRebase(disk.contents);
+        if (rebased !== null) {
+          // The edits now sit on top of the disk version; nothing to keep aside.
+          this.#adopt(disk.contents, disk.hash);
+          this.#buffer = rebased;
+          this.#pending = null;
+          contents = rebased;
+          this.#events.rebased?.(rebased);
+          if (rebased === disk.contents) {
+            this.#settle();
+            return;
+          }
+        } else if (disk.hash !== this.#baseHash) {
+          // A version that is already the base was kept before (or is ours).
           const copy = await this.#writeCopy(disk.contents);
           if (this.#disposed) return;
           if (copy.kind === "error") {
@@ -466,6 +491,16 @@ export class SaveSession {
       disk = null;
     }
     this.#fail("The file keeps changing on disk.");
+  }
+
+  #tryRebase(disk: string): string | null {
+    if (this.#rebase === null || this.#rebaseTried) return null;
+    this.#rebaseTried = true;
+    try {
+      return this.#rebase(disk);
+    } catch {
+      return null;
+    }
   }
 
   async #writeCopy(

@@ -1,6 +1,7 @@
 /** What the sidebar and list pane show for a workspace model. */
 
-import { countOpenTasks, fileStem, noteTitle } from "./markdown";
+import { fileStem, noteTitle } from "./markdown";
+import { openTaskCount, parseTaskDocument, type TaskDocument } from "./taskDocument";
 import { INBOX, isTaskListPath, type Project, type Workspace } from "./workspace";
 
 /** Sidebar entry that groups the task lists of every project. */
@@ -68,16 +69,33 @@ function tasksItem(project: Project, label: string, summaries: Summaries): ListI
   ];
 }
 
-/** Items in the list pane: the task list first, then notes. */
+/** Label of the All tasks entry in the list pane. */
+export const ALL_TASKS_LABEL = "all open tasks";
+
+function taskListItems(workspace: Workspace, summaries: Summaries): ListItem[] {
+  return workspace.projects
+    .filter((project) => openCount(project, summaries) !== 0)
+    .flatMap((project) => tasksItem(project, `${project.name}/tasks.md`, summaries));
+}
+
+/**
+ * Items in the list pane: the task list first, then notes. In All tasks,
+ * the combined view (id `ALL_TASKS`) comes first, then each task list with
+ * open (or not yet counted) tasks.
+ */
 export function listItems(
   workspace: Workspace,
   selection: string,
   summaries: Summaries,
 ): ListItem[] {
   if (selection === ALL_TASKS) {
-    return workspace.projects
-      .filter((project) => openCount(project, summaries) !== 0)
-      .flatMap((project) => tasksItem(project, `${project.name}/tasks.md`, summaries));
+    const all: ListItem = {
+      kind: "tasks",
+      id: ALL_TASKS,
+      label: ALL_TASKS_LABEL,
+      openCount: totalOpen(sidebarEntries(workspace, summaries)),
+    };
+    return [all, ...taskListItems(workspace, summaries)];
   }
   const project = workspace.projects.find((candidate) => candidate.name === selection);
   if (!project) return [];
@@ -108,13 +126,20 @@ function countLabel(count: number | null, word: string): string {
 
 export function listSummary(workspace: Workspace, selection: string, summaries: Summaries): string {
   if (selection === ALL_TASKS) {
-    const lists = listItems(workspace, ALL_TASKS, summaries).length;
+    const lists = taskListItems(workspace, summaries).length;
     const open = totalOpen(sidebarEntries(workspace, summaries));
     return `${open ?? "…"} open · ${lists} ${lists === 1 ? "list" : "lists"}`;
   }
   const project = workspace.projects.find((candidate) => candidate.name === selection);
   if (!project) return "";
   return `${plural(project.notes.length, "note")} · ${countLabel(openCount(project, summaries), "task")}`;
+}
+
+const CONFLICT_COPY = / \(conflict \d{4}-\d{2}-\d{2} \d{4}\)( \d+)?\.md$/i;
+
+/** Whether a note name is a conflict copy kept after a save conflict (`name (conflict …).md`). */
+export function isConflictCopy(name: string): boolean {
+  return CONFLICT_COPY.test(name);
 }
 
 /** Splits a workspace path into the folder part and the file name, for headers. */
@@ -152,12 +177,14 @@ export function pathsToSummarize(
 /** Files above this size are not read for list summaries. */
 export const MAX_SUMMARY_BYTES = 1024 * 1024;
 
-/** Title and open task count of a file. Tasks are only counted in task lists. */
-export function summarizeFile(path: string, text: string): FileSummary {
-  return {
-    title: noteTitle(path, text),
-    openTasks: isTaskListPath(path) ? countOpenTasks(text) : 0,
-  };
+/**
+ * Title and open task count of a file. Tasks are only counted in task lists,
+ * from `tasks` when the list was already parsed.
+ */
+export function summarizeFile(path: string, text: string, tasks?: TaskDocument): FileSummary {
+  if (!isTaskListPath(path)) return { title: noteTitle(path, text), openTasks: 0 };
+  const doc = tasks?.text === text ? tasks : parseTaskDocument(text);
+  return { title: noteTitle(path, text), openTasks: openTaskCount(doc) };
 }
 
 /** Summary for a file that is too large to read for the list. */

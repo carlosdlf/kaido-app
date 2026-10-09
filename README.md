@@ -38,8 +38,8 @@ Kaido is a small, fast desktop app for the notes and task lists you keep while y
 
 | | |
 |---|---|
-| ✅ Available | Open any folder as a workspace · projects and notes from your folder structure · Markdown editor with autosave · new notes (`Ctrl+N`) · rename and delete with undo · table editing · picks up changes made by other editors |
-| 🚧 Next | Task lists with keyboard shortcuts · **All tasks** view across projects · background git sync |
+| ✅ Available | Open any folder as a workspace · projects and notes from your folder structure · Markdown editor with autosave · new notes (`Ctrl+N`) and projects (`Ctrl+Shift+N`) · rename and delete with undo · table editing · task lists with keyboard shortcuts, subtasks, detail and done tasks kept in place · notes linked from tasks · **All tasks** view across projects · picks up changes made by other editors |
+| 🚧 Next | Background git sync |
 | 🗺️ Planned | Command palette (`Ctrl+K`) and instant search · global quick-capture shortcut · links between notes and per-note history · due dates and reminders · a CLI · web and mobile apps |
 
 ## How it works

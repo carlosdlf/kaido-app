@@ -4,7 +4,11 @@
   import { stemLength } from "$lib/core/noteNames";
   import { baseName } from "$lib/core/saveMachine";
   import { formatAge } from "$lib/core/time";
-  import type { ListItem } from "$lib/core/views";
+  import { isConflictCopy, splitPath, type ListItem } from "$lib/core/views";
+  import FileText from "@lucide/svelte/icons/file-text";
+  import Plus from "@lucide/svelte/icons/plus";
+  import SquareCheck from "@lucide/svelte/icons/square-check";
+  import TriangleAlert from "@lucide/svelte/icons/triangle-alert";
   import { scrollTopFor, visibleRange } from "$lib/core/virtualList";
   import type { RenameOutcome } from "./appState.svelte";
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
@@ -399,12 +403,22 @@
                 }}
               >
                 {#if item.kind === "tasks"}
-                  <span class="box" aria-hidden="true">[ ]</span>
+                  <SquareCheck aria-hidden="true" />
                   <span class="name">{item.label}</span>
                   <span class="meta">{item.openCount ?? "…"} open</span>
                 {:else}
+                  {@const location = splitPath(item.name)}
                   <span class="line">
-                    <span class="name">{item.name}</span>
+                    {#if isConflictCopy(item.name)}
+                      <span class="conflict" title="Conflict copy"
+                        ><TriangleAlert aria-hidden="true" /></span
+                      >
+                    {:else}
+                      <FileText aria-hidden="true" />
+                    {/if}
+                    <span class="name"
+                      ><span class="folder">{location.folder}</span>{location.file}</span
+                    >
                     <span class="age">{formatAge(item.modified, now)}</span>
                   </span>
                   <!-- Reserve the line while the title loads so rows do not jump. -->
@@ -425,7 +439,7 @@
     aria-keyshortcuts={createShortcut.aria}
     onclick={oncreate}
   >
-    <span aria-hidden="true">+</span>
+    <Plus aria-hidden="true" />
     <span class="name">new note</span>
     <kbd aria-hidden="true">{createShortcut.hint}</kbd>
   </button>
@@ -512,8 +526,25 @@
     gap: var(--space-10);
   }
 
-  .box {
+  .row :global(.lucide-icon) {
+    color: var(--color-muted);
+  }
+
+  .row[aria-current="true"] :global(.lucide-icon) {
     color: var(--color-accent);
+  }
+
+  .row .conflict {
+    display: flex;
+  }
+
+  .row .conflict :global(.lucide-icon) {
+    color: var(--color-accent);
+  }
+
+  .folder {
+    color: var(--color-muted);
+    font-weight: var(--font-weight-regular);
   }
 
   .tasks .name,
@@ -523,8 +554,12 @@
 
   .line {
     display: flex;
-    justify-content: space-between;
+    align-items: center;
     gap: var(--space-8);
+  }
+
+  .line .name {
+    flex: 1;
   }
 
   .name,

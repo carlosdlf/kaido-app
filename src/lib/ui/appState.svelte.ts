@@ -15,6 +15,13 @@
  * Renaming and deleting notes run in the same queue as change events, after
  * the note's pending edits are saved. The model is updated right away, so
  * the watcher's later report of the app's own change is a no-op.
+ *
+ * Task lists are also kept parsed in a task index, read in the background
+ * with the summaries and kept current from change events and the app's own
+ * edits. Task edits (toggle, add, edit, delete, move) change the list's
+ * text right away and are saved through the list's session like editor
+ * edits: the open list's session, or one created on demand from the index
+ * for the All tasks view, dropped again once everything is on disk.
  */
 
 import {
@@ -28,6 +35,17 @@ import {
 } from "$lib/core/saveMachine";
 import { newNoteFolder, newNotePath } from "$lib/core/newNote";
 import { nextAfterRemoval, renamedPath, validateNoteName } from "$lib/core/noteNames";
+import { projectTasksPath, validateProjectName } from "$lib/core/projectNames";
+import { linkedNote, noteLink, noteNameFromTask, textWithoutLinks } from "$lib/core/taskLinks";
+import * as taskOps from "$lib/core/taskDocument";
+import type {
+  InsertPosition,
+  RemovedLines,
+  TaskDocument,
+  TaskEdit,
+  TaskRef,
+} from "$lib/core/taskDocument";
+import { NO_TASK_DOCS, TaskIndex, type TaskDocs } from "$lib/core/taskIndex";
 import {
   ALL_TASKS,
   fallbackSummary,
@@ -88,6 +106,20 @@ export interface Toast {
   action?: string;
 }
 
+export type ProjectOutcome =
+  | { kind: "created"; name: string }
+  /** The name cannot be used; the reason is shown next to it. */
+  | { kind: "invalid"; reason: string }
+  /** Creating failed for another reason, already reported in a toast. */
+  | { kind: "failed" };
+
+/** Asks the task views to focus a task (by line) or, with `line: null`, the new task input. */
+export interface TaskFocusRequest {
+  id: number;
+  path: string;
+  line: number | null;
+}
+
 export type RenameOutcome =
   | { kind: "renamed"; path: string }
   /** The name cannot be used; the reason is shown next to it. */
@@ -103,6 +135,12 @@ interface DeletedNote {
   path: string;
   /** What the note contained, including edits that could not be saved. */
   contents: string;
+  generation: number;
+}
+
+interface DeletedTask {
+  path: string;
+  removed: RemovedLines;
   generation: number;
 }
 
@@ -224,6 +262,42 @@ export function restoreFailedMessage(name: string, message: string): string {
   return `${name} could not be restored: ${message}`;
 }
 
+export function taskDeletedMessage(text: string): string {
+  return text === "" ? "Deleted a task" : `Deleted task: ${text}`;
+}
+
+export const TASK_CHANGED = "The task changed on disk, so nothing was changed.";
+
+export function oversizedTasksMessage(paths: readonly string[]): string {
+  return `Not shown here (larger than 1 MiB): ${paths.join(", ")}`;
+}
+
+export const SPACED_NAME = "Names cannot start or end with a space.";
+
+export function notLinkedMessage(name: string): string {
+  return `Created ${name}; the task changed, so it was not linked.`;
+}
+
+export function missingNoteMessage(name: string): string {
+  return `${name} does not exist.`;
+}
+
+export const NOTE_NOT_SHOWN = "this path is not shown as a note in the workspace.";
+
+export const TASK_NOT_RESTORED =
+  "The task list is no longer available, so the task was not restored.";
+
+export const PROJECT_IGNORED =
+  "Projects with this name are hidden by the workspace ignore patterns.";
+
+export function projectExistsMessage(name: string): string {
+  return `A project named ${name} already exists.`;
+}
+
+export function createProjectFailedMessage(message: string): string {
+  return `The project could not be created: ${message}`;
+}
+
 /** Actions that are refused once while edits cannot be saved. */
 type UnsafeAction = "close" | "switch";
 
@@ -250,6 +324,15 @@ export class AppState {
   editorFocusRequest: number = $state(0);
   /** Renamed and deleted notes, in order, so the editor can move or drop their state. */
   editorChanges: readonly EditorPathChange[] = $state.raw([]);
+  /** Parsed task lists by path, including edits not saved yet. */
+  taskDocs: TaskDocs = $state.raw(NO_TASK_DOCS);
+  /** The selected task list is shown in the text editor instead of the task view. */
+  taskTextMode: boolean = $state(false);
+  /** Task lists (and `ALL_TASKS`) whose done tasks are hidden. */
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- replaced, never mutated
+  hideDone: ReadonlySet<string> = $state.raw(new Set());
+  /** The latest request for the task views to move focus, or `null`. */
+  taskFocus: TaskFocusRequest | null = $state.raw(null);
 
   readonly #storage: Storage;
   readonly #defer: (task: () => void) => void;
@@ -283,6 +366,20 @@ export class AppState {
   /** Deleted notes that an undo toast can restore, by toast id. */
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- private bookkeeping, never rendered
   readonly #deleted = new Map<number, DeletedNote>();
+  /** Deleted tasks that an undo toast can restore, by toast id. */
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- private bookkeeping, never rendered
+  readonly #deletedTasks = new Map<number, DeletedTask>();
+  /** Other toast actions, by toast id. */
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- private bookkeeping, never rendered
+  readonly #toastActions = new Map<number, () => Promise<void>>();
+  /** Tasks a note is being created from, by path and line text. */
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- private bookkeeping, never rendered
+  readonly #creatingFromTask = new Set<string>();
+  readonly #tasks = new TaskIndex();
+  /** Edits made through task list sessions created on demand, to apply again after a conflict. */
+  readonly #taskEdits = new WeakMap<SaveSession, ((doc: TaskDocument) => TaskEdit | null)[]>();
+  #tasksChanged = false;
+  #taskFocusId = 0;
   #settings: ParseResult<DeviceSettings> = parseSettings(null);
   #settingsWarnings: ConfigWarning[] = [];
   #config: WorkspaceConfig = parseWorkspaceConfig(null).value;
@@ -394,6 +491,11 @@ export class AppState {
       this.workspace = buildWorkspace(files, this.#config);
       this.#store.clear();
       this.summaries = this.#store.view();
+      this.#tasks.clear();
+      this.#tasksChanged = false;
+      this.taskDocs = this.#tasks.view();
+      // eslint-disable-next-line svelte/prefer-svelte-reactivity -- replaced, never mutated
+      this.hideDone = new Set();
       this.notice = null;
       this.#select(INBOX);
       this.phase = { kind: "ready", root };
@@ -426,6 +528,16 @@ export class AppState {
     if (path === this.item && this.document?.status !== "error") return;
     this.#leave(path);
     this.item = path;
+    this.taskTextMode = false;
+    // A pending focus request belongs to what was shown before.
+    this.taskFocus = null;
+    if (path === ALL_TASKS) {
+      // The All tasks view reads the task index; there is no document.
+      this.#documentRequest += 1;
+      this.document = null;
+      this.saveStatus = null;
+      return;
+    }
     const live = this.#sessions.get(path);
     if (live) {
       // Unsaved or still saving: show the buffer, not the disk version.
@@ -601,9 +713,20 @@ export class AppState {
    * Restores the note deleted with toast `id`, without replacing a file that
    * took its name meanwhile, and selects it.
    */
-  async undoDelete(id: number): Promise<void> {
+  async undoDelete(id: number): Promise<"note" | "task" | null> {
+    const task = this.#deletedTasks.get(id);
+    if (task) {
+      this.dismissToast(id);
+      if (task.generation !== this.#generation) return null;
+      const edit = this.#editTasks(task.path, null, (doc) =>
+        taskOps.restoreLines(doc, task.removed),
+      );
+      if (edit) this.#requestTaskFocus(task.path, edit.focus);
+      else this.#toast(TASK_NOT_RESTORED);
+      return "task";
+    }
     const deleted = this.#deleted.get(id);
-    if (!deleted) return;
+    if (!deleted) return null;
     this.dismissToast(id);
     await this.#serial(async () => {
       if (deleted.generation !== this.#generation) return;
@@ -629,13 +752,260 @@ export class AppState {
       if (role?.kind !== "note" || role.archived) return;
       this.#openCreated(written, deleted.contents, role.project);
     });
+    return "note";
   }
 
   /** The toast of the most recent delete that can still be undone, or `null`. */
   get latestUndo(): number | null {
     let latest: number | null = null;
-    for (const id of this.#deleted.keys()) latest = latest === null ? id : Math.max(latest, id);
+    for (const id of [...this.#deleted.keys(), ...this.#deletedTasks.keys()])
+      latest = latest === null ? id : Math.max(latest, id);
     return latest;
+  }
+
+  /*
+   * Task edits address a task by `TaskRef` (its line and the line's text as
+   * shown). If the list changed meanwhile and the task cannot be found by
+   * its text, nothing changes and a toast says so.
+   */
+
+  /** Flips the done state of a task of the list `path`. */
+  toggleTask(path: string, ref: TaskRef): void {
+    this.#editTasks(path, ref, (doc) => taskOps.toggleTask(doc, ref));
+  }
+
+  /** Adds an open task; resolves to a reference to it, or `null` if nothing was added. */
+  addTask(path: string, text: string, position: InsertPosition): TaskRef | null {
+    const ref = typeof position === "object" && "after" in position ? position.after : null;
+    const edit = this.#editTasks(path, ref, (doc) => taskOps.insertTask(doc, text, position));
+    if (edit?.focus == null) return null;
+    return taskOps.refAt(taskOps.parseTaskDocument(edit.text), edit.focus);
+  }
+
+  /** Replaces the detail of a top-level task (its non-task indented lines). */
+  setTaskDetail(path: string, ref: TaskRef, detail: string): void {
+    this.#editTasks(path, ref, (doc) => taskOps.setTaskDetail(doc, ref, detail));
+  }
+
+  /** Replaces the text of a task. Empty text changes nothing. */
+  editTask(path: string, ref: TaskRef, text: string): void {
+    this.#editTasks(path, ref, (doc) => taskOps.editTaskText(doc, ref, text));
+  }
+
+  /**
+   * Moves an open task above the previous (`-1`) or below the next (`1`)
+   * open task of its section; resolves to its new line.
+   */
+  moveTask(path: string, ref: TaskRef, direction: -1 | 1): number | null {
+    return (
+      this.#editTasks(path, ref, (doc) => taskOps.moveTask(doc, ref, direction))?.focus ?? null
+    );
+  }
+
+  /**
+   * Deletes a task with its subtasks and shows a toast that can undo it.
+   * Resolves to the line of the task that takes its place.
+   */
+  deleteTask(path: string, ref: TaskRef): number | null {
+    let removed: RemovedLines | null = null;
+    let text = "";
+    const edit = this.#editTasks(path, ref, (doc) => {
+      const line = taskOps.locateTask(doc, ref);
+      text = line === null ? "" : (taskOps.taskAt(doc, line)?.text ?? "");
+      const deletion = taskOps.deleteTask(doc, ref);
+      removed = deletion?.removed ?? null;
+      return deletion;
+    });
+    if (!edit || removed === null) return null;
+    const id = this.#toast(taskDeletedMessage(text), "Undo");
+    this.#deletedTasks.set(id, { path, removed, generation: this.#generation });
+    return edit.focus;
+  }
+
+  /** Hides or shows the done tasks of a list, or of All tasks with `ALL_TASKS`. */
+  toggleHideDone(key: string): void {
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity -- replaced, never mutated
+    const next = new Set(this.hideDone);
+    if (!next.delete(key)) next.add(key);
+    this.hideDone = next;
+  }
+
+  /** Whether `path` is a note shown in the workspace. */
+  hasNote(path: string): boolean {
+    return this.#isNote(path);
+  }
+
+  /** Selects a note in its project and moves focus into the editor. */
+  openNote(path: string): void {
+    const role = classifyPath(path, createPathFilter(this.#config));
+    if (role?.kind !== "note" || role.archived || !this.#isNote(path)) return;
+    this.folder = role.project;
+    this.selectItem(path);
+    this.editorFocusRequest += 1;
+  }
+
+  /**
+   * Opens the note a task links to. A link to a note that does not exist
+   * shows a toast offering to create it. Nothing happens without a link.
+   */
+  openTaskNote(path: string, ref: TaskRef): void {
+    const doc = this.#currentTasks(path);
+    const line = doc ? taskOps.locateTask(doc, ref) : null;
+    const task = doc && line !== null ? taskOps.taskAt(doc, line) : null;
+    if (!task) {
+      if (doc) this.#toast(TASK_CHANGED);
+      return;
+    }
+    const link = linkedNote(task.text, path, (candidate) => this.#isNote(candidate));
+    if (!link) return;
+    if (link.exists) {
+      this.openNote(link.path);
+      return;
+    }
+    const id = this.#toast(missingNoteMessage(baseName(link.path)), "Create");
+    const title = textWithoutLinks(task.text);
+    const generation = this.#generation;
+    this.#toastActions.set(id, () => this.#createLinkedNote(link.path, title, generation));
+  }
+
+  /**
+   * Creates a note named after a task in the task's project folder, with
+   * the task text as its title, links it from the task and opens it.
+   */
+  async createNoteFromTask(path: string, ref: TaskRef): Promise<void> {
+    if (this.phase.kind !== "ready") return;
+    // One note per task at a time, e.g. when the menu item is chosen twice quickly.
+    const key = `${path}\n${ref.raw}`;
+    if (this.#creatingFromTask.has(key)) return;
+    this.#creatingFromTask.add(key);
+    try {
+      await this.#createNoteFromTask(path, ref);
+    } finally {
+      this.#creatingFromTask.delete(key);
+    }
+  }
+
+  async #createNoteFromTask(path: string, ref: TaskRef): Promise<void> {
+    const doc = this.#currentTasks(path);
+    const line = doc ? taskOps.locateTask(doc, ref) : null;
+    const task = doc && line !== null ? taskOps.taskAt(doc, line) : null;
+    if (!task) {
+      this.#toast(TASK_CHANGED);
+      return;
+    }
+    const folder = path.slice(0, path.lastIndexOf("/"));
+    const stem = noteNameFromTask(task.text);
+    const contents = `# ${textWithoutLinks(task.text) || stem}\n`;
+    const generation = this.#generation;
+    const isIgnored = createPathFilter(this.#config);
+    const tried: string[] = [];
+    for (let attempt = 0; attempt < MAX_CREATE_ATTEMPTS; attempt += 1) {
+      // eslint-disable-next-line svelte/prefer-svelte-reactivity -- local to this call, never rendered
+      const taken = new Set(this.#files.map((file) => file.path.toLowerCase()));
+      const candidate = newNotePath(
+        folder,
+        (candidatePath) => {
+          const key = candidatePath.toLowerCase();
+          return (
+            taken.has(key) || tried.includes(key) || classifyPath(candidatePath, isIgnored) === null
+          );
+        },
+        undefined,
+        stem,
+      );
+      if (candidate === null) break;
+      let written: WrittenFile;
+      try {
+        written = await this.#storage.writeFile(candidate, contents, { expectedHash: null });
+      } catch (error) {
+        if (generation !== this.#generation) return;
+        const storageError = toStorageError(error);
+        if (storageError.kind === "Conflict") {
+          tried.push(candidate.toLowerCase());
+          continue;
+        }
+        this.#toast(createNoteFailedMessage(storageError.message));
+        return;
+      }
+      if (generation !== this.#generation) return;
+      const suffix = noteLink(baseName(written.path));
+      // Found by its text again: the list may have changed while the note was written.
+      const linked = this.#editTasks(path, null, (current) => {
+        const at = taskOps.locateTask(current, ref);
+        const now = at === null ? null : taskOps.taskAt(current, at);
+        return now ? taskOps.editTaskText(current, ref, `${now.text} ${suffix}`) : null;
+      });
+      if (!linked) this.#toast(notLinkedMessage(baseName(written.path)));
+      this.#openCreated(written, contents, folder.split("/")[0] ?? INBOX);
+      this.editorFocusRequest += 1;
+      return;
+    }
+    if (generation === this.#generation) this.#toast(NO_FREE_NOTE_NAME);
+  }
+
+  /** Runs a toast's action button: undo a delete, or create a missing note. */
+  async runToastAction(id: number): Promise<"note" | "task" | "create" | null> {
+    const action = this.#toastActions.get(id);
+    if (!action) return this.undoDelete(id);
+    this.dismissToast(id);
+    await action();
+    return "create";
+  }
+
+  /**
+   * Shows the selected task list in the text editor (`true`) or as the task
+   * view. Both use the same session, so nothing is saved or read to switch.
+   */
+  setTaskTextMode(on: boolean): void {
+    const path = this.item;
+    if (!isTaskListPath(path) || on === this.taskTextMode) return;
+    const session = this.#sessions.get(path);
+    if (session && on) {
+      // The task view's edits are in the buffer, not in the shown document.
+      this.document = this.#ready(path, session.text);
+    } else if (session) {
+      this.#syncTasks(session);
+      this.#publishTasks();
+    }
+    this.taskTextMode = on;
+  }
+
+  /**
+   * Creates a project folder with an empty task list (create-only), then
+   * selects it and asks the task view to focus its new task input.
+   */
+  async createProject(input: string): Promise<ProjectOutcome> {
+    if (this.phase.kind !== "ready") return { kind: "failed" };
+    const generation = this.#generation;
+    return this.#serial(async (): Promise<ProjectOutcome> => {
+      if (generation !== this.#generation) return { kind: "failed" };
+      const validation = validateProjectName(
+        input,
+        this.workspace.projects.map((project) => project.name),
+      );
+      if (!validation.ok) return { kind: "invalid", reason: validation.reason };
+      const name = validation.name;
+      const path = projectTasksPath(name);
+      if (classifyPath(path, createPathFilter(this.#config))?.kind !== "tasks")
+        return { kind: "invalid", reason: PROJECT_IGNORED };
+      let written: WrittenFile;
+      try {
+        written = await this.#storage.writeFile(path, "", { expectedHash: null });
+      } catch (error) {
+        if (generation !== this.#generation) return { kind: "failed" };
+        const storageError = toStorageError(error);
+        if (storageError.kind === "Conflict")
+          return { kind: "invalid", reason: projectExistsMessage(name) };
+        this.#toast(createProjectFailedMessage(storageError.message));
+        return { kind: "failed" };
+      }
+      if (generation !== this.#generation) return { kind: "failed" };
+      this.#openCreated(written, "", name);
+      this.#tasks.set(path, "", written.hash);
+      this.#publishTasks();
+      this.#requestTaskFocus(path, null);
+      return { kind: "created", name };
+    });
   }
 
   /** Shows a short message. */
@@ -645,6 +1015,8 @@ export class AppState {
 
   dismissToast(id: number): void {
     this.#deleted.delete(id);
+    this.#toastActions.delete(id);
+    this.#deletedTasks.delete(id);
     this.toasts = this.toasts.filter((toast) => toast.id !== id);
   }
 
@@ -681,6 +1053,8 @@ export class AppState {
     const first = this.#firstItem(folder);
     this.#leave("");
     this.item = "";
+    this.taskTextMode = false;
+    this.taskFocus = null;
     this.document = null;
     this.saveStatus = null;
     if (first !== null) this.selectItem(first);
@@ -708,8 +1082,97 @@ export class AppState {
     this.#documentRequest += 1;
     this.folder = folder;
     this.item = path;
+    this.taskTextMode = false;
     this.document = { status: "ready", path, text: contents, modified: entry.modified };
     this.saveStatus = session.status;
+  }
+
+  /**
+   * Applies a task edit to the current text of the list at `path` (its
+   * session's buffer), records it in the session and shows it right away.
+   */
+  #editTasks(
+    path: string,
+    ref: TaskRef | null,
+    edit: (doc: TaskDocument) => TaskEdit | null,
+  ): TaskEdit | null {
+    if (this.phase.kind !== "ready") return null;
+    const session = this.#taskSession(path);
+    if (!session) return null;
+    const current = session.text;
+    const indexed = this.#tasks.get(path)?.doc;
+    const before = indexed?.text === current ? indexed : taskOps.parseTaskDocument(current);
+    if (ref !== null && taskOps.locateTask(before, ref) === null) {
+      this.#toast(TASK_CHANGED);
+      return null;
+    }
+    const result = edit(before);
+    if (!result) return null;
+    const text = result.text;
+    this.#refused = null;
+    session.edit(() => text);
+    this.#taskEdits.get(session)?.push(edit);
+    const doc = this.#tasks.set(path, text, null);
+    this.#store.set(path, summarizeFile(path, text, doc));
+    // The text editor shows this list: hand it the new text like a change from disk.
+    if (path === this.item && this.taskTextMode) this.document = this.#ready(path, text);
+    this.#publishTasks();
+    return result;
+  }
+
+  /**
+   * The session of a shown task list: the existing one, or a new one based
+   * on the index entry when it matches a known disk version.
+   */
+  #taskSession(path: string): SaveSession | null {
+    if (!isTaskListPath(path) || !this.#index.has(path)) return null;
+    const live = this.#sessions.get(path);
+    if (live) return live;
+    const indexed = this.#tasks.get(path);
+    if (!indexed || indexed.hash === null) return null;
+    const modified = this.#index.get(path)?.modified ?? 0;
+    // Its base may be older than the disk: on a conflict the edits are
+    // applied again to the newer version once, before keeping both.
+    const edits: ((doc: TaskDocument) => TaskEdit | null)[] = [];
+    const session = this.#createSession(
+      path,
+      { contents: indexed.doc.text, hash: indexed.hash },
+      modified,
+      (disk) => {
+        let text = disk;
+        for (const edit of edits) {
+          const result = edit(taskOps.parseTaskDocument(text));
+          if (!result) return null;
+          text = result.text;
+        }
+        return text;
+      },
+    );
+    this.#taskEdits.set(session, edits);
+    this.#sessions.set(path, session);
+    return session;
+  }
+
+  /** Puts a task list session's buffer into the index and the summaries. */
+  #syncTasks(session: SaveSession): void {
+    const path = session.path;
+    if (!isTaskListPath(path) || !this.#index.has(path)) return;
+    const text = session.text;
+    const doc = this.#tasks.set(path, text, session.dirty ? null : session.hash);
+    this.#store.set(path, summarizeFile(path, text, doc));
+    this.#tasksChanged = true;
+  }
+
+  /** Publishes task lists and summaries now, for edits that must show at once. */
+  #publishTasks(): void {
+    this.#tasksChanged = true;
+    this.#publishPending = true;
+    this.#publish();
+  }
+
+  #requestTaskFocus(path: string, line: number | null): void {
+    this.#taskFocusId += 1;
+    this.taskFocus = { id: this.#taskFocusId, path, line };
   }
 
   /** Runs `task` in the change queue, so watcher reports wait until it is done. */
@@ -809,11 +1272,59 @@ export class AppState {
 
   /** Undo toasts belong to the workspace they were shown in. */
   #dropUndo(): void {
-    if (this.#deleted.size === 0) return;
     // eslint-disable-next-line svelte/prefer-svelte-reactivity -- local to this call, never rendered
-    const ids = new Set(this.#deleted.keys());
+    const ids = new Set([
+      ...this.#deleted.keys(),
+      ...this.#deletedTasks.keys(),
+      ...this.#toastActions.keys(),
+    ]);
+    if (ids.size === 0) return;
     this.#deleted.clear();
+    this.#deletedTasks.clear();
+    this.#toastActions.clear();
     this.toasts = this.toasts.filter((toast) => !ids.has(toast.id));
+  }
+
+  /** The current text of a task list (its session's buffer when it has one), parsed. */
+  #currentTasks(path: string): TaskDocument | null {
+    const session = this.#sessions.get(path);
+    const indexed = this.#tasks.get(path)?.doc ?? null;
+    if (!session) return indexed;
+    const text = session.text;
+    return indexed?.text === text ? indexed : taskOps.parseTaskDocument(text);
+  }
+
+  /** Creates a note a task links to but that does not exist, then opens it. */
+  async #createLinkedNote(path: string, title: string, generation: number): Promise<void> {
+    if (generation !== this.#generation) return;
+    // A hand-written link may name a file the app would not create.
+    const name = validateNoteName(baseName(path));
+    if (!name.ok || name.name !== baseName(path)) {
+      this.#toast(createNoteFailedMessage(name.ok ? SPACED_NAME : name.reason));
+      return;
+    }
+    const role = classifyPath(path, createPathFilter(this.#config));
+    if (role?.kind !== "note" || role.archived) {
+      this.#toast(createNoteFailedMessage(NOTE_NOT_SHOWN));
+      return;
+    }
+    const contents = title === "" ? "" : `# ${title}\n`;
+    let written: WrittenFile;
+    try {
+      written = await this.#storage.writeFile(path, contents, { expectedHash: null });
+    } catch (error) {
+      if (generation !== this.#generation) return;
+      const storageError = toStorageError(error);
+      this.#toast(
+        storageError.kind === "Conflict"
+          ? nameTakenMessage(baseName(path))
+          : createNoteFailedMessage(storageError.message),
+      );
+      return;
+    }
+    if (generation !== this.#generation) return;
+    this.#openCreated(written, contents, role.project);
+    this.editorFocusRequest += 1;
   }
 
   #ready(path: string, text: string): DocumentState {
@@ -832,6 +1343,13 @@ export class AppState {
 
   /** Flushes the open note before another one is shown. */
   #leave(next: string): void {
+    if (this.item === ALL_TASKS && next !== ALL_TASKS) {
+      // Lists edited from All tasks are saved now and dropped once written.
+      for (const session of [...this.#sessions.values()]) {
+        if (session.path !== next) void session.flush().then(() => this.#retire(session));
+      }
+      return;
+    }
     const session = this.#sessions.get(this.item);
     if (!session || this.item === next) return;
     void session.flush().then(() => this.#retire(session));
@@ -957,7 +1475,12 @@ export class AppState {
     };
   }
 
-  #createSession(path: string, file: FileContents, modified: number): SaveSession {
+  #createSession(
+    path: string,
+    file: FileContents,
+    modified: number,
+    rebase?: (disk: string) => string | null,
+  ): SaveSession {
     const session: SaveSession = new SaveSession({
       path,
       contents: file.contents,
@@ -966,7 +1489,12 @@ export class AppState {
       io: this.#documentIO(),
       timers: this.#timers,
       ...(this.#saveDelay === undefined ? {} : { saveDelay: this.#saveDelay }),
+      ...(rebase === undefined ? {} : { rebase }),
       events: {
+        rebased: () => {
+          this.#syncTasks(session);
+          this.#publishTasks();
+        },
         // A rename moves the session, so its current path is read each time.
         status: (status) => {
           if (this.#sessions.get(session.path) !== session) return;
@@ -976,11 +1504,11 @@ export class AppState {
         },
         saved: (contents) => {
           this.#refused = null;
-          this.#updateSummary(session.path, contents);
+          this.#updateSummary(session, contents);
         },
         reloaded: (contents) => {
           const current = session.path;
-          this.#updateSummary(current, contents);
+          this.#updateSummary(session, contents);
           if (current === this.item && this.#sessions.get(current) === session) {
             this.document = this.#ready(current, contents);
           }
@@ -1001,9 +1529,12 @@ export class AppState {
     return session;
   }
 
-  #updateSummary(path: string, contents: string): void {
+  #updateSummary(session: SaveSession, contents: string): void {
+    const path = session.path;
     if (!this.#index.has(path)) return;
-    this.#store.set(path, summarizeFile(path, contents));
+    // A task list shows its buffer, which may be ahead of what was saved.
+    if (isTaskListPath(path)) this.#syncTasks(session);
+    else this.#store.set(path, summarizeFile(path, contents));
     this.#schedulePublish();
   }
 
@@ -1059,13 +1590,26 @@ export class AppState {
     try {
       const file = await this.#storage.readFile(path);
       if (!current()) return;
+      const live = this.#sessions.get(path);
+      if (live) {
+        // A task edit started a session meanwhile; its buffer is newer.
+        this.document = this.#ready(path, live.text);
+        this.saveStatus = live.status;
+        return;
+      }
       const modified = this.#index.get(path)?.modified ?? 0;
       const session = this.#createSession(path, file, modified);
       this.#sessions.set(path, session);
       this.document = { status: "ready", path, text: file.contents, modified };
       this.saveStatus = session.status;
-      this.#store.set(path, summarizeFile(path, file.contents));
-      this.#schedulePublish();
+      if (isTaskListPath(path)) {
+        const doc = this.#tasks.set(path, file.contents, file.hash);
+        this.#store.set(path, summarizeFile(path, file.contents, doc));
+        this.#publishTasks();
+      } else {
+        this.#store.set(path, summarizeFile(path, file.contents));
+        this.#schedulePublish();
+      }
     } catch (error) {
       if (!current()) return;
       if (isStorageError(error, "NotFound")) this.document = { status: "missing", path };
@@ -1109,18 +1653,28 @@ export class AppState {
     if (path === this.item && doc?.path === path && doc.status !== "error") return;
     if (entry.size > MAX_SUMMARY_BYTES) {
       this.#store.set(path, fallbackSummary(path));
+      // A list that grew too large is no longer kept parsed; All tasks says so.
+      if (!this.#sessions.has(path) && this.#tasks.delete(path)) this.#tasksChanged = true;
       this.#schedulePublish();
       return;
     }
-    let text: string;
+    let file: FileContents;
     try {
-      text = (await this.#storage.readFile(path)).contents;
+      file = await this.#storage.readFile(path);
     } catch {
       // Unreadable files keep their fallback title; a later change retries them.
       return;
     }
     if (generation !== this.#generation || !this.#index.has(path)) return;
-    this.#store.set(path, summarizeFile(path, text));
+    if (isTaskListPath(path)) {
+      // A list with a session is kept current by it, edits included.
+      if (this.#sessions.has(path)) return;
+      const doc = this.#tasks.set(path, file.contents, file.hash);
+      this.#store.set(path, summarizeFile(path, file.contents, doc));
+      this.#tasksChanged = true;
+    } else {
+      this.#store.set(path, summarizeFile(path, file.contents));
+    }
     this.#schedulePublish();
   }
 
@@ -1134,6 +1688,10 @@ export class AppState {
     if (!this.#publishPending) return;
     this.#publishPending = false;
     this.summaries = this.#store.view();
+    if (this.#tasksChanged) {
+      this.#tasksChanged = false;
+      this.taskDocs = this.#tasks.view();
+    }
   }
 
   #onChange(event: ChangeEvent, generation: number): void {
@@ -1196,9 +1754,15 @@ export class AppState {
 
     // Forget files that are gone or now ignored.
     if (this.#store.retain((path) => shown.has(path))) this.#schedulePublish();
+    if (this.#tasks.retain((path) => shown.has(path))) {
+      this.#tasksChanged = true;
+      this.#schedulePublish();
+    }
 
     if (this.folder !== ALL_TASKS && !findProject(this.workspace, this.folder)) {
       this.#select(INBOX);
+    } else if (this.item === ALL_TASKS) {
+      // The All tasks view follows the task index; there is no document to reload.
     } else if (this.item === "") {
       if (this.#firstItem(this.folder) !== null) this.#select(this.folder);
     } else if (removed.includes(this.item)) {

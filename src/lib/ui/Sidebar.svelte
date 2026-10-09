@@ -1,7 +1,13 @@
 <script lang="ts">
+  import { tick, untrack } from "svelte";
+  import Folder from "@lucide/svelte/icons/folder";
+  import Inbox from "@lucide/svelte/icons/inbox";
+  import ListChecks from "@lucide/svelte/icons/list-checks";
+  import Plus from "@lucide/svelte/icons/plus";
   import { nextListIndex } from "$lib/core/listNavigation";
   import { ALL_TASKS, type SidebarEntry } from "$lib/core/views";
   import { INBOX } from "$lib/core/workspace";
+  import type { ProjectOutcome } from "./appState.svelte";
 
   interface Props {
     /** Projects in display order; the first one is the inbox. */
@@ -15,10 +21,92 @@
     onpick: () => void;
     selected: string;
     onselect: (id: string) => void;
+    /** Creates a project with the typed name. */
+    oncreateproject?: (name: string) => Promise<ProjectOutcome>;
+    /** The new project shortcut, for assistive technology and as a visible hint. */
+    createProjectShortcut?: { aria: string; hint: string };
+    /** Each new value opens the new project field. */
+    newProjectRequest?: number;
   }
 
-  let { entries, allOpen, workspaceName, warnings, notice, onpick, selected, onselect }: Props =
-    $props();
+  let {
+    entries,
+    allOpen,
+    workspaceName,
+    warnings,
+    notice,
+    onpick,
+    selected,
+    onselect,
+    oncreateproject,
+    createProjectShortcut,
+    newProjectRequest = 0,
+  }: Props = $props();
+
+  // New project
+  let creating = $state(false);
+  let projectDraft = $state("");
+  let projectError: string | null = $state(null);
+  let submitting = false;
+  let addButton: HTMLButtonElement | undefined = $state();
+
+  function startProject() {
+    creating = true;
+    projectDraft = "";
+    projectError = null;
+  }
+
+  async function closeProject(returnFocus: boolean) {
+    creating = false;
+    projectError = null;
+    if (!returnFocus) return;
+    await tick();
+    addButton?.focus();
+  }
+
+  async function submitProject() {
+    if (submitting || !oncreateproject) return;
+    if (projectDraft.trim() === "") {
+      void closeProject(true);
+      return;
+    }
+    submitting = true;
+    const outcome = await oncreateproject(projectDraft);
+    submitting = false;
+    if (!creating) return;
+    if (outcome.kind === "invalid") projectError = outcome.reason;
+    // A created project's task list takes focus; after a failure it goes back to the button.
+    else void closeProject(outcome.kind === "failed");
+  }
+
+  function handleProjectKeydown(event: KeyboardEvent) {
+    if (event.isComposing) return;
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void submitProject();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      void closeProject(true);
+    }
+  }
+
+  /** Leaving the field cancels; switching windows keeps it open. */
+  function handleProjectBlur() {
+    if (!document.hasFocus() || submitting) return;
+    void closeProject(false);
+  }
+
+  function focusField(input: HTMLInputElement) {
+    input.focus();
+  }
+
+  let handledRequest = untrack(() => newProjectRequest);
+  $effect(() => {
+    const request = newProjectRequest;
+    if (request === handledRequest) return;
+    handledRequest = request;
+    untrack(startProject);
+  });
 
   let nav: HTMLElement | undefined = $state();
 
@@ -68,6 +156,7 @@
           aria-current={selected === INBOX ? "page" : undefined}
           onclick={() => onselect(INBOX)}
         >
+          <Inbox aria-hidden="true" />
           <span class="label">~/inbox</span>
           <span class="count" aria-label={countLabel(inbox?.openCount)}
             >[{count(inbox?.openCount)}]</span
@@ -83,6 +172,7 @@
           aria-current={selected === ALL_TASKS ? "page" : undefined}
           onclick={() => onselect(ALL_TASKS)}
         >
+          <ListChecks aria-hidden="true" />
           <span class="label">~/all-tasks</span>
           <span class="count" aria-label={countLabel(allOpen)}>[{count(allOpen)}]</span>
         </button>
@@ -103,7 +193,7 @@
                 aria-current={selected === project.name ? "page" : undefined}
                 onclick={() => onselect(project.name)}
               >
-                <span class="glyph" aria-hidden="true">▸</span>
+                <span class="glyph"><Folder aria-hidden="true" /></span>
                 <span class="label">{project.name}</span>
               </button>
             </li>
@@ -112,10 +202,43 @@
       {:else}
         <p class="hint">No projects yet</p>
       {/if}
-      <button type="button" class="item add">
-        <span aria-hidden="true">+</span>
-        <span>new project</span>
-      </button>
+      {#if creating}
+        <div class="new-project">
+          <label class="visually-hidden" for="new-project-input">New project name</label>
+          <input
+            id="new-project-input"
+            class="project-input"
+            type="text"
+            placeholder="project name"
+            spellcheck="false"
+            autocomplete="off"
+            bind:value={projectDraft}
+            aria-invalid={projectError ? "true" : undefined}
+            aria-describedby={projectError ? "new-project-error" : undefined}
+            oninput={() => (projectError = null)}
+            onkeydown={handleProjectKeydown}
+            onblur={handleProjectBlur}
+            {@attach focusField}
+          />
+          {#if projectError}
+            <span id="new-project-error" class="project-error" role="alert">{projectError}</span>
+          {/if}
+        </div>
+      {:else}
+        <button
+          type="button"
+          class="item add"
+          bind:this={addButton}
+          aria-keyshortcuts={createProjectShortcut?.aria}
+          onclick={startProject}
+        >
+          <Plus aria-hidden="true" />
+          <span class="label">new project</span>
+          {#if createProjectShortcut}
+            <kbd aria-hidden="true">{createProjectShortcut.hint}</kbd>
+          {/if}
+        </button>
+      {/if}
     </div>
   </nav>
 
@@ -219,6 +342,7 @@
 
   .item {
     display: flex;
+    align-items: center;
     gap: var(--space-8);
     width: 100%;
     padding: var(--space-6) var(--space-10);
@@ -245,16 +369,47 @@
     color: var(--color-muted);
   }
 
-  .glyph {
-    color: var(--color-dim);
+  .glyph,
+  .item :global(.lucide-icon) {
+    display: flex;
+    color: var(--color-muted);
   }
 
-  .item[aria-current="page"] .glyph {
+  .item[aria-current="page"] .glyph,
+  .item[aria-current="page"] :global(.lucide-icon) {
     color: var(--color-accent);
   }
 
   .add {
     color: var(--color-muted);
+  }
+
+  .new-project {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    padding: var(--space-2) var(--space-6);
+  }
+
+  .project-input {
+    width: 100%;
+    padding: var(--space-4) var(--space-6);
+    background: var(--color-bg);
+    border: var(--space-1) solid var(--color-border-strong);
+    border-radius: var(--radius-sm);
+  }
+
+  .project-input::placeholder {
+    color: var(--color-muted);
+  }
+
+  .project-input[aria-invalid="true"] {
+    border-color: var(--color-danger);
+  }
+
+  .project-error {
+    color: var(--color-danger);
+    font-size: var(--font-size-small);
   }
 
   .hint {

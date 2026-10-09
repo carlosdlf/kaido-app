@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ViewModeSwitch, { type ViewMode } from "./ViewModeSwitch.svelte";
   import { untrack } from "svelte";
   import { describeSaveStatus, type SaveStatus } from "$lib/core/saveMachine";
   import { splitPath } from "$lib/core/views";
@@ -17,9 +18,24 @@
     onedit: (path: string, read: () => string) => void;
     /** Renamed and deleted notes, in order; only new entries are applied. */
     pathChanges?: readonly EditorPathChange[];
+    /** Another view takes the pane; the editor keeps its state for later. */
+    hidden?: boolean;
+    /** A task list shown as text: switches back to the task view. */
+    onviewmode?: ((mode: ViewMode) => void) | undefined;
+    viewShortcut?: { aria: string; hint: string };
   }
 
-  let { doc, status, now, focusRequest, onedit, pathChanges = [] }: Props = $props();
+  let {
+    doc,
+    status,
+    now,
+    focusRequest,
+    onedit,
+    pathChanges = [],
+    hidden = false,
+    onviewmode,
+    viewShortcut,
+  }: Props = $props();
 
   const location = $derived(doc ? splitPath(doc.path) : null);
   const label = $derived(status ? describeSaveStatus(status, now) : null);
@@ -82,17 +98,22 @@
   });
 </script>
 
-<main class="editor-pane" aria-label="Editor">
+<main class="editor-pane" aria-label="Editor" {hidden}>
   {#if doc && location}
     <header class="header">
       <span class="path">{location.folder}<span class="file">{location.file}</span></span>
-      {#if ready && status && label}
-        <span
-          class="status"
-          class:failed={status.kind === "failed"}
-          title={status.kind === "failed" ? status.message : undefined}>{label}</span
-        >
-      {/if}
+      <span class="tools">
+        {#if ready && status && label}
+          <span
+            class="status"
+            class:failed={status.kind === "failed"}
+            title={status.kind === "failed" ? status.message : undefined}>{label}</span
+          >
+        {/if}
+        {#if onviewmode && viewShortcut}
+          <ViewModeSwitch mode="text" onchange={onviewmode} shortcut={viewShortcut} />
+        {/if}
+      </span>
     </header>
   {/if}
 
@@ -145,8 +166,18 @@
     color: var(--color-text);
   }
 
-  .status {
+  .editor-pane[hidden] {
+    display: none;
+  }
+
+  .tools {
+    display: flex;
     flex-shrink: 0;
+    align-items: center;
+    gap: var(--space-16);
+  }
+
+  .status {
     white-space: nowrap;
   }
 

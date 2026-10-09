@@ -47,6 +47,7 @@ These rules are checked by `pnpm check` and `pnpm lint`, so a violation fails th
 | Shell | Tauri v2 |
 | UI | Svelte 5, TypeScript, Vite |
 | Styling | Plain CSS with design tokens (CSS custom properties) |
+| Icons | [Lucide](https://lucide.dev) line icons (`@lucide/svelte`, ISC), imported one by one so only the icons used are bundled |
 | Editor | CodeMirror 6 with Markdown live preview |
 | Search | MiniSearch (in-memory full-text index) |
 | Validation | valibot |
@@ -88,7 +89,7 @@ The rules live in `src/lib/core/workspace.ts` (`classifyPath`, `buildWorkspace`)
 - Paths matching the workspace `ignore` patterns (see [Configuration](#configuration)) are ignored.
 - Folder symlinks are not followed. A file symlink is listed only if it resolves to a note or the workspace config file inside the workspace.
 - A **note**'s title is its first heading, or the file name.
-- A **task** is a Markdown checkbox (`- [ ]` / `- [x]`). Open tasks are counted only in task lists.
+- A **task** is a Markdown checkbox (`- [ ]` / `- [x]`) in a task list. See [Tasks](#tasks) for how task lists are read and edited.
 
 The files are the source of truth. The search index and caches live in the app's data directory, never in the workspace.
 
@@ -259,7 +260,7 @@ If `settings.json` cannot be overwritten, the app still works but cannot remembe
 2. Open the workspace. Subscribe to change events **before** listing, so no change in between is missed.
 3. Read `.kaido/config.json` and list files in parallel, build the model and render. The first render needs only the listing.
 4. Save the opened workspace to `settings.json` in the background; a failure becomes a warning, never a blocking error.
-5. After the first render, read titles and open task counts in the background (**summaries**):
+5. After the first render, read titles and open task counts in the background (**summaries**); task lists read this way also fill the [task index](#all-tasks):
    - task lists first (they drive the sidebar counts), then the selected project, then the rest;
    - up to 8 files at a time;
    - results published at most once per frame;
@@ -306,6 +307,74 @@ Line endings are kept as they are: each note is edited with the line separator i
 - Both run in the same queue as change events and update the model right away, so the watcher's later report of the change is a no-op. Failures show a notice and change nothing.
 
 **New notes.** `Ctrl+N` (`Cmd+N` on macOS) or the `+ new note` button in the list pane creates an empty note in the selected project, or in `inbox/` when All tasks is selected (`src/lib/core/newNote.ts`). It is named `untitled.md`, then `untitled 2.md`, `untitled 3.md`…, skipping names already in the workspace (compared case-insensitively) or hidden by the ignore patterns. The file is written with `expectedHash: null`; if a file with that name appeared on disk meanwhile, the next name is tried, a few times at most. The note is added to the model, selected and opened with the editor focused right away, without waiting for the watcher; its autosave starts from the hash of that first write. A failure shows a notice and changes nothing else.
+
+## Tasks
+
+Each project's tasks live in `<project>/tasks.md`; the inbox's in `inbox/tasks.md`. The file stays plain GitHub-flavored Markdown. The model and every edit live in `src/lib/core/taskDocument.ts`.
+
+**Reading a task list.**
+
+- A **task block** is a task line at the start of a line (`- [ ] text`, `- [x] text`; bullets `-`, `*` or `+`; state ` `, `x` or `X`) plus every following line that starts with a space or a tab: subtasks and continuation lines. Blank lines followed by more indented lines stay in the block (a loose list item, as in CommonMark); the block ends before the next non-blank line that does not start with a space or a tab, and blank lines at its end are not part of it.
+- Indented task lines inside a block are **subtasks**. They are shown one level in, whatever their depth, and can be toggled, edited and deleted (with the lines indented deeper below them). Subtasks are not created or reordered from the task view.
+- Headings are shown as section labels, in file order: ATX headings (`#` to `######`) and setext headings (a paragraph underlined with `===` or `---`). As in CommonMark, `---` after a blank line, a task, a list item or a line that lazily continues a task is a thematic break, not a heading. Headings without open tasks are left out.
+- Front matter at the top of the file and fenced code blocks are skipped, so their checkboxes are not tasks. A fence opened inside a task block ends with the block.
+- Everything else (paragraphs, blank lines, other lists) is not shown and is never changed.
+- Task text is shown as plain text; inline Markdown is not rendered.
+
+**Editing.** Edits are line-level and as small as possible, so they merge well with git's `merge=union` driver:
+
+| Edit | Changes |
+|---|---|
+| Toggle | Only the state character between the brackets |
+| Add | One new line `- [ ] text` after the block of the focused task (or at the end of the file for an empty list), using the file's line separator. A file whose last line has no line break keeps it that way. A file that ends inside a fenced code block that is never closed gets the task just before that fence, so the task is not swallowed by the code block and the file's own lines stay untouched. Line breaks in the text become spaces |
+| Edit | Only the text after the checkbox; indentation, bullet, state, the spacing after the checkbox and trailing whitespace stay |
+| Delete | The block's lines (a subtask: its line and the lines indented deeper below it) |
+| Move | Swaps the block with the previous or next open task of the same section (between the same headings). Done tasks and other lines between them stay where they are |
+
+Every other line keeps its bytes and its own line break. Done tasks are never moved in the file: "done at the bottom" is only how the view shows them.
+
+**Finding the task again.** The views address a task by its line number together with the exact text of that line (`TaskRef`). The list can change between showing a task and acting on it: an edit from disk or from the text editor. If the line still has that text, the edit applies there; otherwise it applies to the one task line that has exactly that text. When there is no such line, or more than one, nothing changes and a toast says "The task changed on disk". An open edit or new task field closes (with the same toast) as soon as the line it belongs to changes.
+
+**Saving.** A task list uses the same `SaveSession` as a note: edits change the list's text and the view right away, and the session saves 500 ms later, immediately on switching items, leaving the window or closing the app. Changes on disk reload the view when there are no unsaved edits; with unsaved edits both versions are kept, exactly as for notes. The other version is written as `tasks (conflict YYYY-MM-DD HHmm).md` next to the list; since only `tasks.md` is a task list, that copy shows up as a note of the project and its tasks are not counted or shown in the task views. The list pane marks conflict copies (names ending in ` (conflict YYYY-MM-DD HHmm).md`, optionally numbered) with a warning icon. The **View as** switch at the right end of the header (`list` / `text`, a radio group: arrow keys or a click change it, and focus stays on it) shows the same file, with the same session, in the text editor or as the task view; it sits at the same place in both headers. `Ctrl+Shift+M` (`Cmd+Shift+M`) toggles it while a project's task list is selected, also from inside the text editor but not while typing in another field; it moves focus into the editor, or to the task list. A task edit that reaches the list while it is shown as text (an undo from a toast) is handed to the editor like a change from disk, so the next keystroke keeps it.
+
+**Task view.** Selecting a project's task list shows its tasks in file order under their headings. Done tasks stay where they are, struck through and dimmed; **hide done** in the header hides them (and done subtasks), remembered per list while the app runs. Toggling never moves a task, so focus stays on it.
+
+Each row shows a chevron when the task has detail, the subtask counter (`done/total`) when it has subtasks, and a `↗ <note>` chip when it links to a note (see [Linked notes](#linked-notes)). Icons are [Lucide](https://lucide.dev) line icons drawn with the text color: muted, the accent color on the selected row, and hidden from assistive technology.
+
+| Key | On a focused task |
+|---|---|
+| `Space` | Toggle (also a click on the checkbox) |
+| `Enter` | New task below; in the field, `Enter` adds it and opens another, `Tab` makes it a subtask of the task above and `Shift+Tab` a task again (one level), `Esc` closes the field without adding (in an empty list's field it clears the text), leaving the field adds what was typed |
+| `F2`, double-click | Edit the text, links included; `Enter` or leaving the field saves, `Esc` cancels. Empty text changes nothing |
+| `→`, chevron | Show the task's detail in a text area below it. In the text area, `Ctrl+Enter` (`Cmd+Enter`), `Esc`, `←` at the very start (nothing selected), the chevron or leaving it saves and hides it; `Esc` saves too |
+| `Ctrl+Enter` (`Cmd+Enter`), chip | Open the linked note, with focus in the editor |
+| `Shift+F10`, context menu key, right-click | Task menu: **Edit**, **Create note from task** or **Open note**, **Copy text** (the task text as written), **Delete** |
+| `Delete` | Delete, with an undo toast (`Ctrl+Z` / `Cmd+Z` in the list or the toast) |
+| `Alt+↑` / `Alt+↓` | Move among the open tasks of the section |
+| `↑` / `↓`, `Home` / `End` | Move focus |
+
+The list has a single tab stop. Each task is a real checkbox labelled by its text and described by its linked note and subtask progress. When the focused task leaves the view (hidden as done, or deleted), focus goes to the task now in its place. An empty list shows an "Add a task…" field; `+ new task` opens the field after the last open task. Undo puts the deleted lines back and focuses the task. If the list has not changed since the delete, they go back exactly where they were. Otherwise they go after the line that preceded them, else before the line that followed them (each only if exactly one line has that text), else at their old line number, moved to the end of any block it falls in, so a restored task never ends up inside another task's block.
+
+**Detail.** A task's detail is the indented lines of its block that are not subtasks (or under a subtask), shown without their common indentation. `→` opens it for any top-level task, also one without detail yet. Closing it without changes writes nothing. Saving rewrites only that block: the task line, then the detail lines, then the subtasks with their own lines, in their order. Lines the user did not change keep their exact bytes (trailing spaces of a hard break, tabs); new or changed lines get the detail's indentation, the prefix of its least indented line (else the subtasks' indentation, else two spaces). Blank lines at either end are dropped and whitespace-only lines become empty; blank lines inside the detail are kept, which keeps them in the block. A fenced code block left open in the detail is closed with a matching fence line at its end, so the subtasks after it stay tasks. Other blocks are never touched.
+
+**Subtasks from the UI.** A new subtask (`Tab` in the new task field) is added as the last subtask of the block, indented like its existing subtasks (else its detail, else two spaces). If the block ends inside a code block that is never closed, the subtask goes just before that code block instead, so it is not swallowed by it.
+
+### Linked notes
+
+A task links to a note with a plain Markdown link in its text, `[label](path.md)`, with the path relative to the task list, so the link also works on GitHub and in other editors (`src/lib/core/taskLinks.ts`). Links the app writes percent-encode spaces and the characters that would end or change a CommonMark link destination: `#`, `%`, `(`, `)`, `<`, `>`, `[`, `]` (`C%23%20notes.md`); other characters, including non-ASCII ones, stay as they are. Only relative links to `.md` files inside the workspace count; URLs, absolute paths, anchors, links inside inline code and links to task lists (`<project>/tasks.md`) are left alone. The task's **linked note** is the first link to an existing note; if none of its links exists, the first one is shown as missing. The row shows the link as a chip with the note's name instead of the Markdown.
+
+- **Open note** (`Ctrl+Enter`, the chip or the menu) selects the note in its project and focuses the editor. For a missing note a toast offers **Create**, which writes `# <task text>` to that path with `expectedHash: null` and opens it; a file that appeared meanwhile is never replaced. A hand-written link whose file name breaks the [note name rules](#editing-and-autosave) (or starts or ends with a space) is not created; the toast gives the reason.
+- **Create note from task** (menu, for tasks without a link) names the note after the task text without links: characters not allowed in file names (`/ \ < > : " | ? *`, control characters) become spaces, spaces are collapsed, a trailing `.md` is dropped, leading dots and trailing dots and spaces are dropped, and the name is cut to fit 200 bytes with `.md` on a character boundary. A name that is still not valid (empty, `tasks`, a Windows device name) becomes `untitled`. The note goes into the task list's folder as `<name>.md`, `<name> 2.md`… like new notes (a long name is shortened so the number still fits in 200 bytes), created with `# <task text>` and `expectedHash: null`. Then ` [note](<name>.md)` is appended to the task (one line edit, finding the task by its text) and the note opens with editor focus. If the task changed meanwhile so that it cannot be found, the note is still opened and a toast says it was created but not linked. Asking again for the same task while its note is being created does nothing.
+
+### All tasks
+
+`~/all-tasks` in the sidebar shows the combined view: the tasks of every task list (done ones in place, struck through, unless **hide done** is on for All tasks), the inbox first, then projects in sidebar order, each under a header with its open count. Archived projects are left out. The list pane also lists each task list, to open it on its own. The same keys work as in the task view; `Enter` adds to the focused task's list, and `Alt+↑/↓` moves within it.
+
+The view reads the **task index** (`src/lib/core/taskIndex.ts`): the parsed text of every task list, with the hash of the disk version it matches. It is filled by the background summary reads (lists over 1 MiB are skipped; a list that grows over that size is dropped, and All tasks names the lists it cannot show), updated from change events, and from the app's own edits and saves; each change parses only the list it touches. A list with an open session is kept current by the session, so a background read never replaces edits that are not saved yet. Edits from All tasks create a session on demand from the index entry (no read needed); it is saved like any other and dropped once everything is on disk. If the file changed on disk before the index caught up, the save conflicts; the session then reads the newer version and applies the same edits to it once, finding each task again by its text. Only if that fails are both versions kept, as above. The sidebar counts come from the same parsed lists: open top-level tasks, subtasks not counted.
+
+### New projects
+
+`+ new project` in the sidebar (or `Ctrl+Shift+N`, `Cmd+Shift+N` on macOS) opens a name field. `Enter` creates the project, `Esc` or leaving the field cancels. The name is used as typed (trimmed) for the folder (`src/lib/core/projectNames.ts`): the [note name rules](#editing-and-autosave) apply without adding `.md`, plus names starting with `_` (including `_archive`), `inbox`, `node_modules`, existing project names (ignoring case), names hidden by the ignore patterns, and names over 100 UTF-8 bytes are refused with the reason shown. The project is created by writing an empty `<name>/tasks.md` with `expectedHash: null`, so an existing list is never replaced. The new project is selected with its task list open and the "Add a task…" field focused.
 
 ## Sync
 

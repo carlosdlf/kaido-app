@@ -57,27 +57,39 @@ export function stemLength(name: string): number {
 
 const invalid = (reason: string): NameValidation => ({ ok: false, reason });
 
+/**
+ * Why a trimmed file or folder name breaks on some OS (empty, separators,
+ * control or reserved characters, a leading dot), or `null`.
+ */
+export function portableNameProblem(trimmed: string): string | null {
+  if (trimmed === "") return "Enter a name.";
+  if (trimmed.includes("/") || trimmed.includes("\\")) return "Names cannot contain / or \\.";
+  if (CONTROL.test(trimmed)) return "Names cannot contain control characters.";
+  if (WINDOWS_RESERVED_CHARS.test(trimmed)) return 'Names cannot contain < > : " | ? or *.';
+  if (trimmed.startsWith(".")) return "Names cannot start with a dot.";
+  return null;
+}
+
+/**
+ * Why a name without its extension breaks on Windows (a trailing space or
+ * dot, a device name such as `CON`, also before another extension), or `null`.
+ */
+export function stemProblem(stem: string): string | null {
+  if (/[\s.]$/u.test(stem)) return "Names cannot end with a space or a dot.";
+  const device = (stem.split(".")[0] ?? "").trimEnd();
+  if (WINDOWS_DEVICE.test(device)) return `${device.toUpperCase()} is a reserved name on Windows.`;
+  return null;
+}
+
 /** Checks a name typed for a note and returns the file name to use, or why it is refused. */
 export function validateNoteName(input: string): NameValidation {
   const trimmed = input.trim();
-  if (trimmed === "") return invalid("Enter a name.");
-  if (trimmed.includes("/") || trimmed.includes("\\")) {
-    return invalid("Names cannot contain / or \\.");
-  }
-  if (CONTROL.test(trimmed)) return invalid("Names cannot contain control characters.");
-  if (WINDOWS_RESERVED_CHARS.test(trimmed)) {
-    return invalid('Names cannot contain < > : " | ? or *.');
-  }
-  if (trimmed.startsWith(".")) return invalid("Names cannot start with a dot.");
+  const problem = portableNameProblem(trimmed);
+  if (problem !== null) return invalid(problem);
 
   const name = MARKDOWN_EXTENSION.test(trimmed) ? trimmed : `${trimmed}.md`;
-  const stem = name.slice(0, stemLength(name));
-  if (/[\s.]$/u.test(stem)) return invalid("Names cannot end with a space or a dot.");
-  // Windows reserves device names, also when followed by an extension.
-  const device = (stem.split(".")[0] ?? "").trimEnd();
-  if (WINDOWS_DEVICE.test(device)) {
-    return invalid(`${device.toUpperCase()} is a reserved name on Windows.`);
-  }
+  const stemIssue = stemProblem(name.slice(0, stemLength(name)));
+  if (stemIssue !== null) return invalid(stemIssue);
   if (name.toLowerCase() === TASKS_FILE) {
     return invalid(`${TASKS_FILE} is reserved for task lists.`);
   }

@@ -1,12 +1,10 @@
 /**
- * Light Markdown scanning for list views: note titles and open task counts.
+ * Light Markdown scanning for list views: note titles.
  *
  * Front matter at the very top (`---` … `---`) and fenced code blocks
  * (``` or ~~~) are skipped, so a `# comment` in a shell snippet is not a
- * title and a checkbox inside a code sample is not a task.
+ * title. Task lists are parsed by `taskDocument.ts`.
  */
-
-import { parseTaskLine } from "./tasks";
 
 const FENCE = /^ {0,3}(`{3,}|~{3,})/;
 const HEADING = /^ {0,3}#[ \t]+(.*)$/;
@@ -50,11 +48,6 @@ function scanProse(text: string, visit: (line: string) => boolean, start = 0): v
   }
 }
 
-function proseStart(text: string): number {
-  // Without a closing delimiter it is not front matter, just a rule.
-  return Math.max(frontMatterEnd(text), 0);
-}
-
 /** Removes an optional closing sequence (`# Title ##`), in linear time. */
 export function headingText(raw: string): string {
   const text = raw.trim();
@@ -91,18 +84,4 @@ export function noteTitle(path: string, text: string): string {
     Math.max(start, 0),
   );
   return title || fileStem(path);
-}
-
-/** Number of unchecked task lines. */
-export function countOpenTasks(text: string): number {
-  let count = 0;
-  scanProse(
-    text,
-    (line) => {
-      if (parseTaskLine(line)?.done === false) count += 1;
-      return false;
-    },
-    proseStart(text),
-  );
-  return count;
 }

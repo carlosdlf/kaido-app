@@ -80,6 +80,12 @@ const typeAtEnd = (text: string) => {
 };
 const fileText = async (storage: MemoryStorage, path: string) =>
   (await storage.readFile(path)).contents;
+const tasksPane = () => within(screen.getByRole("main", { name: "Tasks" }));
+/** Shows the selected task list in the text editor. */
+async function editAsText() {
+  await userEvent.setup().click(tasksPane().getByRole("radio", { name: "text" }));
+  await vi.waitFor(() => expect(textbox()).toBeVisible());
+}
 
 describe("AppShell without a workspace", () => {
   it("offers to open a folder and remembers the choice", async () => {
@@ -145,14 +151,16 @@ describe("AppShell with a workspace", () => {
     expect(nav().getByRole("button", { name: /all-tasks/ })).toHaveTextContent("[3]");
     const projects = within(nav().getByRole("list", { name: "projects" }));
     expect(projects.getAllByRole("button").map((button) => button.textContent?.trim())).toEqual([
-      "▸ api-payments",
-      "▸ dotfiles",
+      "api-payments",
+      "dotfiles",
     ]);
     expect(screen.getByText("~/notes")).toBeInTheDocument();
     expect(list().getByRole("heading", { name: "~/inbox" })).toBeInTheDocument();
     expect(list().getByText("1 note · 2 tasks")).toBeInTheDocument();
-    expect(editorText().state.doc.toString()).toBe(files["inbox/tasks.md"]);
-    expect(textbox()).toHaveTextContent("- [ ] renew TLS #ops");
+    expect(tasksPane().getAllByRole("checkbox")).toHaveLength(3);
+    expect(tasksPane().getByRole("checkbox", { name: "renew TLS #ops" })).not.toBeChecked();
+    expect(tasksPane().getByRole("checkbox", { name: "done" })).toBeChecked();
+    expect(screen.queryByRole("main", { name: "Editor" })).toBeNull();
   });
 
   it("shows note names, titles and the note in the editor", async () => {
@@ -207,7 +215,11 @@ describe("AppShell with a workspace", () => {
     const user = userEvent.setup();
     await ready({ files: { "inbox/tasks.md": "- [x] done" } });
     await user.click(nav().getByRole("button", { name: /all-tasks/ }));
-    expect(list().getByText("No open tasks.")).toBeInTheDocument();
+    const all = within(screen.getByRole("main", { name: "All tasks" }));
+    expect(all.getByText("0 open")).toBeInTheDocument();
+    expect(all.getByRole("checkbox", { name: "done" })).toBeChecked();
+    await user.click(all.getByRole("button", { name: "hide done" }));
+    expect(all.getByText("No open tasks.")).toBeInTheDocument();
   });
 
   it("moves through folders and items with the keyboard", async () => {
@@ -231,7 +243,7 @@ describe("AppShell with a workspace", () => {
     expect(tasks).toHaveFocus();
     expect(tasks).toHaveAttribute("aria-current", "true");
     await user.keyboard("{Enter}");
-    await vi.waitFor(() => expect(textbox()).toHaveTextContent("try pino"));
+    expect(tasksPane().getByRole("checkbox", { name: "try pino" })).toBeInTheDocument();
   });
 
   it("ignores arrow keys on buttons that are not folders", async () => {
@@ -248,7 +260,9 @@ describe("AppShell with a workspace", () => {
     const { storage, app } = await ready();
     storage.setExternal("inbox/tasks.md", "- [ ] a\n- [ ] b\n- [ ] c\n- [ ] d\n");
     await app.settled();
-    await vi.waitFor(() => expect(textbox()).toHaveTextContent("- [ ] d"));
+    await vi.waitFor(() =>
+      expect(tasksPane().getByRole("checkbox", { name: "d" })).toBeInTheDocument(),
+    );
     expect(nav().getByRole("button", { name: /inbox/ })).toHaveTextContent("[4]");
   });
 
@@ -256,7 +270,7 @@ describe("AppShell with a workspace", () => {
     const { storage, app } = await ready();
     storage.setExternal("inbox/tasks.md", null);
     await app.settled();
-    expect(await editor().findByRole("status")).toHaveTextContent("This file no longer exists.");
+    expect(await tasksPane().findByRole("status")).toHaveTextContent("This file no longer exists.");
   });
 
   it("shows read errors", async () => {
@@ -344,6 +358,7 @@ describe("AppShell with a workspace", () => {
 describe("AppShell editing", () => {
   it("saves typed text and shows the save state", async () => {
     const { storage } = await ready();
+    await editAsText();
     typeAtEnd("- [ ] new task\n");
     expect(await editor().findByText("unsaved")).toBeInTheDocument();
     await vi.waitFor(async () =>
@@ -358,6 +373,7 @@ describe("AppShell editing", () => {
   it("keeps the line breaks of a CRLF note", async () => {
     const crlf = "- [ ] one\r\n- [ ] two\r\n";
     const { storage } = await ready({ files: { "inbox/tasks.md": crlf } });
+    await editAsText();
     await vi.waitFor(() => expect(textbox()).toHaveTextContent("- [ ] two"));
     expect(editor().getByText(/^saved · /)).toBeInTheDocument();
     expect(undo(editorText())).toBe(false);
@@ -370,6 +386,7 @@ describe("AppShell editing", () => {
   it("keeps undo history when switching notes", async () => {
     const user = userEvent.setup();
     const { storage } = await ready();
+    await editAsText();
     typeAtEnd("extra");
     await user.click(list().getByRole("button", { name: /reading-list\.md/ }));
     await vi.waitFor(() => expect(textbox()).toHaveTextContent("# Reading list"));
@@ -377,6 +394,7 @@ describe("AppShell editing", () => {
     expect(await fileText(storage, "inbox/tasks.md")).toContain("extra");
 
     await user.click(list().getByRole("button", { name: /tasks\.md/ }));
+    await editAsText();
     await vi.waitFor(() => expect(textbox()).toHaveTextContent("extra"));
     expect(undo(editorText())).toBe(true);
     expect(editorText().state.doc.toString()).toBe(files["inbox/tasks.md"]);
@@ -394,7 +412,7 @@ describe("AppShell editing", () => {
     render(AppShell, { app });
     await app.start();
     await app.settled();
-    await vi.waitFor(() => expect(textbox()).toBeInTheDocument());
+    await editAsText();
     typeAtEnd("on blur");
     window.dispatchEvent(new FocusEvent("blur"));
     await vi.waitFor(async () =>
@@ -405,6 +423,7 @@ describe("AppShell editing", () => {
   it("keeps both versions on a conflict and says so", async () => {
     const user = userEvent.setup();
     const { storage, app } = await ready();
+    await editAsText();
     vi.spyOn(storage, "writeFile").mockRejectedValueOnce(new StorageError("Io", "disk busy"));
     typeAtEnd("mine");
     expect(
@@ -427,6 +446,7 @@ describe("AppShell editing", () => {
 
   it("hides the editor for a missing note", async () => {
     const { storage, app } = await ready();
+    await editAsText();
     storage.setExternal("inbox/tasks.md", null);
     await app.settled();
     expect(await editor().findByRole("status")).toHaveTextContent("This file no longer exists.");
@@ -461,6 +481,7 @@ describe("AppShell new note", () => {
 
   it("works while typing in the editor and ignores held keys", async () => {
     const { app } = await ready();
+    await editAsText();
     const create = vi.spyOn(app, "createNote");
     textbox().focus();
     fireEvent.keyDown(textbox(), { key: "n", ctrlKey: true, repeat: true });
@@ -597,6 +618,7 @@ describe("AppShell note actions", () => {
     // In the editor, Ctrl+Z is the editor's own undo.
     await user.click(row(/tasks\.md/));
     await app.settled();
+    await editAsText();
     textbox().focus();
     await user.keyboard("{Control>}z{/Control}");
     await app.settled();
@@ -660,8 +682,19 @@ describe("AppShell note actions", () => {
   it("returns focus to the list when the last toast is dismissed", async () => {
     const user = userEvent.setup();
     const { app } = await ready();
+    await user.click(row(/reading-list\.md/));
     app.notify("hello");
     await user.click(await screen.findByRole("button", { name: "Dismiss" }));
-    await vi.waitFor(() => expect(row(/tasks\.md/)).toHaveFocus());
+    await vi.waitFor(() => expect(row(/reading-list\.md/)).toHaveFocus());
+  });
+
+  it("returns focus to the task list when the last toast is dismissed there", async () => {
+    const user = userEvent.setup();
+    const { app } = await ready();
+    app.notify("hello");
+    await user.click(await screen.findByRole("button", { name: "Dismiss" }));
+    await vi.waitFor(() =>
+      expect(tasksPane().getByRole("checkbox", { name: "try pino" })).toHaveFocus(),
+    );
   });
 });

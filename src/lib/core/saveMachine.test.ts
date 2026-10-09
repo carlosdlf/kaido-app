@@ -808,3 +808,65 @@ describe("SaveSession exclusive steps", () => {
     await expect(session.exclusive(task)).rejects.toThrow(SESSION_CLOSED);
   });
 });
+
+describe("rebasing edits on a newer disk version", () => {
+  function rebasing(rebase: (disk: string) => string | null) {
+    const disk = new FakeDisk();
+    disk.files.set("p/tasks.md", "a\n");
+    const events = { conflict: vi.fn(), rebased: vi.fn(), saved: vi.fn() };
+    const session = new SaveSession({
+      path: "p/tasks.md",
+      contents: "a\n",
+      hash: hash("a\n"),
+      savedAt: 1,
+      io: disk,
+      timers,
+      events,
+      rebase: vi.fn(rebase),
+    });
+    return { disk, events, session };
+  }
+
+  it("applies the edits again instead of keeping a conflict copy", async () => {
+    const { disk, events, session } = rebasing((text) => `${text}mine\n`);
+    session.edit(() => "a\nmine\n");
+    disk.files.set("p/tasks.md", "theirs\na\n");
+    await session.flush();
+    expect(disk.files.get("p/tasks.md")).toBe("theirs\na\nmine\n");
+    expect(events.rebased).toHaveBeenCalledWith("theirs\na\nmine\n");
+    expect(events.conflict).not.toHaveBeenCalled();
+    expect(session.text).toBe("theirs\na\nmine\n");
+    expect(session.dirty).toBe(false);
+  });
+
+  it("settles without a write when the rebased text is already on disk", async () => {
+    const { disk, events, session } = rebasing((text) => text);
+    session.edit(() => "a\nmine\n");
+    disk.files.set("p/tasks.md", "same\n");
+    await session.flush();
+    expect(disk.writes).toHaveLength(1);
+    expect(events.rebased).toHaveBeenCalledWith("same\n");
+    expect(session.status).toMatchObject({ kind: "saved" });
+  });
+
+  it("keeps a conflict copy when the edits no longer apply, and tries only once", async () => {
+    const { disk, events, session } = rebasing(() => null);
+    session.edit(() => "a\nmine\n");
+    disk.files.set("p/tasks.md", "theirs\n");
+    await session.flush();
+    expect(events.conflict).toHaveBeenCalledOnce();
+    expect(disk.files.get("p/tasks.md")).toBe("a\nmine\n");
+
+    const second = rebasing(() => {
+      throw new Error("broken");
+    });
+    second.session.edit(() => "x\n");
+    second.disk.files.set("p/tasks.md", "theirs\n");
+    await second.session.flush();
+    expect(second.events.conflict).toHaveBeenCalledOnce();
+    second.session.edit(() => "y\n");
+    second.disk.files.set("p/tasks.md", "again\n");
+    await second.session.flush();
+    expect(second.events.conflict).toHaveBeenCalledTimes(2);
+  });
+});

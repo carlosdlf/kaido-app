@@ -94,3 +94,10 @@ a:hover {
   white-space: nowrap;
   border: 0;
 }
+
+/* Lucide line icons: sized by token, colored by the surrounding text. */
+.lucide-icon {
+  flex-shrink: 0;
+  width: var(--icon-size);
+  height: var(--icon-size);
+}

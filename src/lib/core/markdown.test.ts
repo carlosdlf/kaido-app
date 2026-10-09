@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { countOpenTasks, fileStem, noteTitle, TITLE_SCAN_LIMIT } from "./markdown";
+import { fileStem, noteTitle, TITLE_SCAN_LIMIT } from "./markdown";
 
 describe("noteTitle", () => {
   it("uses the first level-one heading", () => {
@@ -65,21 +65,6 @@ describe("noteTitle", () => {
   });
 });
 
-describe("countOpenTasks", () => {
-  it("counts unchecked tasks only", () => {
-    expect(countOpenTasks("- [ ] a\n- [x] b\n* [ ] c\n+ [X] d\ntext")).toBe(2);
-  });
-
-  it("handles CRLF line endings and empty text", () => {
-    expect(countOpenTasks("- [ ] a\r\n- [ ] b\r\n")).toBe(2);
-    expect(countOpenTasks("")).toBe(0);
-  });
-
-  it("ignores tasks in code blocks and front matter", () => {
-    expect(countOpenTasks("---\n- [ ] meta\n---\n```\n- [ ] code\n```\n- [ ] real")).toBe(1);
-  });
-});
-
 describe("noteTitle limits", () => {
   it("only scans the head of long notes", () => {
     const filler = "text\n".repeat(TITLE_SCAN_LIMIT / 5 + 10);
@@ -96,7 +81,6 @@ describe("noteTitle limits", () => {
     const text = `# Title\n${"- [ ] task\n".repeat(100_000)}`;
     const start = Date.now();
     expect(noteTitle("a.md", text)).toBe("Title");
-    expect(countOpenTasks(text)).toBe(100_000);
     expect(Date.now() - start).toBeLessThan(200);
   });
 });

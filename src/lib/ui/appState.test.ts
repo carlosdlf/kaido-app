@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ALL_TASKS } from "$lib/core/views";
+import { ALL_TASKS, listItems } from "$lib/core/views";
 import { MemoryStorage, StorageError } from "$lib/storage";
 import { AppState } from "./appState.svelte";
 
@@ -288,10 +288,12 @@ describe("AppState selection", () => {
     expect(app.item).toBe("inbox/idea.md");
   });
 
-  it("selects the first task list in all tasks", async () => {
+  it("selects the combined task view in all tasks, without a document", async () => {
     const { app } = await started();
     app.selectFolder(ALL_TASKS);
-    expect(app.item).toBe("inbox/tasks.md");
+    expect(app.item).toBe(ALL_TASKS);
+    expect(app.document).toBeNull();
+    expect(app.saveStatus).toBeNull();
   });
 
   it("clears the selection for an empty view", async () => {
@@ -299,7 +301,7 @@ describe("AppState selection", () => {
     expect(app.item).toBe("");
     expect(app.document).toBeNull();
     app.selectFolder(ALL_TASKS);
-    expect(app.item).toBe("");
+    expect(app.item).toBe(ALL_TASKS);
   });
 
   it("shows a loading state, then the contents", async () => {
@@ -530,7 +532,10 @@ describe("AppState failures after subscribing", () => {
       files: { "inbox/tasks.md": "- [x] done", "api/tasks.md": "- [ ] open" },
     });
     app.selectFolder(ALL_TASKS);
-    expect(app.item).toBe("api/tasks.md");
+    expect(listItems(app.workspace, ALL_TASKS, app.summaries).map((item) => item.id)).toEqual([
+      ALL_TASKS,
+      "api/tasks.md",
+    ]);
   });
 });
 

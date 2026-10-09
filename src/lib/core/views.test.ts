@@ -1,7 +1,10 @@
+import { parseTaskDocument } from "./taskDocument";
 import { describe, expect, it } from "vitest";
 import {
   ALL_TASKS,
+  ALL_TASKS_LABEL,
   fallbackSummary,
+  isConflictCopy,
   MAX_SUMMARY_BYTES,
   PathQueue,
   summarizeFile,
@@ -78,17 +81,25 @@ describe("listItems", () => {
     expect(listItems(ws, "missing", summaries)).toEqual([]);
   });
 
-  it("lists task files with open or unknown counts in all tasks", () => {
+  it("lists the combined view, then task files with open or unknown counts in all tasks", () => {
     expect(listItems(ws, ALL_TASKS, summaries).map((item) => item.id)).toEqual([
+      ALL_TASKS,
       "inbox/tasks.md",
       "api/tasks.md",
     ]);
     expect(listItems(ws, ALL_TASKS, new Map()).map((item) => item.id)).toEqual([
+      ALL_TASKS,
       "inbox/tasks.md",
       "api/tasks.md",
       "empty/tasks.md",
     ]);
-    expect(listItems(ws, ALL_TASKS, summaries)[0]).toMatchObject({ label: "inbox/tasks.md" });
+    expect(listItems(ws, ALL_TASKS, summaries)[0]).toMatchObject({
+      kind: "tasks",
+      label: ALL_TASKS_LABEL,
+      openCount: 5,
+    });
+    expect(listItems(ws, ALL_TASKS, new Map())[0]).toMatchObject({ openCount: null });
+    expect(listItems(ws, ALL_TASKS, summaries)[1]).toMatchObject({ label: "inbox/tasks.md" });
   });
 });
 
@@ -174,6 +185,18 @@ describe("summarizeFile", () => {
     expect(summarizeFile("api/sub/tasks.md", "- [ ] a").openTasks).toBe(0);
   });
 
+  it("counts open top-level tasks outside code and front matter, like the task view", () => {
+    const text = "---\n- [ ] meta\n---\n```\n- [ ] code\n```\n- [ ] real\n  - [ ] sub\n- [X] done";
+    expect(summarizeFile("api/tasks.md", text).openTasks).toBe(1);
+    expect(summarizeFile("api/tasks.md", "- [ ] a\r- [ ] b").openTasks).toBe(2);
+  });
+
+  it("reuses a parsed list for the same text only", () => {
+    const doc = parseTaskDocument("- [ ] a\n- [ ] b");
+    expect(summarizeFile("api/tasks.md", "- [ ] a\n- [ ] b", doc).openTasks).toBe(2);
+    expect(summarizeFile("api/tasks.md", "- [ ] a", doc).openTasks).toBe(1);
+  });
+
   it("falls back to the file name for skipped files", () => {
     expect(fallbackSummary("api/big-log.md")).toEqual({ title: "big-log", openTasks: 0 });
     expect(MAX_SUMMARY_BYTES).toBe(1024 * 1024);
@@ -257,5 +280,15 @@ describe("PathQueue", () => {
     expect(queue.take(1)).toEqual(["a.md"]);
     queue.add(["d.md"], () => 0);
     expect(queue.take(5)).toEqual(["b.md", "c.md", "d.md"]);
+  });
+});
+
+describe("isConflictCopy", () => {
+  it("recognizes conflict copies by name", () => {
+    expect(isConflictCopy("tasks (conflict 2026-10-08 0905).md")).toBe(true);
+    expect(isConflictCopy("api/plan (conflict 2026-10-08 0905) 2.md")).toBe(true);
+    expect(isConflictCopy("conflict notes.md")).toBe(false);
+    expect(isConflictCopy("a (conflict notes).md")).toBe(false);
+    expect(isConflictCopy("a (conflict 2026-10-08 0905).txt")).toBe(false);
   });
 });

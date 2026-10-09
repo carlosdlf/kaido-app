@@ -35,6 +35,9 @@ importers:
       '@lezer/highlight':
         specifier: ^1.2.5
         version: 1.2.5
+      '@lucide/svelte':
+        specifier: ~1.52.0
+        version: 1.52.0(svelte@5.57.2(@typescript-eslint/types@8.71.1))
       '@tauri-apps/api':
         specifier: ~2.11.1
         version: 2.11.1
@@ -433,6 +436,11 @@ packages:
 
   '@lezer/yaml@1.0.4':
     resolution: {integrity: sha512-2lrrHqxalACEbxIbsjhqGpSW8kWpUKuY6RHgnSAFZa6qK62wvnPxA8hGOwOoDbwHcOFs5M4o27mjGu+P7TvBmw==}
+
+  '@lucide/svelte@1.52.0':
+    resolution: {integrity: sha512-bQ8t3IcZxWqAdmdMZPyZEv8Qf+MDgBAf7n43eRQoXyBeLWr8HWToiMIO6vKlHxC/lnMiCDdTzm09hjy92ch46A==}
+    peerDependencies:
+      svelte: ^5
 
   '@marijn/find-cluster-break@1.0.4':
     resolution: {integrity: sha512-Wy0V7+SGUjnF9/TkiM1hKVDPj7jKXduPNboMVtHTA8dySMURWqfg/JZ9E2Sq8JgSJmkl7k7Qe9FLeMSrSraWmQ==}
@@ -2150,6 +2158,10 @@ snapshots:
       '@lezer/common': 1.5.3
       '@lezer/highlight': 1.2.5
       '@lezer/lr': 1.4.11
+
+  '@lucide/svelte@1.52.0(svelte@5.57.2(@typescript-eslint/types@8.71.1))':
+    dependencies:
+      svelte: 5.57.2(@typescript-eslint/types@8.71.1)
 
   '@marijn/find-cluster-break@1.0.4': {}
 
