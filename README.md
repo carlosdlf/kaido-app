@@ -1,3 +1,10 @@
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/kaido-mark-light.svg">
+  <img src="docs/assets/kaido-mark-dark.svg" alt="Kaido logo" width="112">
+</picture>
+
 # Kaido
 
 **Notes and to-dos for developers, stored in your own git repo.**
@@ -5,29 +12,35 @@
 ![Status: alpha](https://img.shields.io/badge/status-alpha-F2A93B?labelColor=24272C)
 [![License: MIT or Apache 2.0](https://img.shields.io/badge/license-MIT%20or%20Apache%202.0-F2A93B?labelColor=24272C)](#license)
 [![CI](https://img.shields.io/github/actions/workflow/status/carlosdlf/kaido-app/ci.yml?branch=main&label=ci&labelColor=24272C)](https://github.com/carlosdlf/kaido-app/actions/workflows/ci.yml)
+
 <!--
 Enable once coverage upload and the first release exist:
 [![Coverage](https://img.shields.io/codecov/c/github/carlosdlf/kaido-app?labelColor=24272C)](https://codecov.io/gh/carlosdlf/kaido-app)
 [![Release](https://img.shields.io/github/v/release/carlosdlf/kaido-app?include_prereleases&color=F2A93B&labelColor=24272C)](https://github.com/carlosdlf/kaido-app/releases)
 -->
 
-Kaido is a minimal, keyboard-first desktop app for keeping notes and task lists organized by project. Everything is plain Markdown in a git repository you own. There is no account, no server, and no lock-in: you can read and edit your notes with any editor, and Kaido syncs them in the background.
+</div>
+
+## What is Kaido?
+
+Kaido is a small, fast desktop app for the notes and task lists you keep while you work: meeting notes, runbooks, ideas, and the to-dos for each project. Think of a notes app without the bloat, built for people who already live in a terminal and a git repo.
+
+- **Your files, not a database.** Every note is a plain Markdown file and every project is a folder. Open them in any editor, grep them, diff them.
+- **Your git repo is the sync.** Kaido will commit and sync in the background with the `git` you already use (in progress). No account, no server, no subscription, no lock-in.
+- **Organized by project.** Each project has its notes and one task list. An inbox catches everything that doesn't have a home yet.
+- **Keyboard first and instant.** Built with [Tauri](https://tauri.app) and Svelte. Opening the app, switching notes and searching should never make you wait.
+- **Safe by design.** Autosave never overwrites a newer version: if a file changed elsewhere, both versions are kept. Deleted notes go to the system trash and can be undone.
 
 > [!NOTE]
 > Kaido is in early development and not ready for daily use yet. Follow the [changelog](CHANGELOG.md) for progress.
 
 ## Features
 
-Planned for the first release:
-
-- **Projects** with Markdown notes and a task list each
-- **Inbox** and a global quick-capture shortcut
-- **All tasks** view across every project
-- **Command palette** (`Ctrl+K`) to search notes and tasks and run actions
-- **Background git sync** with conflict handling that never loses data
-- **Fast and light**: built with [Tauri](https://tauri.app), instant search, no waiting on the network
-
-On the roadmap: links between notes, per-note history, due dates and reminders, a pomodoro timer, a CLI, and web and mobile apps.
+| | |
+|---|---|
+| ✅ Available | Open any folder as a workspace · projects and notes from your folder structure · Markdown editor with autosave · new notes (`Ctrl+N`) · rename and delete with undo · table editing · picks up changes made by other editors |
+| 🚧 Next | Task lists with keyboard shortcuts · **All tasks** view across projects · background git sync |
+| 🗺️ Planned | Command palette (`Ctrl+K`) and instant search · global quick-capture shortcut · links between notes and per-note history · due dates and reminders · a CLI · web and mobile apps |
 
 ## How it works
 
