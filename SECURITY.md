@@ -9,7 +9,7 @@ Kaido is in early development. Security fixes are applied to the latest release 
 Please **do not** report security vulnerabilities through public issues, discussions or pull requests.
 
 Instead, use GitHub's private vulnerability reporting:
-[Report a vulnerability](https://github.com/kaidoapp/kaido/security/advisories/new).
+[Report a vulnerability](https://github.com/carlosdlf/kaido-app/security/advisories/new).
 
 Please include:
 

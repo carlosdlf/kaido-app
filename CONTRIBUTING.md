@@ -21,8 +21,8 @@ Thanks for your interest in Kaido! This guide explains how to set up the project
 3. Clone and run:
 
    ```sh
-   git clone https://github.com/kaidoapp/kaido.git
-   cd kaido
+   git clone https://github.com/carlosdlf/kaido-app.git
+   cd kaido-app
    pnpm install
    pnpm tauri dev
    ```

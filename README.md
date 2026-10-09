@@ -4,11 +4,11 @@
 
 ![Status: alpha](https://img.shields.io/badge/status-alpha-F2A93B?labelColor=24272C)
 [![License: MIT or Apache 2.0](https://img.shields.io/badge/license-MIT%20or%20Apache%202.0-F2A93B?labelColor=24272C)](#license)
+[![CI](https://img.shields.io/github/actions/workflow/status/carlosdlf/kaido-app/ci.yml?branch=main&label=ci&labelColor=24272C)](https://github.com/carlosdlf/kaido-app/actions/workflows/ci.yml)
 <!--
-Enable once the repository is published on GitHub:
-[![CI](https://img.shields.io/github/actions/workflow/status/kaidoapp/kaido/ci.yml?branch=main&label=ci&labelColor=24272C)](https://github.com/kaidoapp/kaido/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/codecov/c/github/kaidoapp/kaido?labelColor=24272C)](https://codecov.io/gh/kaidoapp/kaido)
-[![Release](https://img.shields.io/github/v/release/kaidoapp/kaido?include_prereleases&color=F2A93B&labelColor=24272C)](https://github.com/kaidoapp/kaido/releases)
+Enable once coverage upload and the first release exist:
+[![Coverage](https://img.shields.io/codecov/c/github/carlosdlf/kaido-app?labelColor=24272C)](https://codecov.io/gh/carlosdlf/kaido-app)
+[![Release](https://img.shields.io/github/v/release/carlosdlf/kaido-app?include_prereleases&color=F2A93B&labelColor=24272C)](https://github.com/carlosdlf/kaido-app/releases)
 -->
 
 Kaido is a minimal, keyboard-first desktop app for keeping notes and task lists organized by project. Everything is plain Markdown in a git repository you own. There is no account, no server, and no lock-in: you can read and edit your notes with any editor, and Kaido syncs them in the background.
@@ -69,8 +69,8 @@ Kaido picks up changes you make with other editors while it is running.
 Requirements: [Node.js](https://nodejs.org) 22+, [pnpm](https://pnpm.io), [Rust](https://rustup.rs) (stable), `git`, and the [Tauri prerequisites](https://tauri.app/start/prerequisites/) for your platform.
 
 ```sh
-git clone https://github.com/kaidoapp/kaido.git
-cd kaido
+git clone https://github.com/carlosdlf/kaido-app.git
+cd kaido-app
 pnpm install
 pnpm tauri dev
 ```
