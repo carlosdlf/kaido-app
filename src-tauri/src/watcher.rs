@@ -753,6 +753,69 @@ mod tests {
     }
 
     #[test]
+    fn moved_notes_and_project_folders_are_reported_and_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        fs::create_dir_all(root.join("a/sub")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(root.join("a/n.md"), "x").unwrap();
+        fs::write(root.join("a/sub/deep.md"), "x").unwrap();
+
+        let (watcher, batches) = start_settled(&root, 100);
+
+        // A note moved to another folder: removed at one path, created at
+        // the other.
+        crate::fs_ops::move_file(&root, "a/n.md", "b/n.md").unwrap();
+        assert!(
+            wait_for(&batches, |b| {
+                let paths = all_paths(b);
+                paths.contains("a/n.md") && paths.contains("b/n.md")
+            }),
+            "got {:?}",
+            batches.lock().unwrap()
+        );
+        let got = batches.lock().unwrap().clone();
+        assert!(
+            got.iter()
+                .flat_map(|b| &b.entries)
+                .any(|e| e.path == "b/n.md")
+        );
+        assert!(
+            !got.iter()
+                .flat_map(|b| &b.entries)
+                .any(|e| e.path == "a/n.md")
+        );
+
+        // A whole project folder: the listing is rescanned, and the moved
+        // folders are watched at their new place.
+        batches.lock().unwrap().clear();
+        crate::folder_ops::rename_folder(&root, "a", "_archive/a").unwrap();
+        assert!(wait_for(&batches, |b| b.iter().any(|b| b.rescan)));
+        let followed = |dirs: &[PathBuf]| {
+            dirs.contains(&root.join("_archive/a/sub")) && !dirs.contains(&root.join("a/sub"))
+        };
+        if watch_tree::SELECTIVE {
+            let start = Instant::now();
+            while !followed(&watcher.watched_dirs()) && start.elapsed() < Duration::from_secs(5) {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                followed(&watcher.watched_dirs()),
+                "{:?}",
+                watcher.watched_dirs()
+            );
+        }
+        fs::write(root.join("_archive/a/sub/deep.md"), "changed").unwrap();
+        assert!(
+            wait_for(&batches, |b| all_paths(b)
+                .contains("_archive/a/sub/deep.md")),
+            "got {:?}",
+            batches.lock().unwrap()
+        );
+        assert!(!all_paths(&batches.lock().unwrap()).contains("a/sub/deep.md"));
+    }
+
+    #[test]
     fn never_watches_pruned_folders_and_follows_new_ones() {
         let dir = tempfile::tempdir().unwrap();
         let root = dunce::canonicalize(dir.path()).unwrap();

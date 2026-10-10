@@ -439,6 +439,11 @@ export class SearchIndex {
     this.#projects = [...next];
   }
 
+  /** Moves recently opened paths that moved; `rename` returns the new path or `null`. */
+  renameRecent(rename: (path: string) => string | null): void {
+    this.#recent = this.#recent.map((path) => rename(path) ?? path);
+  }
+
   /** Remembers that a note or task list was opened. */
   touch(path: string): void {
     this.#recent = [path, ...this.#recent.filter((recent) => recent !== path)].slice(

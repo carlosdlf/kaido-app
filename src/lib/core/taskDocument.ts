@@ -422,6 +422,23 @@ function insertLines(
   return lines;
 }
 
+/**
+ * Adds `added` (a task block taken from another list) at the end of the
+ * list, before a fenced code block left open at the end, with this list's
+ * line separator. A list whose last line has no line break keeps it so.
+ * Focus goes to the first added line.
+ */
+export function appendLines(doc: TaskDocument, added: readonly SourceLine[]): TaskEdit | null {
+  if (added.length === 0) return null;
+  const index = doc.openFence ?? doc.lines.length;
+  const lastWithoutBreak = doc.lines[doc.lines.length - 1]?.eol === "";
+  const lines = added.map((line, at): SourceLine => {
+    const last = at === added.length - 1 && index === doc.lines.length;
+    return { text: line.text, eol: last && lastWithoutBreak ? "" : doc.separator };
+  });
+  return { text: joinLines(insertLines(doc, index, lines)), focus: index };
+}
+
 /** Where `insertTask` puts a new task. */
 export type InsertPosition =
   /**

@@ -4,11 +4,16 @@
  * from edits (git status only reports which paths changed).
  */
 
-import { isListablePath, isTaskListPath } from "./workspace";
+import { ARCHIVE_DIR, isListablePath, isTaskListPath } from "./workspace";
 
+/**
+ * One change to commit. `folder` marks renames and deletes that happened
+ * because the app moved or deleted a whole project folder.
+ */
 export type FileChange =
-  | { kind: "added" | "modified" | "deleted"; path: string }
-  | { kind: "renamed"; from: string; path: string };
+  | { kind: "added" | "modified"; path: string }
+  | { kind: "deleted"; path: string; folder?: boolean }
+  | { kind: "renamed"; from: string; path: string; folder?: boolean };
 
 /** Longest subject line, as git tooling expects. */
 export const MAX_SUBJECT_LENGTH = 72;
@@ -54,9 +59,12 @@ function fit(subject: string): string {
 /** `Update a/b.md`, shortened to the file name when the path is too long. */
 function singleSubject(change: FileChange): string {
   if (change.kind === "renamed") {
-    const target =
-      folderOf(change.from) === folderOf(change.path) ? nameOf(change.path) : change.path;
-    const full = `Rename ${change.from} to ${target}`;
+    if (folderOf(change.from) !== folderOf(change.path)) {
+      const full = `Move ${change.from} to ${change.path}`;
+      if (full.length <= MAX_SUBJECT_LENGTH) return full;
+      return fit(`Move ${nameOf(change.from)} to ${change.path}`);
+    }
+    const full = `Rename ${change.from} to ${nameOf(change.path)}`;
     if (full.length <= MAX_SUBJECT_LENGTH) return full;
     return fit(`Rename ${nameOf(change.from)} to ${nameOf(change.path)}`);
   }
@@ -96,6 +104,61 @@ function groupSubject(changes: readonly FileChange[]): string {
   return subject.length <= MAX_SUBJECT_LENGTH ? subject : what;
 }
 
+/** The project folder of a path: `a` for `a/x.md`, `_archive/a` for `_archive/a/x.md`. */
+function projectFolder(path: string): string {
+  const segments = path.split("/");
+  const depth = segments[0] === ARCHIVE_DIR ? 2 : 1;
+  return segments.length > depth ? segments.slice(0, depth).join("/") : "";
+}
+
+/** The project name of a project folder (without `_archive/`). */
+function projectName(folder: string): string {
+  return folder.startsWith(`${ARCHIVE_DIR}/`) ? folder.slice(ARCHIVE_DIR.length + 1) : folder;
+}
+
+/**
+ * `Rename project a to b`, `Archive project a`, `Unarchive project a` or
+ * `Delete project a`, when every change (task list edits aside, such as
+ * links updated in other projects) moved or deleted one project folder.
+ */
+function projectSubject(changes: readonly FileChange[]): string | null {
+  const core = changes.filter(
+    (change) => !(change.kind === "modified" && isTaskListPath(change.path)),
+  );
+  const [first] = core;
+  if (!first || !core.every((change) => "folder" in change && change.folder === true)) return null;
+  if (first.kind === "deleted") {
+    const folder = projectFolder(first.path);
+    const same = core.every(
+      (change) => change.kind === "deleted" && projectFolder(change.path) === folder,
+    );
+    return folder !== "" && same ? fit(`Delete project ${projectName(folder)}`) : null;
+  }
+  if (first.kind !== "renamed") return null;
+  const from = projectFolder(first.from);
+  const to = projectFolder(first.path);
+  const same = core.every(
+    (change) =>
+      change.kind === "renamed" &&
+      projectFolder(change.from) === from &&
+      projectFolder(change.path) === to &&
+      change.from.slice(from.length) === change.path.slice(to.length),
+  );
+  if (from === "" || to === "" || from === to || !same) return null;
+  if (to === `${ARCHIVE_DIR}/${from}`) return fit(`Archive project ${from}`);
+  if (from === `${ARCHIVE_DIR}/${to}`) return fit(`Unarchive project ${to}`);
+  return fit(`Rename project ${projectName(from)} to ${projectName(to)}`);
+}
+
+/** A single note moved or renamed, with task list edits (updated links) aside. */
+function movedNote(changes: readonly FileChange[]): FileChange | null {
+  const core = changes.filter(
+    (change) => !(change.kind === "modified" && isTaskListPath(change.path)),
+  );
+  const [only] = core;
+  return core.length === 1 && only?.kind === "renamed" && only.folder !== true ? only : null;
+}
+
 function bodyLine(change: FileChange): string {
   return change.kind === "renamed" ? `${change.from} -> ${change.path}` : change.path;
 }
@@ -112,10 +175,16 @@ export function commitMessage(changes: readonly FileChange[]): string | null {
     (change) =>
       (change.kind === "added" || change.kind === "modified") && isTaskListPath(change.path),
   );
+  const moved = onlyTasks ? null : movedNote(sorted);
   let subject: string;
   if (onlyTasks) subject = tasksSubject(sorted);
-  else if (sorted.length === 1 && sorted[0]) subject = singleSubject(sorted[0]);
-  else subject = groupSubject(sorted);
+  else if (moved) subject = singleSubject(moved);
+  else {
+    const project = projectSubject(sorted);
+    if (project !== null) subject = project;
+    else if (sorted.length === 1 && sorted[0]) subject = singleSubject(sorted[0]);
+    else subject = groupSubject(sorted);
+  }
   if (sorted.length === 1) return subject;
   const lines = sorted.slice(0, MAX_BODY_PATHS).map(bodyLine);
   if (sorted.length > MAX_BODY_PATHS) lines.push(`…and ${sorted.length - MAX_BODY_PATHS} more`);
@@ -123,6 +192,16 @@ export function commitMessage(changes: readonly FileChange[]): string | null {
 }
 
 type Hint = { kind: "added" } | { kind: "deleted" } | { kind: "renamed"; from: string };
+
+/** A whole folder the app moved (`to` set) or deleted (`to` null). */
+interface FolderHint {
+  from: string;
+  to: string | null;
+}
+
+function inside(path: string, folder: string): boolean {
+  return path.startsWith(`${folder}/`);
+}
 
 /**
  * What the app itself did to files since the last commit. Git status only
@@ -132,6 +211,8 @@ type Hint = { kind: "added" } | { kind: "deleted" } | { kind: "renamed"; from: s
  */
 export class ChangeHints {
   readonly #hints = new Map<string, Hint>();
+  /** Folder moves and deletes, oldest first. */
+  #folders: FolderHint[] = [];
 
   /** A file was created where none existed. */
   created(path: string): void {
@@ -169,13 +250,54 @@ export class ChangeHints {
     else this.#hints.set(to, { kind: "renamed", from: origin });
   }
 
+  /**
+   * A whole folder was moved. Hints about files inside it move along, and
+   * every file inside counts as renamed from its old place.
+   */
+  folderRenamed(from: string, to: string): void {
+    for (const [path, hint] of [...this.#hints]) {
+      if (!inside(path, from)) continue;
+      this.#hints.delete(path);
+      this.#hints.set(to + path.slice(from.length), hint);
+    }
+    this.#folders.push({ from, to });
+  }
+
+  /** A whole folder was deleted. */
+  folderDeleted(path: string): void {
+    this.#folders.push({ from: path, to: null });
+  }
+
   /** Forgets hints about committed paths. */
   committed(paths: Iterable<string>): void {
-    for (const path of paths) this.#hints.delete(path);
+    const committed = [...paths];
+    for (const path of committed) this.#hints.delete(path);
+    const touched = (folder: string) => committed.some((path) => inside(path, folder));
+    this.#folders = this.#folders.filter(
+      (hint) => !touched(hint.from) && (hint.to === null || !touched(hint.to)),
+    );
   }
 
   clear(): void {
     this.#hints.clear();
+    this.#folders = [];
+  }
+
+  /** Where a file was before the folder moves, or `null` when none moved it. */
+  #folderOrigin(path: string): string | null {
+    let current = path;
+    for (let index = this.#folders.length - 1; index >= 0; index -= 1) {
+      const hint = this.#folders[index];
+      if (hint?.to != null && inside(current, hint.to)) {
+        current = hint.from + current.slice(hint.to.length);
+      }
+    }
+    return current === path ? null : current;
+  }
+
+  /** Whether a folder delete covers `path`. */
+  #folderDeleted(path: string): boolean {
+    return this.#folders.some((hint) => hint.to === null && inside(path, hint.from));
   }
 
   /**
@@ -199,12 +321,23 @@ export class ChangeHints {
         changes.push({ kind: "renamed", from: hint.from, path });
       }
     }
+    if (this.#folders.length > 0) {
+      for (const path of reported) {
+        if (done.has(path) || this.#hints.has(path)) continue;
+        const origin = this.#folderOrigin(path);
+        if (origin === null || !reported.has(origin) || done.has(origin)) continue;
+        done.add(origin).add(path);
+        changes.push({ kind: "renamed", from: origin, path, folder: true });
+      }
+    }
     for (const path of reported) {
       if (done.has(path)) continue;
       done.add(path);
       const hint = this.#hints.get(path);
       const onDisk = exists(path);
-      if (onDisk === false || (hint?.kind === "deleted" && onDisk !== true)) {
+      if (hint === undefined && onDisk !== true && this.#folderDeleted(path)) {
+        changes.push({ kind: "deleted", path, folder: true });
+      } else if (onDisk === false || (hint?.kind === "deleted" && onDisk !== true)) {
         changes.push({ kind: "deleted", path });
       } else if (hint?.kind === "added" || hint?.kind === "renamed") {
         // A renamed file whose old path was never committed is new to git.

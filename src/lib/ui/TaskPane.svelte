@@ -41,6 +41,7 @@
     onopennote?: (path: string, ref: TaskRef) => void;
     oncreatenote?: (path: string, ref: TaskRef) => void;
     oncopytext?: (text: string) => void;
+    onmovetoproject?: (path: string, ref: TaskRef) => void;
     onstale?: () => void;
     onundo?: () => void;
     /** Whether done tasks are hidden, and how to switch it. */

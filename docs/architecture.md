@@ -119,6 +119,9 @@ All platform access goes through the `Storage` interface (`src/lib/storage/types
 | `readFile(path)` | Reads a note or `.kaido/config.json`; resolves to `{ contents, hash }` |
 | `writeFile(path, contents, { expectedHash? })` | Atomically writes a note or `.kaido/config.json`; resolves to its `FileEntry` plus the new `hash`. See [Conditional writes](#conditional-writes) |
 | `renameFile(from, to)` | Renames a note within its folder without replacing another file; resolves to the `FileEntry` and `hash` of the file at `to` |
+| `moveFile(from, to)` | Moves a note or task list to any folder of the workspace, creating missing folders, without replacing another file; resolves like `renameFile` |
+| `renameFolder(from, to)` | Renames, archives or unarchives a project folder; resolves to `{ entries }`, the moved Markdown files at their new paths. See [Project folders](#project-folders) |
+| `deleteFolder(path)` | Moves a project folder to the system trash, with the rules of `renameFolder` and the trash rules of `deleteFile` |
 | `deleteFile(path, expectedHash)` | Moves a note to the system trash, only if it still has `expectedHash`. The note is removed permanently only where no trash is available: on Linux, when the trash folders cannot be written (missing, no permission, read-only, full). On Windows and macOS a failed trash move is reported and the note is kept, as is any other trash failure on Linux. Notes over 8 MiB cannot be renamed or deleted, since no hash is handed out for them |
 | `readSettings()` / `writeSettings(contents)` | Reads or writes the raw device `settings.json` (`null` if missing) |
 | `watchSettings(listener)` | Subscribes to changes of `settings.json` made outside the app (`settings://changed`) |
@@ -134,7 +137,7 @@ All platform access goes through the `Storage` interface (`src/lib/storage/types
 | Backend | Used for |
 |---|---|
 | `TauriStorage` | The desktop app. Calls the Rust commands and listens to the watcher event. Responses are validated with valibot; an unexpected response becomes an `Io` error, and a malformed change event is treated as a rescan. |
-| `MemoryStorage` | Tests and `pnpm dev` in a browser (serves a sample workspace). Follows the same path, size, read-only, conditional write, rename and delete rules as the desktop backend and can simulate external edits. Deleted notes are kept in its `trash` list. Its hash is a fast non-cryptographic content hash; like the desktop hash, equal contents always give equal hashes. |
+| `MemoryStorage` | Tests and `pnpm dev` in a browser (serves a sample workspace). Follows the same path, size, read-only, conditional write, rename, move and delete rules as the desktop backend and can simulate external edits. Folder moves and deletes are reported as a `rescan`, like the file watcher does. Deleted files are kept in its `trash` list. Its hash is a fast non-cryptographic content hash; like the desktop hash, equal contents always give equal hashes. |
 
 ### Commands
 
@@ -149,6 +152,9 @@ The Rust commands live in `src-tauri/src/commands.rs`, except the quick capture 
 | `write_file` | `path`, `contents`, optional `expectedHash` | `FileEntry` and `hash` |
 | `rename_file` | `from`, `to` | `FileEntry` and `hash` of the file at `to` |
 | `delete_file` | `path`, `expectedHash` | – |
+| `move_file` | `from`, `to` | `FileEntry` and `hash` of the file at `to` |
+| `rename_folder` | `from`, `to` (project folders) | `{ entries }`: the `FileEntry` of every listable Markdown file of the folder at its new path, sorted |
+| `delete_folder` | `path` (a project folder) | – |
 | `read_settings` | – | `string \| null` |
 | `write_settings` | `contents` | –; `Conflict` if the file changed since the app last read or wrote it, see [Settings writes](#settings-writes) |
 | `git_status` | – | `GitStatus`, see [Git sync](#git-sync) |
@@ -184,11 +190,23 @@ Otherwise the write fails with `Conflict` and the file is left untouched. The ch
 
 ### Renaming and deleting
 
-- `rename_file` and `delete_file` accept notes only, never `.kaido/config.json` (`InvalidPath`).
+- `rename_file`, `move_file` and `delete_file` accept notes only (task lists included), never `.kaido/config.json` (`InvalidPath`).
 - A rename stays in the same folder (`InvalidPath` otherwise; the folder part is compared exactly). It never replaces a file: an existing `to`, including `to` equal to `from`, is a `Conflict`. A case-only rename (`a.md` to `A.md`) works, also on case-insensitive file systems. The note must be readable and at most 8 MiB (`TooLarge`). A missing `from` is `NotFound`.
 - A delete needs the hash of the version the user has seen; a different hash is a `Conflict`, so a newer version is never deleted. A missing file is `NotFound`.
+- `move_file` follows the rename rules but `to` may be in any folder; missing folders are created (and removed again if the move fails). Across folders, both folders must be real folders, not reached through a link to a folder, and a note that is itself a link is refused, since a relative link would point elsewhere from its new folder (`InvalidPath`).
 
 Calls to `open_workspace` run one at a time and the most recently issued one wins: an older call still waiting fails with `Superseded`, which the UI ignores. A failed open keeps the previous workspace.
+
+### Project folders
+
+`rename_folder` renames (`a` to `b`), archives (`a` to `_archive/a`, creating `_archive/` when missing) and unarchives (`_archive/a` to `a`) a project with a single rename, so the move is atomic on one file system. `delete_folder` moves a project folder to the system trash under the same rules and fallback as `delete_file`, without a hash precondition (the app asks first); a permanent delete removes links inside the folder, never what they point to.
+
+- Both commands accept only project folders: a top-level folder or `_archive/<name>`. The workspace root, `inbox` (in any letter case), `_archive` itself, hidden folders, `node_modules` and subfolders of a project are `InvalidPath`, so `to` is never inside `from`. A missing folder is `NotFound`; a file is `NotADirectory`.
+- A project folder that is a link to a folder, or a `to` reached through one (such as a linked `_archive`), is `InvalidPath`: the listing does not follow folder links, and renaming or trashing a link could break it or act on its target.
+- An existing `to` is never replaced, not even an empty folder (`Conflict`). The rename uses `renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS and `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows, falling back to a check followed by a rename where the file system does not support them. A case-only rename of the same folder (`a` to `A`) works. On Windows and macOS a folder whose name differs from `to` only in letter case is a `Conflict` as well.
+- Links inside the folder are moved as they are. A relative link that would point somewhere else after the move (for example a link to a sibling project when archiving adds a folder level) makes the move fail with `InvalidPath`. Links in hidden folders and `node_modules` are not checked.
+- Moving a note or a folder to another drive or file system is refused with `Io`; nothing is copied.
+- The watcher reports the move like any other change: `paths` for a moved note, a `rescan` for a moved folder, and the folder is watched at its new place.
 
 ### Errors
 
@@ -205,7 +223,7 @@ Errors cross the boundary as `{ kind, message }` and become a `StorageError` in 
 | `TooLarge` | The file or contents exceed 8 MiB |
 | `PermissionDenied` | The OS denied access, or the target file is read-only |
 | `Superseded` | A newer `open_workspace` call overtook this one |
-| `Conflict` | A conditional write found the file missing, present or changed (see [Conditional writes](#conditional-writes)), `settings.json` changed since it was last read (see [Settings writes](#settings-writes)), or a clone destination already exists |
+| `Conflict` | A conditional write found the file missing, present or changed (see [Conditional writes](#conditional-writes)), the target of a rename or move exists, `settings.json` changed since it was last read (see [Settings writes](#settings-writes)), or a clone destination already exists |
 | `NotEmpty` | `scaffold_workspace` was given a folder that has files in it |
 | `Cancelled` | The user cancelled the operation (`git_clone_cancel`) |
 | `Io` | Any other failure |
@@ -383,11 +401,13 @@ Line endings are kept as they are: each note is edited with the line separator i
 
 **Switching workspaces and closing.** Before another workspace opens, pending saves are written in the current one (waiting at most a few seconds). If some edits are still unsaved after that, because saving failed or took too long, the switch is refused: the current workspace and editor stay as they are and a notice names the notes. Closing the window works the same way, and also counts saves of a previous workspace that are still running. Trying the same action again right away goes ahead without the unsaved edits. That consent only covers the very next attempt: any edit, any successful save, or a check that finds nothing unsaved withdraws it.
 
-**Note actions.** Right-clicking a note in the list, or pressing `Shift+F10` or the context menu key on the focused row, opens a menu with **Rename** (`F2`), **Copy path** (the workspace-relative path) and **Delete** (`Del`). `F2` and `Delete` also work directly on the focused row, never while typing in the editor.
+**Note actions.** Right-clicking a note in the list, or pressing `Shift+F10` or the context menu key on the focused row, opens a menu with **Rename** (`F2`), **Move to…**, **Copy path** (the workspace-relative path) and **Delete** (`Del`). `F2` and `Delete` also work directly on the focused row, never while typing in the editor.
 
 - **Rename** edits the file name in the row, with the name before `.md` selected. `Enter` or leaving the field confirms (switching to another window does not), `Esc` cancels; an unchanged name just ends editing, even one the rules below would refuse. The name is used as typed, trimmed, with `.md` added when missing (`src/lib/core/noteNames.ts`). Names that break on Linux, macOS or Windows are refused with the reason shown next to the field: `/`, `\`, control characters, `<>:"|?*`, a leading dot, a trailing space or dot, Windows device names (`CON`, `NUL`, `COM1`…), names over 200 UTF-8 bytes (leaving room for conflict copies and the trash within the usual 255-byte limit), `tasks.md`, names already used in the folder (compared case-insensitively, except the note's own name; this includes an open note whose file was deleted elsewhere and the selected note shown as missing), and names hidden by the ignore patterns. Unsaved edits are saved first; an open note then keeps its text, undo history and save state under the new path, without being read again.
 - **Delete** asks for no confirmation. Pending edits are saved first, then the file is moved to the system trash, the next row is selected and a toast offers **Undo** for a few seconds (`Ctrl+Z` / `Cmd+Z` while the toast or the list has focus; in the list it undoes the most recent delete). Holding `Delete` deletes one note. Undo writes the deleted contents back, including edits that could not be saved, with `expectedHash: null`, so a file that took the name meanwhile is kept and a notice says so.
-- Notes over 8 MiB cannot be renamed or deleted from the app.
+- **Move to…** opens a picker (`src/lib/ui/MovePicker.svelte`, a modal dialog with a filter combobox and a listbox): every active project, the inbox first, and under each the folders that already hold notes (`src/lib/core/moveTargets.ts`), without the note's own folder. Typing filters, `↑`/`↓` choose, `Enter` or a click moves and `Esc` or a click outside closes. The note keeps its file name; a name already used there (ignoring case), a folder hidden by the ignore patterns and a move that would make it a project's `tasks.md` are refused with the reason shown in the picker. The move uses `moveFile` after the note's pending edits are saved; an open note stays open with its text, history and save state, and the selection moves to its new project. A toast offers **Undo** (`Ctrl+Z` in the list), which moves it back.
+- Renaming or moving a note updates the links to it in task lists (see [Links after moves](#links-after-moves)).
+- Notes over 8 MiB cannot be renamed, moved or deleted from the app.
 - Both run in the same queue as change events and update the model right away, so the watcher's later report of the change is a no-op. Failures show a notice and change nothing.
 
 **New notes.** `Ctrl+N` (`Cmd+N` on macOS) or the `+ new note` button in the list pane creates an empty note in the selected project, or in `inbox/` when All tasks is selected (`src/lib/core/newNote.ts`). It is named `untitled.md`, then `untitled 2.md`, `untitled 3.md`…, skipping names already in the workspace (compared case-insensitively) or hidden by the ignore patterns. The file is written with `expectedHash: null`; if a file with that name appeared on disk meanwhile, the next name is tried, a few times at most. The note is added to the model, selected and opened with the editor focused right away, without waiting for the watcher; its autosave starts from the hash of that first write. A failure shows a notice and changes nothing else.
@@ -432,7 +452,7 @@ Each row shows a chevron when the task has detail, the subtask counter (`done/to
 | `F2`, double-click | Edit the text, links included; `Enter` or leaving the field saves, `Esc` cancels. Empty text changes nothing |
 | `→`, chevron | Show the task's detail in a text area below it. In the text area, `Ctrl+Enter` (`Cmd+Enter`), `Esc`, `←` at the very start (nothing selected), the chevron or leaving it saves and hides it; `Esc` saves too |
 | `Ctrl+Enter` (`Cmd+Enter`), chip | Open the linked note, with focus in the editor |
-| `Shift+F10`, context menu key, right-click | Task menu: **Edit**, **Create note from task** or **Open note**, **Copy text** (the task text as written), **Delete** |
+| `Shift+F10`, context menu key, right-click | Task menu: **Edit**, **Create note from task** or **Open note**, **Move to project…** (top-level tasks), **Copy text** (the task text as written), **Delete** |
 | `Delete` | Delete, with an undo toast (`Ctrl+Z` / `Cmd+Z` in the list or the toast) |
 | `Alt+↑` / `Alt+↓` | Move among the open tasks of the section |
 | `↑` / `↓`, `Home` / `End` | Move focus |
@@ -459,6 +479,27 @@ The view reads the **task index** (`src/lib/core/taskIndex.ts`): the parsed text
 ### New projects
 
 `+ new project` in the sidebar (or `Ctrl+Shift+N`, `Cmd+Shift+N` on macOS) opens a name field. `Enter` creates the project, `Esc` or leaving the field cancels. The name is used as typed (trimmed) for the folder (`src/lib/core/projectNames.ts`): the [note name rules](#editing-and-autosave) apply without adding `.md`, plus names starting with `_` (including `_archive`), `inbox`, `node_modules`, existing project names (ignoring case), names hidden by the ignore patterns, and names over 100 UTF-8 bytes are refused with the reason shown. The project is created by writing an empty `<name>/tasks.md` with `expectedHash: null`, so an existing list is never replaced. The new project is selected with its task list open and the "Add a task…" field focused.
+
+### Moving tasks
+
+**Move to project…** in the task menu (in a project's task view and in All tasks) opens the same picker with the active projects except the task's own. The whole block (the task line, its detail and its subtasks) is taken out of its list and added at the end of the target project's `tasks.md` (before a fenced code block left open at its end), with that file's line separator; a project without a task list gets one, written create-only. Links in the block are rewritten relative to the new list. Both changes are task edits through the lists' save sessions, so they show at once and are saved like any other. A toast offers **Undo**, which takes the block out of the target list (found by its first line) and puts the lines back in the source list like a deleted task's undo; if the moved task changed in its new list meanwhile, nothing is undone and a toast says so.
+
+### Project actions
+
+Right-clicking a project in the sidebar, or pressing `Shift+F10` or the context menu key on its focused row, opens a menu with **Rename** (`F2`), **Archive** (or **Unarchive** for an archived project), **Copy path** (the project folder) and **Delete…** (`Del`). `F2` and `Delete` also work on the focused row. The inbox and All tasks have no menu.
+
+- **Rename** edits the name in the row: `Enter` confirms, `Esc` or leaving the field cancels. The [project name rules](#new-projects) apply; the project's own name is allowed again with a different letter case. Archived projects are renamed within `_archive/`.
+- **Archive** moves `<name>` to `_archive/<name>`; **Unarchive** moves it back. Unarchiving is refused with a toast while an active project has that name (ignoring case), and so is archiving over an archived project with the same name.
+- Rename, archive and unarchive show a toast with **Undo** (`Ctrl+Z` while the sidebar has focus undoes the most recent one), which moves the folder back.
+- **Delete…** asks first: "Delete project **a**? Its folder (N notes, M tasks) moves to the system trash.", with **Cancel** focused and **Delete**. There is no undo toast; the system trash keeps the folder. A toast says "Project a moved to the trash".
+
+**Archived projects** are listed in a collapsed **archived (n)** group below the projects, hidden when there are none, each with an `archive` icon. Selecting one shows it like any project (its key and folder is `_archive/<name>`), and its notes and tasks can be edited. Archived projects stay out of All tasks and search.
+
+**Applying a folder move.** Before `renameFolder` or `deleteFolder`, the pending edits of every open file inside the folder are saved and those sessions are held, so nothing is written to the old path while the folder moves. If an edit cannot be saved, nothing is changed and a toast names the files. After the move, every path under the old folder is replaced in one step: the listing and model, summaries, save sessions (which keep their text and state), cached editor states, the selection and open document, the task index, the search index (archived notes are dropped from it, unarchived ones read again), the recent items of the search palette, pending focus requests, undo toasts and the device setting `hideDone` (patched as one field). The model then already matches the disk, so the watcher's rescan that follows changes nothing: open files see their own hash and are neither reloaded nor copied. A deleted folder's sessions, summaries and index entries are dropped, and the inbox is selected if the selection was inside.
+
+### Links after moves
+
+After a note is renamed or moved and after a project is renamed, archived or unarchived, task links are kept working by `retargetLinks` (`src/lib/core/linkRetarget.ts`): in every task list the app has read, each `[label](target.md)` whose target (resolved relative to the list as in [Linked notes](#linked-notes)) moved, or that no longer reaches its file because the list itself moved (archiving adds a folder level), gets a new target, relative to where the list is now and encoded like the links the app writes. A `#anchor` or `?query` after the path is kept. Only those lines change; every other byte stays, and links in inline code, fenced code blocks and front matter are left alone. The edits go through the lists' save sessions like task edits; undoing the move rewrites the links back. Links in notes are not changed.
 
 ## Search
 
@@ -593,6 +634,8 @@ The app never repairs these states.
 
 ### Commit
 
+Messages come from `src/lib/core/commitMessage.ts`, which combines git's list of changed paths with what the app itself did (created, renamed, moved, deleted, and whole project folders moved or deleted). For example: `Update api/deploy.md`, `Rename inbox/a.md to b.md`, `Move a/x.md to b/x.md`, `Update tasks in inbox and api`, `Rename project a to b`, `Archive project a`, `Unarchive project a`, `Delete project a`; task lists whose links were updated by a move do not change the subject. With more than one change, the body lists the paths.
+
 `git_commit { message }` stages everything in the workspace (`git add -A -- <workspace>`) and commits only those paths (`git commit -m <message> -- <workspace>`). It returns `{ commit: string | null, paths: string[] }`: the new commit's hash and its workspace-relative paths, or `null` and `[]` when there was nothing to commit. Hooks run normally; a failing hook is a `GitFailed` error with its output. Refused (`GitPaused`) for the reasons marked "Refused" above. File writes are not held back while it runs; a write that lands meanwhile is picked up by the next commit.
 
 ### Sync
@@ -672,7 +715,7 @@ Each repository has two async locks (`src-tauri/src/state.rs`):
 | Lock | Taken by | Purpose |
 |---|---|---|
 | git (mutex) | `git_commit`, `git_sync` | One git operation at a time |
-| working tree (read/write) | `write_file`, `rename_file`, `delete_file` (shared); `git_sync` (exclusive) only while it rebases and resolves conflicts | File writes never land in the middle of a rebase |
+| working tree (read/write) | `write_file`, `rename_file`, `delete_file`, `move_file`, `rename_folder`, `delete_folder` (shared); `git_sync` (exclusive) only while it rebases and resolves conflicts | File writes never land in the middle of a rebase |
 
 File writes never wait for `git add`, `git commit`, fetch or push; only for a rebase. `git_status`, `read_file` and `list_files` take no lock.
 

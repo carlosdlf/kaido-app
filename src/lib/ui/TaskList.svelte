@@ -38,6 +38,8 @@
     onopennote?: (path: string, ref: TaskRef) => void;
     oncreatenote?: (path: string, ref: TaskRef) => void;
     oncopytext?: (text: string) => void;
+    /** Asks which project a top-level task moves to. */
+    onmovetoproject?: (path: string, ref: TaskRef) => void;
     /** An open field was closed because its task changed on disk. */
     onstale?: () => void;
     /** `Ctrl+Z` / `Cmd+Z` in the list: undoes the most recent delete. */
@@ -61,6 +63,7 @@
     onopennote,
     oncreatenote,
     oncopytext,
+    onmovetoproject,
     onundo,
     onstale,
   }: Props = $props();
@@ -361,6 +364,7 @@
       row.link
         ? { id: "open", label: "Open note", shortcut: openShortcut }
         : { id: "create", label: "Create note from task" },
+      ...(onmovetoproject && !row.nested ? [{ id: "move", label: "Move to project…" }] : []),
       { id: "copy", label: "Copy text" },
       { id: "delete", label: "Delete", shortcut: { aria: "Delete", hint: "Del" } },
     ];
@@ -388,6 +392,12 @@
     if (action === "edit") {
       menu = null;
       startEdit(row);
+      return;
+    }
+    if (action === "move") {
+      // The picker takes focus and gives it back to the list.
+      menu = null;
+      onmovetoproject?.(row.path, refOf(row));
       return;
     }
     closeMenu(true);

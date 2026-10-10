@@ -9,7 +9,13 @@ async function setup() {
     pick: "/w",
     git: { unavailable: null },
   });
-  const hooks = { written: vi.fn(), renamed: vi.fn(), deleted: vi.fn() };
+  const hooks = {
+    written: vi.fn(),
+    renamed: vi.fn(),
+    deleted: vi.fn(),
+    folderRenamed: vi.fn(),
+    folderDeleted: vi.fn(),
+  };
   const storage = trackWrites(inner, hooks);
   await storage.openWorkspace("/w");
   return { inner, storage, hooks };
@@ -29,6 +35,24 @@ describe("trackWrites", () => {
     const { hash } = await storage.readFile("a/y.md");
     await storage.deleteFile("a/y.md", hash);
     expect(hooks.deleted).toHaveBeenCalledWith("a/y.md");
+  });
+
+  it("reports moves and folder moves and deletes", async () => {
+    const { storage, hooks } = await setup();
+    await storage.moveFile("a/x.md", "b/x.md");
+    expect(hooks.renamed).toHaveBeenCalledWith("a/x.md", "b/x.md");
+    await storage.renameFolder("b", "c");
+    expect(hooks.folderRenamed).toHaveBeenCalledWith("b", "c", [
+      expect.objectContaining({ path: "c/x.md" }),
+    ]);
+    await storage.deleteFolder("c");
+    expect(hooks.folderDeleted).toHaveBeenCalledWith("c");
+    await expect(storage.moveFile("a/y.md", "a/y.md")).rejects.toThrow();
+    await expect(storage.renameFolder("c", "d")).rejects.toThrow();
+    await expect(storage.deleteFolder("c")).rejects.toThrow();
+    expect(hooks.renamed).toHaveBeenCalledTimes(1);
+    expect(hooks.folderRenamed).toHaveBeenCalledTimes(1);
+    expect(hooks.folderDeleted).toHaveBeenCalledTimes(1);
   });
 
   it("does not report failures", async () => {

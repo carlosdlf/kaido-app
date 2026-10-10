@@ -12,6 +12,13 @@ const mod = (path: string): FileChange => ({ kind: "modified", path });
 const add = (path: string): FileChange => ({ kind: "added", path });
 const del = (path: string): FileChange => ({ kind: "deleted", path });
 const ren = (from: string, path: string): FileChange => ({ kind: "renamed", from, path });
+const moved = (from: string, path: string): FileChange => ({
+  kind: "renamed",
+  from,
+  path,
+  folder: true,
+});
+const trashed = (path: string): FileChange => ({ kind: "deleted", path, folder: true });
 
 function subject(changes: FileChange[]): string | undefined {
   return commitMessage(changes)?.split("\n")[0];
@@ -23,7 +30,12 @@ describe("commitMessage subjects", () => {
     ["one added note", [add("inbox/idea.md")], "Add inbox/idea.md"],
     ["one deleted note", [del("inbox/old.md")], "Delete inbox/old.md"],
     ["a rename in a folder", [ren("inbox/a.md", "inbox/b.md")], "Rename inbox/a.md to b.md"],
-    ["a rename across folders", [ren("a/x.md", "b/x.md")], "Rename a/x.md to b/x.md"],
+    ["a note moved across folders", [ren("a/x.md", "b/x.md")], "Move a/x.md to b/x.md"],
+    [
+      "a moved note with updated links",
+      [ren("a/x.md", "b/s/x.md"), mod("c/tasks.md")],
+      "Move a/x.md to b/s/x.md",
+    ],
     ["a loose file", [mod("README.md")], "Update README.md"],
     ["the workspace config", [mod(".kaido/config.json")], "Update .kaido/config.json"],
     ["one task list", [mod("inbox/tasks.md")], "Update tasks in inbox"],
@@ -69,12 +81,69 @@ describe("commitMessage subjects", () => {
     expect(commitMessage(changes)).toBe(commitMessage([...changes].reverse()));
   });
 
+  describe("projects", () => {
+    it.each<[string, FileChange[], string]>([
+      [
+        "a renamed project",
+        [moved("a/tasks.md", "b/tasks.md"), moved("a/s/n.md", "b/s/n.md")],
+        "Rename project a to b",
+      ],
+      [
+        "an archived project",
+        [moved("a/tasks.md", "_archive/a/tasks.md"), moved("a/n.png", "_archive/a/n.png")],
+        "Archive project a",
+      ],
+      [
+        "an archived project with links updated elsewhere",
+        [moved("a/n.md", "_archive/a/n.md"), mod("inbox/tasks.md")],
+        "Archive project a",
+      ],
+      ["an unarchived project", [moved("_archive/a/n.md", "a/n.md")], "Unarchive project a"],
+      [
+        "a renamed archived project",
+        [moved("_archive/a/n.md", "_archive/b/n.md")],
+        "Rename project a to b",
+      ],
+      ["a deleted project", [trashed("a/tasks.md"), trashed("a/n.md")], "Delete project a"],
+      [
+        "renames of two projects",
+        [moved("a/n.md", "c/n.md"), moved("b/n.md", "c/m.md")],
+        "Update 2 notes in c",
+      ],
+      [
+        "a project move with other changes",
+        [moved("a/n.md", "b/n.md"), mod("c/x.md")],
+        "Update 2 notes in 2 projects",
+      ],
+      [
+        "deletes in two projects",
+        [trashed("a/n.md"), trashed("b/n.md")],
+        "Delete 2 notes in 2 projects",
+      ],
+      [
+        "a mix of deletes and moves",
+        [trashed("a/n.md"), moved("a/m.md", "b/m.md")],
+        "Update 2 notes in 2 projects",
+      ],
+      ["a deleted loose file", [trashed("n.md")], "Delete n.md"],
+      ["a folder move of a loose file", [moved("n.md", "b/n.md")], "Move n.md to b/n.md"],
+      [
+        "a folder move inside a project",
+        [moved("a/s/n.md", "a/t/n.md")],
+        "Move a/s/n.md to a/t/n.md",
+      ],
+    ])("%s", (_, changes, expected) => {
+      expect(subject(changes)).toBe(expected);
+    });
+  });
+
   describe("long names", () => {
     const long = "x".repeat(80);
 
     it("uses the file name when the path is too long", () => {
       expect(subject([mod(`${long}/note.md`)])).toBe("Update note.md");
       expect(subject([ren(`${long}/a.md`, `${long}/b.md`)])).toBe("Rename a.md to b.md");
+      expect(subject([ren(`${long}/a.md`, "b/a.md")])).toBe("Move a.md to b/a.md");
     });
 
     it("cuts names that are too long on their own", () => {
@@ -223,6 +292,70 @@ describe("ChangeHints", () => {
     ]);
     hints.clear();
     expect(hints.describe(["a/y.md"], onDisk(["a/y.md"]))).toEqual([mod("a/y.md")]);
+  });
+});
+
+describe("ChangeHints for folders", () => {
+  const onDisk = (paths: string[]) => (path: string) => paths.includes(path);
+
+  it("describes a moved folder as renames of every file in it", () => {
+    const hints = new ChangeHints();
+    hints.folderRenamed("a", "_archive/a");
+    const changes = hints.describe(
+      ["a/tasks.md", "_archive/a/tasks.md", "a/img.png", "_archive/a/img.png", "inbox/tasks.md"],
+      onDisk(["_archive/a/tasks.md", "inbox/tasks.md"]),
+    );
+    expect(changes).toEqual([
+      moved("a/tasks.md", "_archive/a/tasks.md"),
+      moved("a/img.png", "_archive/a/img.png"),
+      mod("inbox/tasks.md"),
+    ]);
+    expect(commitMessage(changes)?.split("\n")[0]).toBe("Archive project a");
+  });
+
+  it("follows chained folder moves and moves file hints along", () => {
+    const hints = new ChangeHints();
+    hints.created("a/new.md");
+    hints.folderRenamed("a", "b");
+    hints.folderRenamed("b", "c");
+    expect(
+      hints.describe(["a/x.md", "c/x.md", "c/new.md"], onDisk(["c/x.md", "c/new.md"])),
+    ).toEqual([moved("a/x.md", "c/x.md"), add("c/new.md")]);
+  });
+
+  it("describes a folder moved back as nothing but edits", () => {
+    const hints = new ChangeHints();
+    hints.folderRenamed("a", "b");
+    hints.folderRenamed("b", "a");
+    expect(hints.describe(["a/x.md"], onDisk(["a/x.md"]))).toEqual([mod("a/x.md")]);
+  });
+
+  it("describes a deleted folder", () => {
+    const hints = new ChangeHints();
+    hints.folderDeleted("a");
+    const changes = hints.describe(["a/tasks.md", "a/n.md", "b/x.md"], onDisk(["b/x.md"]));
+    expect(changes).toEqual([trashed("a/tasks.md"), trashed("a/n.md"), mod("b/x.md")]);
+    hints.committed(["a/tasks.md"]);
+    expect(hints.describe(["a/tasks.md"], onDisk([]))).toEqual([del("a/tasks.md")]);
+  });
+
+  it("forgets folder hints once their files are committed", () => {
+    const hints = new ChangeHints();
+    hints.folderRenamed("a", "b");
+    hints.folderRenamed("c", "d");
+    hints.committed(["b/x.md", "a/x.md"]);
+    expect(hints.describe(["a/y.md", "b/y.md"], onDisk(["b/y.md"]))).toEqual([
+      del("a/y.md"),
+      mod("b/y.md"),
+    ]);
+    expect(hints.describe(["c/y.md", "d/y.md"], onDisk(["d/y.md"]))).toEqual([
+      moved("c/y.md", "d/y.md"),
+    ]);
+    hints.clear();
+    expect(hints.describe(["c/y.md", "d/y.md"], onDisk(["d/y.md"]))).toEqual([
+      del("c/y.md"),
+      mod("d/y.md"),
+    ]);
   });
 });
 

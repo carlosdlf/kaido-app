@@ -4,8 +4,10 @@
  * Markdown-only listings that skip hidden folders and `node_modules`, and
  * change notifications (with fresh metadata) for writes and simulated
  * external edits of listed files and the workspace configuration, and
- * conditional writes based on content hashes. Renames stay within a folder
- * and never replace a file; deleted notes are kept in `trash`. A fake git
+ * conditional writes based on content hashes. Renames stay within a folder,
+ * moves may go anywhere, and neither replaces a file; folder moves and
+ * deletes take every file inside along and are reported as a rescan, like
+ * the file watcher does. Deleted files are kept in `trash`. A fake git
  * repository (`git`) commits snapshots of the files and simulates an
  * upstream, paused states and failures.
  */
@@ -31,11 +33,20 @@ import {
 } from "./setupFiles";
 import { MemoryGit, type MemoryGitOptions } from "./MemoryGit";
 import { StorageError } from "./errors";
-import { checkNotePath, checkRenamePaths, checkStoragePath, MAX_FILE_BYTES } from "./paths";
+import {
+  checkFolderMove,
+  checkFolderPath,
+  checkMovePaths,
+  checkNotePath,
+  checkRenamePaths,
+  checkStoragePath,
+  MAX_FILE_BYTES,
+} from "./paths";
 import type {
   ChangeListener,
   CloseHandler,
   FileContents,
+  FolderMove,
   GitVersion,
   OpenedWorkspace,
   ScaffoldResult,
@@ -88,7 +99,7 @@ export class MemoryStorage implements Storage {
   settings: string | null;
   pick: string | null;
   root: string | null = null;
-  /** Notes deleted with `deleteFile`, oldest first, like the system trash. */
+  /** Files deleted with `deleteFile` or `deleteFolder`, oldest first, like the system trash. */
   readonly trash: { path: string; contents: string }[] = [];
   readonly #listeners = new Set<ChangeListener>();
   readonly #settingsListeners = new Set<() => void>();
@@ -254,9 +265,70 @@ export class MemoryStorage implements Storage {
     this.#echo([path]);
   }
 
+  async moveFile(from: string, to: string): Promise<WrittenFile> {
+    checkMovePaths(from, to);
+    const files = this.#files();
+    const file = files.get(from);
+    if (!file) throw new StorageError("NotFound", `${from} does not exist.`);
+    if (byteLength(file.contents) > MAX_FILE_BYTES) {
+      throw new StorageError("TooLarge", `${from} is larger than 8 MiB.`);
+    }
+    if (files.has(to)) throw new StorageError("Conflict", `${to} already exists.`);
+    files.delete(from);
+    files.set(to, file);
+    this.#echo([from, to]);
+    return { ...this.#entry(to, file), hash: contentHash(file.contents) };
+  }
+
+  /** Paths of the files inside `folder`, in the open workspace. */
+  #inside(folder: string): string[] {
+    const prefix = `${folder}/`;
+    return [...this.#files().keys()].filter((path) => path.startsWith(prefix));
+  }
+
+  async renameFolder(from: string, to: string): Promise<FolderMove> {
+    checkFolderMove(from, to);
+    const files = this.#files();
+    const moved = this.#inside(from);
+    if (moved.length === 0) throw new StorageError("NotFound", `${from} does not exist.`);
+    if (this.#inside(to).length > 0) throw new StorageError("Conflict", `${to} already exists.`);
+    const entries: FileEntry[] = [];
+    for (const path of moved) {
+      const file = files.get(path);
+      if (!file) continue;
+      const target = `${to}${path.slice(from.length)}`;
+      files.delete(path);
+      // A move keeps contents and modification times.
+      files.set(target, file);
+      if (isListablePath(target)) entries.push(this.#entry(target, file));
+    }
+    entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    this.#echoRescan();
+    return { entries };
+  }
+
+  async deleteFolder(path: string): Promise<void> {
+    checkFolderPath(path);
+    const files = this.#files();
+    const removed = this.#inside(path);
+    if (removed.length === 0) throw new StorageError("NotFound", `${path} does not exist.`);
+    for (const inside of removed) {
+      const file = files.get(inside);
+      if (!file) continue;
+      files.delete(inside);
+      this.trash.push({ path: inside, contents: file.contents });
+    }
+    this.#echoRescan();
+  }
+
   /** Reports the app's own changes asynchronously, like the file watcher. */
   #echo(paths: string[]): void {
     if (this.#echoWrites) queueMicrotask(() => this.emitChange({ paths }));
+  }
+
+  /** Folder moves and deletes are reported as a rescan, as by the file watcher. */
+  #echoRescan(): void {
+    if (this.#echoWrites) queueMicrotask(() => this.emitChange({ paths: [], rescan: true }));
   }
 
   async readSettings(): Promise<string | null> {

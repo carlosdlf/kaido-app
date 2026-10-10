@@ -1,5 +1,8 @@
 <script lang="ts">
   import { tick, untrack } from "svelte";
+  import Archive from "@lucide/svelte/icons/archive";
+  import ChevronDown from "@lucide/svelte/icons/chevron-down";
+  import ChevronRight from "@lucide/svelte/icons/chevron-right";
   import Folder from "@lucide/svelte/icons/folder";
   import Inbox from "@lucide/svelte/icons/inbox";
   import ListChecks from "@lucide/svelte/icons/list-checks";
@@ -16,9 +19,10 @@
   import CloudUpload from "@lucide/svelte/icons/cloud-upload";
   import { syncAnnouncement, type SyncIcon, type SyncView } from "$lib/core/syncStatus";
   import { nextListIndex } from "$lib/core/listNavigation";
-  import { ALL_TASKS, type SidebarEntry } from "$lib/core/views";
-  import { INBOX } from "$lib/core/workspace";
-  import type { ProjectOutcome } from "./appState.svelte";
+  import { ALL_TASKS, type ArchivedEntry, type SidebarEntry } from "$lib/core/views";
+  import { INBOX, isArchivedKey, projectNameOf } from "$lib/core/workspace";
+  import type { ProjectOutcome, RenameOutcome } from "./appState.svelte";
+  import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
 
   interface Props {
     /** Projects in display order; the first one is the inbox. */
@@ -48,6 +52,17 @@
     onsearch?: () => void;
     /** The search shortcut, for assistive technology and as a visible hint. */
     searchShortcut?: { aria: string; hint: string };
+    /** Archived projects, shown in a collapsed group. */
+    archived?: ArchivedEntry[];
+    /** Renames a project (by key) to the typed name. */
+    onrenameproject?: (key: string, name: string) => Promise<RenameOutcome>;
+    onarchive?: (name: string) => void;
+    onunarchive?: (name: string) => void;
+    /** Asks to delete a project (by key); the caller confirms. */
+    ondeleteproject?: (key: string) => void;
+    oncopypath?: (key: string) => void;
+    /** `Ctrl+Z` / `Cmd+Z` in the sidebar: undoes the latest project rename or archive. */
+    onundo?: () => void;
     /** Opens the settings. */
     onsettings?: () => void;
     /** The settings shortcut, for assistive technology and the tooltip. */
@@ -71,6 +86,13 @@
     syncShortcut,
     onsearch,
     searchShortcut = { aria: "Control+K", hint: "^K" },
+    archived = [],
+    onrenameproject,
+    onarchive,
+    onunarchive,
+    ondeleteproject,
+    oncopypath,
+    onundo,
     onsettings,
     settingsShortcut,
   }: Props = $props();
@@ -177,7 +199,169 @@
 
   const inbox = $derived(entries.find((entry) => entry.name === INBOX));
   const projects = $derived(entries.filter((entry) => entry.name !== INBOX));
-  const order = $derived([INBOX, ALL_TASKS, ...projects.map((project) => project.name)]);
+
+  // Archived projects
+  let showArchived = $state(false);
+  // An archived project that gets selected (e.g. right after archiving it) is shown.
+  $effect(() => {
+    if (isArchivedKey(selected)) untrack(() => (showArchived = true));
+  });
+  const order = $derived([
+    INBOX,
+    ALL_TASKS,
+    ...projects.map((project) => project.name),
+    ...(showArchived ? archived.map((project) => project.key) : []),
+  ]);
+
+  function isProjectKey(id: string): boolean {
+    return id !== INBOX && id !== ALL_TASKS && order.includes(id);
+  }
+
+  /** Focuses the row of `id`, or the selected row when it is gone. */
+  async function focusNav(id: string) {
+    await tick();
+    const row =
+      nav?.querySelector<HTMLButtonElement>(`[data-nav-id="${CSS.escape(id)}"]`) ??
+      nav?.querySelector<HTMLButtonElement>("[data-nav-id][aria-current='page']");
+    row?.focus();
+  }
+
+  // Context menu
+  let menu: { key: string; x: number; y: number } | null = $state(null);
+  const menuItems = $derived.by((): MenuItem[] => {
+    const key = menu?.key;
+    if (key === undefined) return [];
+    return [
+      ...(onrenameproject
+        ? [{ id: "rename", label: "Rename", shortcut: { aria: "F2", hint: "F2" } }]
+        : []),
+      isArchivedKey(key)
+        ? { id: "unarchive", label: "Unarchive" }
+        : { id: "archive", label: "Archive" },
+      { id: "copy-path", label: "Copy path" },
+      { id: "delete", label: "Delete…", shortcut: { aria: "Delete", hint: "Del" } },
+    ];
+  });
+
+  function openMenu(key: string, x: number, y: number) {
+    if (!isProjectKey(key)) return;
+    menu = { key, x, y };
+  }
+
+  function openMenuAtRow(key: string, row: HTMLElement) {
+    const rect = row.getBoundingClientRect();
+    openMenu(key, rect.left + rect.width / 4, rect.bottom);
+  }
+
+  function closeMenu(returnFocus: boolean) {
+    const key = menu?.key;
+    menu = null;
+    if (returnFocus && key !== undefined) void focusNav(key);
+  }
+
+  function chooseMenuItem(action: string) {
+    const key = menu?.key;
+    if (key === undefined) return;
+    menu = null;
+    switch (action) {
+      case "rename":
+        startRename(key);
+        return;
+      case "archive":
+        void focusNav(key);
+        onarchive?.(key);
+        return;
+      case "unarchive":
+        void focusNav(key);
+        onunarchive?.(projectNameOf(key));
+        return;
+      case "copy-path":
+        void focusNav(key);
+        oncopypath?.(key);
+        return;
+      default:
+        void focusNav(key);
+        ondeleteproject?.(key);
+    }
+  }
+
+  // Inline project rename
+  let renaming: string | null = $state(null);
+  let renameDraft = $state("");
+  let renameError: string | null = $state(null);
+  let renameBusy = false;
+
+  function startRename(key: string) {
+    if (!onrenameproject || !isProjectKey(key)) return;
+    renaming = key;
+    renameDraft = projectNameOf(key);
+    renameError = null;
+  }
+
+  function focusRenameField(input: HTMLInputElement) {
+    input.focus();
+    input.select();
+  }
+
+  function endRename(focus: string | null) {
+    renaming = null;
+    renameError = null;
+    if (focus !== null) void focusNav(focus);
+  }
+
+  async function commitRename() {
+    const key = renaming;
+    if (key === null || renameBusy || !onrenameproject) return;
+    renameBusy = true;
+    const outcome = await onrenameproject(key, renameDraft);
+    renameBusy = false;
+    if (renaming !== key) return;
+    if (outcome.kind === "invalid") renameError = outcome.reason;
+    else endRename(outcome.kind === "renamed" ? outcome.path : key);
+  }
+
+  function handleRenameKeydown(event: KeyboardEvent) {
+    if (event.isComposing) return;
+    // Keys typed here never reach the sidebar's own shortcuts.
+    event.stopPropagation();
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void commitRename();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      endRename(renaming);
+    }
+  }
+
+  /** Leaving the field cancels; switching windows keeps it open. */
+  function handleRenameBlur() {
+    if (!document.hasFocus() || renameBusy) return;
+    endRename(null);
+  }
+
+  function isUndo(event: KeyboardEvent): boolean {
+    return (
+      (event.ctrlKey || event.metaKey) &&
+      !event.altKey &&
+      !event.shiftKey &&
+      event.key.toLowerCase() === "z"
+    );
+  }
+
+  /** Keys on a focused project row: rename, delete and the context menu. */
+  function handleRowAction(event: KeyboardEvent, id: string, row: HTMLElement): boolean {
+    if (!isProjectKey(id) || event.ctrlKey || event.metaKey || event.altKey) return false;
+    const once = !event.repeat;
+    if (event.key === "F2" && !event.shiftKey) {
+      if (once) startRename(id);
+    } else if (event.key === "Delete" && !event.shiftKey) {
+      if (once) ondeleteproject?.(id);
+    } else if (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey)) {
+      openMenuAtRow(id, row);
+    } else return false;
+    event.preventDefault();
+    return true;
+  }
 
   function count(value: number | null | undefined): string {
     return value === null || value === undefined ? "…" : String(value);
@@ -188,8 +372,17 @@
   }
 
   function handleKeydown(event: KeyboardEvent) {
+    if (event.target instanceof HTMLInputElement) return;
+    if (isUndo(event)) {
+      event.preventDefault();
+      if (!event.repeat) onundo?.();
+      return;
+    }
     // Only arrow through folder entries, not the other buttons in the nav.
-    if (!(event.target instanceof HTMLElement) || !event.target.dataset["navId"]) return;
+    if (!(event.target instanceof HTMLElement)) return;
+    const own = event.target.dataset["navId"];
+    if (own === undefined) return;
+    if (handleRowAction(event, own, event.target)) return;
     const next = nextListIndex(event.key, order.indexOf(selected), order.length);
     if (next === null) return;
     event.preventDefault();
@@ -199,6 +392,50 @@
     nav?.querySelector<HTMLButtonElement>(`[data-nav-id="${CSS.escape(id)}"]`)?.focus();
   }
 </script>
+
+{#snippet projectRow(key: string, name: string, isArchived: boolean)}
+  {#if renaming === key}
+    <div class="new-project">
+      <label class="visually-hidden" for="rename-project-input">Rename project {name}</label>
+      <input
+        id="rename-project-input"
+        class="project-input"
+        type="text"
+        spellcheck="false"
+        autocomplete="off"
+        bind:value={renameDraft}
+        aria-invalid={renameError ? "true" : undefined}
+        aria-describedby={renameError ? "rename-project-error" : undefined}
+        oninput={() => (renameError = null)}
+        onkeydown={handleRenameKeydown}
+        onblur={handleRenameBlur}
+        {@attach focusRenameField}
+      />
+      {#if renameError}
+        <span id="rename-project-error" class="project-error" role="alert">{renameError}</span>
+      {/if}
+    </div>
+  {:else}
+    <button
+      type="button"
+      class="item"
+      data-nav-id={key}
+      tabindex={selected === key ? 0 : -1}
+      aria-current={selected === key ? "page" : undefined}
+      aria-keyshortcuts="F2 Delete Shift+F10"
+      onclick={() => onselect(key)}
+      oncontextmenu={(event) => {
+        event.preventDefault();
+        openMenu(key, event.clientX, event.clientY);
+      }}
+    >
+      <span class="glyph">
+        {#if isArchived}<Archive aria-hidden="true" />{:else}<Folder aria-hidden="true" />{/if}
+      </span>
+      <span class="label">{name}</span>
+    </button>
+  {/if}
+{/snippet}
 
 <aside class="sidebar" aria-label="Sidebar">
   <div class="brand"><span class="prompt" aria-hidden="true">❯</span>kaido</div>
@@ -256,17 +493,7 @@
         <ul class="group" aria-labelledby="projects-heading">
           {#each projects as project (project.name)}
             <li>
-              <button
-                type="button"
-                class="item"
-                data-nav-id={project.name}
-                tabindex={selected === project.name ? 0 : -1}
-                aria-current={selected === project.name ? "page" : undefined}
-                onclick={() => onselect(project.name)}
-              >
-                <span class="glyph"><Folder aria-hidden="true" /></span>
-                <span class="label">{project.name}</span>
-              </button>
+              {@render projectRow(project.name, project.name, false)}
             </li>
           {/each}
         </ul>
@@ -311,7 +538,43 @@
         </button>
       {/if}
     </div>
+    {#if archived.length > 0}
+      <div class="group">
+        <button
+          type="button"
+          class="heading toggle"
+          aria-expanded={showArchived}
+          aria-controls="archived-projects"
+          onclick={() => (showArchived = !showArchived)}
+        >
+          {#if showArchived}<ChevronDown aria-hidden="true" />{:else}<ChevronRight
+              aria-hidden="true"
+            />{/if}
+          archived ({archived.length})
+        </button>
+        {#if showArchived}
+          <ul class="group" id="archived-projects" aria-label="Archived projects">
+            {#each archived as project (project.key)}
+              <li>
+                {@render projectRow(project.key, project.name, true)}
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
+    {/if}
   </nav>
+
+  {#if menu}
+    <ContextMenu
+      label="Project actions"
+      x={menu.x}
+      y={menu.y}
+      items={menuItems}
+      onselect={chooseMenuItem}
+      onclose={closeMenu}
+    />
+  {/if}
 
   <footer class="footer">
     {#if notice}
@@ -483,6 +746,20 @@
 
   .add {
     color: var(--color-muted);
+  }
+
+  .toggle {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    width: 100%;
+    padding-top: var(--space-2);
+    border-radius: var(--radius-sm);
+    text-align: left;
+  }
+
+  .toggle:hover {
+    color: var(--color-text);
   }
 
   .new-project {

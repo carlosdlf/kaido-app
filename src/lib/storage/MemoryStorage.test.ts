@@ -393,6 +393,117 @@ describe("MemoryStorage.deleteFile", () => {
   });
 });
 
+describe("MemoryStorage.moveFile", () => {
+  it("moves a note to another folder, keeping contents and time, and echoes both paths", async () => {
+    const store = await opened({ "inbox/a.md": "abc" });
+    const listener = vi.fn();
+    await store.watch(listener);
+    await expect(store.moveFile("inbox/a.md", "api/new/a.md")).resolves.toEqual({
+      path: "api/new/a.md",
+      size: 3,
+      modified: 1001,
+      hash: contentHash("abc"),
+    });
+    await expect(store.readFile("inbox/a.md")).rejects.toMatchObject({ kind: "NotFound" });
+    await Promise.resolve();
+    expect(listener).toHaveBeenCalledWith({
+      paths: ["inbox/a.md", "api/new/a.md"],
+      entries: [{ path: "api/new/a.md", size: 3, modified: 1001 }],
+      rescan: false,
+    });
+  });
+
+  it("allows case-only moves and never replaces a file", async () => {
+    const store = await opened({ "a/x.md": "one", "b/x.md": "two" });
+    await expect(store.moveFile("a/x.md", "b/x.md")).rejects.toMatchObject({ kind: "Conflict" });
+    await expect(store.moveFile("a/x.md", "a/X.md")).resolves.toMatchObject({ path: "a/X.md" });
+    expect((await store.readFile("b/x.md")).contents).toBe("two");
+  });
+
+  it("refuses missing, large and invalid files", async () => {
+    const store = await opened({ "big.md": "a".repeat(8 * 1024 * 1024 + 1), "a.md": "x" });
+    await expect(store.moveFile("none.md", "b/none.md")).rejects.toMatchObject({
+      kind: "NotFound",
+    });
+    await expect(store.moveFile("big.md", "b/big.md")).rejects.toMatchObject({
+      kind: "TooLarge",
+    });
+    await expect(store.moveFile("a.md", "b/a.txt")).rejects.toMatchObject({
+      kind: "InvalidPath",
+    });
+  });
+});
+
+describe("MemoryStorage.renameFolder", () => {
+  it("moves every file of the folder, returns its notes and reports a rescan", async () => {
+    const store = await opened({
+      "a/tasks.md": "- [ ] t\n",
+      "a/sub/n.md": "n",
+      "a/image.png": "png",
+      "ab/x.md": "x",
+    });
+    const listener = vi.fn();
+    await store.watch(listener);
+    await expect(store.renameFolder("a", "_archive/a")).resolves.toEqual({
+      entries: [
+        { path: "_archive/a/sub/n.md", size: 1, modified: 1001 },
+        { path: "_archive/a/tasks.md", size: 8, modified: 1001 },
+      ],
+    });
+    expect([...(store.folders.get("/w")?.keys() ?? [])].sort()).toEqual([
+      "_archive/a/image.png",
+      "_archive/a/sub/n.md",
+      "_archive/a/tasks.md",
+      "ab/x.md",
+    ]);
+    await Promise.resolve();
+    expect(listener).toHaveBeenCalledWith({ paths: [], entries: [], rescan: true });
+  });
+
+  it("refuses a missing folder, an existing target and invalid folders", async () => {
+    const store = await opened({ "a/x.md": "x", "b/y.md": "y", "inbox/z.md": "z" });
+    await expect(store.renameFolder("c", "d")).rejects.toMatchObject({ kind: "NotFound" });
+    await expect(store.renameFolder("a", "b")).rejects.toMatchObject({ kind: "Conflict" });
+    await expect(store.renameFolder("inbox", "c")).rejects.toMatchObject({
+      kind: "InvalidPath",
+    });
+    await expect(store.renameFolder("a", "a/b")).rejects.toMatchObject({ kind: "InvalidPath" });
+    await expect(store.renameFolder("a", "a")).rejects.toMatchObject({ kind: "Conflict" });
+    await expect(store.renameFolder("a", "A")).resolves.toEqual({
+      entries: [{ path: "A/x.md", size: 1, modified: 1001 }],
+    });
+  });
+});
+
+describe("MemoryStorage.deleteFolder", () => {
+  it("moves every file of the folder to the trash and reports a rescan", async () => {
+    const store = await opened({ "a/tasks.md": "t", "a/n.md": "n", "b/x.md": "x" });
+    const listener = vi.fn();
+    await store.watch(listener);
+    await expect(store.deleteFolder("a")).resolves.toBeUndefined();
+    expect(store.trash).toEqual([
+      { path: "a/tasks.md", contents: "t" },
+      { path: "a/n.md", contents: "n" },
+    ]);
+    expect(await store.listFiles()).toEqual([{ path: "b/x.md", size: 1, modified: 1001 }]);
+    await Promise.resolve();
+    expect(listener).toHaveBeenCalledWith({ paths: [], entries: [], rescan: true });
+  });
+
+  it("refuses missing and fixed folders, and does not echo when echoes are off", async () => {
+    const store = await opened({ "a/x.md": "x", "inbox/y.md": "y" }, false);
+    const listener = vi.fn();
+    await store.watch(listener);
+    await expect(store.deleteFolder("c")).rejects.toMatchObject({ kind: "NotFound" });
+    await expect(store.deleteFolder("inbox")).rejects.toMatchObject({ kind: "InvalidPath" });
+    await expect(store.deleteFolder("_archive")).rejects.toMatchObject({ kind: "InvalidPath" });
+    await store.deleteFolder("a");
+    await store.renameFolder("inbox", "x").catch(() => undefined);
+    await Promise.resolve();
+    expect(listener).not.toHaveBeenCalled();
+  });
+});
+
 describe("MemoryStorage onboarding", () => {
   it("reports git", async () => {
     await expect(new MemoryStorage().gitVersion()).resolves.toEqual({

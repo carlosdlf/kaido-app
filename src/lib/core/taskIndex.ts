@@ -44,6 +44,20 @@ export class TaskIndex {
     return this.#entries.delete(path);
   }
 
+  /** Moves a list to another path; returns whether there was one. */
+  rename(from: string, to: string): boolean {
+    const entry = this.#entries.get(from);
+    if (!entry || from === to) return false;
+    this.#entries.delete(from);
+    this.#entries.set(to, entry);
+    return true;
+  }
+
+  /** The paths of the indexed lists. */
+  paths(): string[] {
+    return [...this.#entries.keys()];
+  }
+
   /** Removes every path for which `keep` returns false; returns whether anything was removed. */
   retain(keep: (path: string) => boolean): boolean {
     let removed = false;

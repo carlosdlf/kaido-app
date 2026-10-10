@@ -69,7 +69,7 @@ export function resolveLinkTarget(target: string, from: string): string | null {
 }
 
 /** `[start, end)` ranges of inline code spans: a backtick run up to the next run of the same length. */
-function codeSpans(text: string): [number, number][] {
+export function codeSpans(text: string): [number, number][] {
   const spans: [number, number][] = [];
   const runs = [...text.matchAll(/`+/g)];
   for (let index = 0; index < runs.length; index += 1) {

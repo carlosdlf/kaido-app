@@ -61,6 +61,8 @@ import { newNoteFolder, newNotePath } from "$lib/core/newNote";
 import { nextAfterRemoval, renamedPath, validateNoteName } from "$lib/core/noteNames";
 import { projectTasksPath, validateProjectName } from "$lib/core/projectNames";
 import { linkedNote, noteLink, noteNameFromTask, textWithoutLinks } from "$lib/core/taskLinks";
+import { retargetLinks } from "$lib/core/linkRetarget";
+import { applyMove, isInside, movedPath, reverseMoves, type PathMove } from "$lib/core/pathMoves";
 import { serializeTask } from "$lib/core/tasks";
 import * as taskOps from "$lib/core/taskDocument";
 import type {
@@ -100,8 +102,13 @@ import {
   createPathFilter,
   diffFiles,
   findProject,
+  findProjectByKey,
   INBOX,
+  isArchivedKey,
   isTaskListPath,
+  projectKey,
+  projectKeyOf,
+  projectNameOf,
   WORKSPACE_CONFIG_PATH,
   workspaceFiles,
   type ChangeEvent,
@@ -211,6 +218,35 @@ interface DeletedTask {
   path: string;
   removed: RemovedLines;
   generation: number;
+}
+
+/** A move an undo toast can take back. */
+type MoveUndo =
+  /** A note now at `to`, which goes back to `from`. */
+  | { kind: "note"; from: string; to: string; generation: number }
+  /** A project folder now at `to`, which goes back to `from`. */
+  | { kind: "folder"; from: string; to: string; generation: number }
+  /** A task block moved from the list `source` to `target`, where it starts at `inserted`. */
+  | {
+      kind: "task";
+      source: string;
+      target: string;
+      removed: RemovedLines;
+      inserted: TaskRef;
+      generation: number;
+    };
+
+/** Moving a note or task: done, refused with a reason, or failed (already reported). */
+export type MoveOutcome =
+  { kind: "moved"; path: string } | { kind: "invalid"; reason: string } | { kind: "failed" };
+
+/** What a folder move did. */
+type FolderOutcome = "moved" | "conflict" | "failed";
+
+/** What a project holds, for the delete confirmation. */
+export interface ProjectContents {
+  notes: number;
+  tasks: number;
 }
 
 export interface AppStateOptions {
@@ -377,6 +413,61 @@ export function projectExistsMessage(name: string): string {
 
 export function createProjectFailedMessage(message: string): string {
   return `The project could not be created: ${message}`;
+}
+
+export function noteExistsThereMessage(name: string): string {
+  return `A note named ${name} already exists there.`;
+}
+
+export const MOVE_IGNORED = "Notes there are hidden by the workspace ignore patterns.";
+export const TASKS_RESERVED = "tasks.md is reserved for task lists.";
+
+export function movedNoteMessage(name: string, folder: string): string {
+  return `Moved ${name} to ${folder}/`;
+}
+
+export function moveFailedMessage(name: string, message: string): string {
+  return `${name} could not be moved: ${message}`;
+}
+
+export function movedTaskMessage(project: string): string {
+  return `Moved task to ${project}`;
+}
+
+export function taskMoveFailedMessage(project: string, message: string): string {
+  return `The task could not be moved to ${project}: ${message}`;
+}
+
+export function unsavedMoveMessage(paths: readonly string[]): string {
+  return `Changes to ${paths.join(", ")} could not be saved, so nothing was changed.`;
+}
+
+export function renamedProjectMessage(from: string, to: string): string {
+  return `Renamed project ${from} to ${to}`;
+}
+
+export function archivedProjectMessage(name: string): string {
+  return `Archived ${name}`;
+}
+
+export function unarchivedProjectMessage(name: string): string {
+  return `Unarchived ${name}`;
+}
+
+export function archivedExistsMessage(name: string): string {
+  return `An archived project named ${name} already exists.`;
+}
+
+export function unarchiveTakenMessage(existing: string, name: string): string {
+  return `A project named ${existing} already exists, so ${name} was not unarchived.`;
+}
+
+export function projectTrashedMessage(name: string): string {
+  return `Project ${name} moved to the trash`;
+}
+
+export function projectActionFailedMessage(name: string, action: string, message: string): string {
+  return `${name} could not be ${action}: ${message}`;
 }
 
 export const SHORTCUT_TAKEN = "Quick capture shortcut is in use by another app";
@@ -615,6 +706,9 @@ export class AppState {
   /** Deleted tasks that an undo toast can restore, by toast id. */
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- private bookkeeping, never rendered
   readonly #deletedTasks = new Map<number, DeletedTask>();
+  /** Moves that an undo toast can take back, by toast id. */
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- private bookkeeping, never rendered
+  readonly #moveUndos = new Map<number, MoveUndo>();
   /** Other toast actions, by toast id. */
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- private bookkeeping, never rendered
   readonly #toastActions = new Map<number, () => Promise<void>>();
@@ -678,6 +772,14 @@ export class AppState {
       },
       deleted: (path) => {
         this.#hints.deleted(path);
+        this.#scheduler?.changed();
+      },
+      folderRenamed: (from, to) => {
+        this.#hints.folderRenamed(from, to);
+        this.#scheduler?.changed();
+      },
+      folderDeleted: (path) => {
+        this.#hints.folderDeleted(path);
         this.#scheduler?.changed();
       },
     });
@@ -960,6 +1062,9 @@ export class AppState {
         return { kind: "failed" };
       }
       if (generation !== this.#generation) return { kind: "failed" };
+      const moves: PathMove[] = [{ from: path, to, folder: false }];
+      this.#remapUndo(moves);
+      this.#retargetAll(moves);
       return { kind: "renamed", path: to };
     });
   }
@@ -1013,7 +1118,13 @@ export class AppState {
    * Restores the note deleted with toast `id`, without replacing a file that
    * took its name meanwhile, and selects it.
    */
-  async undoDelete(id: number): Promise<"note" | "task" | null> {
+  async undoDelete(id: number): Promise<"note" | "task" | "project" | null> {
+    const move = this.#moveUndos.get(id);
+    if (move) {
+      this.dismissToast(id);
+      await this.#undoMove(move);
+      return move.kind === "folder" ? "project" : move.kind;
+    }
     const task = this.#deletedTasks.get(id);
     if (task) {
       this.dismissToast(id);
@@ -1055,10 +1166,15 @@ export class AppState {
     return "note";
   }
 
-  /** The toast of the most recent delete that can still be undone, or `null`. */
+  /** The toast of the most recent note or task change that can still be undone, or `null`. */
   get latestUndo(): number | null {
     let latest: number | null = null;
-    for (const id of [...this.#deleted.keys(), ...this.#deletedTasks.keys()])
+    const moves = [...this.#moveUndos].filter(([, undo]) => undo.kind !== "folder");
+    for (const id of [
+      ...this.#deleted.keys(),
+      ...this.#deletedTasks.keys(),
+      ...moves.map(([key]) => key),
+    ])
       latest = latest === null ? id : Math.max(latest, id);
     return latest;
   }
@@ -1128,10 +1244,7 @@ export class AppState {
     const next = new Set(this.hideDone);
     if (!next.delete(key)) next.add(key);
     this.hideDone = next;
-    if (this.phase.kind !== "ready") return;
-    const keys = [...next].map((item) => (item === ALL_TASKS ? ALL_TASKS_KEY : item));
-    const root = this.phase.root;
-    this.#updateSettings((settings) => withHideDone(settings, root, keys));
+    this.#saveHideDone();
   }
 
   /** Whether `path` is a note shown in the workspace. */
@@ -1142,8 +1255,8 @@ export class AppState {
   /** Selects a note in its project and moves focus into the editor. */
   openNote(path: string): void {
     const role = classifyPath(path, createPathFilter(this.#config));
-    if (role?.kind !== "note" || role.archived || !this.#isNote(path)) return;
-    this.folder = role.project;
+    if (role?.kind !== "note" || !this.#isNote(path)) return;
+    this.folder = projectKey(role.project, role.archived);
     this.selectItem(path);
     this.editorFocusRequest += 1;
   }
@@ -1255,7 +1368,7 @@ export class AppState {
       return now ? taskOps.editTaskText(current, ref, `${now.text} ${suffix}`) : null;
     });
     if (!linked) this.#toast(notLinkedMessage(baseName(written.path)));
-    this.#openCreated(written, contents, folder.split("/")[0] ?? INBOX);
+    this.#openCreated(written, contents, projectKeyOf(written.path));
     this.editorFocusRequest += 1;
   }
 
@@ -1450,7 +1563,7 @@ export class AppState {
   }
 
   /** Runs a toast's action button: undo a delete, or create a missing note. */
-  async runToastAction(id: number): Promise<"note" | "task" | "create" | null> {
+  async runToastAction(id: number): Promise<"note" | "task" | "project" | "create" | null> {
     const action = this.#toastActions.get(id);
     if (!action) return this.undoDelete(id);
     this.dismissToast(id);
@@ -1512,6 +1625,587 @@ export class AppState {
       this.#requestTaskFocus(path, null);
       return { kind: "created", name };
     });
+  }
+
+  /**
+   * Moves a note into another folder of the workspace, keeping its file
+   * name. An open note keeps its text, history and save state, and links to
+   * it from task lists are updated. A toast can undo it.
+   */
+  async moveNote(path: string, folder: string): Promise<MoveOutcome> {
+    if (this.phase.kind !== "ready") return { kind: "failed" };
+    const name = baseName(path);
+    const to = folder === "" ? name : `${folder}/${name}`;
+    if (to === path) return { kind: "moved", path };
+    const generation = this.#generation;
+    return this.#serial(async (): Promise<MoveOutcome> => {
+      if (generation !== this.#generation) return { kind: "failed" };
+      const outcome = await this.#moveNoteTo(path, to);
+      if (outcome.kind !== "moved" || generation !== this.#generation) return outcome;
+      const id = this.#toast(movedNoteMessage(name, folder), "Undo");
+      this.#moveUndos.set(id, { kind: "note", from: path, to: outcome.path, generation });
+      return outcome;
+    });
+  }
+
+  /** Moves a note to `to`; runs in the change queue. */
+  async #moveNoteTo(path: string, to: string): Promise<MoveOutcome> {
+    const generation = this.#generation;
+    const name = baseName(to);
+    if (!this.#isNote(path)) return { kind: "invalid", reason: NOTE_GONE };
+    if (this.#nameTaken(path, to)) {
+      return { kind: "invalid", reason: noteExistsThereMessage(name) };
+    }
+    const role = classifyPath(to, createPathFilter(this.#config));
+    if (role?.kind === "tasks") return { kind: "invalid", reason: TASKS_RESERVED };
+    if (role === null) return { kind: "invalid", reason: MOVE_IGNORED };
+    const selected = this.item === path;
+    const session = this.#sessions.get(path);
+    try {
+      if (session) {
+        await session.exclusive(async () => {
+          const written = await this.#storage.moveFile(path, to);
+          session.moveTo(written.path, written.hash);
+          if (generation === this.#generation) this.#applyRename(path, written, session);
+        });
+      } else {
+        const written = await this.#storage.moveFile(path, to);
+        if (generation === this.#generation) this.#applyRename(path, written, null);
+      }
+    } catch (error) {
+      if (generation !== this.#generation) return { kind: "failed" };
+      const storageError = toStorageError(error);
+      if (storageError.kind === "Conflict") {
+        return { kind: "invalid", reason: noteExistsThereMessage(name) };
+      }
+      this.#toast(moveFailedMessage(baseName(path), storageError.message));
+      return { kind: "failed" };
+    }
+    if (generation !== this.#generation) return { kind: "failed" };
+    // The open note stays open, now in the project it moved to.
+    if (selected && this.item === to) this.folder = projectKeyOf(to);
+    const moves: PathMove[] = [{ from: path, to, folder: false }];
+    this.#remapUndo(moves);
+    this.#retargetAll(moves);
+    return { kind: "moved", path: to };
+  }
+
+  /**
+   * Moves a top-level task with its detail and subtasks to the end of
+   * another project's task list (created when missing). Links in it are
+   * rewritten for the new list. A toast can undo it.
+   */
+  async moveTaskToProject(path: string, ref: TaskRef, project: string): Promise<MoveOutcome> {
+    if (this.phase.kind !== "ready") return { kind: "failed" };
+    const target = projectTasksPath(project);
+    if (target === path) return { kind: "moved", path };
+    const generation = this.#generation;
+    return this.#serial(async (): Promise<MoveOutcome> => {
+      if (generation !== this.#generation) return { kind: "failed" };
+      if (!findProject(this.workspace, project)) {
+        return { kind: "invalid", reason: missingProjectMessage(project) };
+      }
+      const problem = await this.#ensureTaskList(target);
+      if (generation !== this.#generation) return { kind: "failed" };
+      if (problem !== null) {
+        return { kind: "invalid", reason: taskMoveFailedMessage(project, problem) };
+      }
+      const doc = this.#currentTasks(path);
+      const line = doc ? taskOps.locateTask(doc, ref) : null;
+      const block = doc && line !== null ? taskOps.blockOf(doc, line) : null;
+      const removal = doc && block?.line === line ? taskOps.deleteTask(doc, ref) : null;
+      if (!removal) {
+        this.#toast(TASK_CHANGED);
+        return { kind: "failed" };
+      }
+      const blockText = taskOps.joinLines(removal.removed.lines);
+      const moved = retargetLinks(blockText, path, [], target)?.text ?? blockText;
+      const lines = taskOps.splitLines(moved);
+      const added = this.#editTasks(target, null, (current) => taskOps.appendLines(current, lines));
+      if (added?.focus == null) {
+        this.#toast(taskMoveFailedMessage(project, TASK_LIST_UNAVAILABLE));
+        return { kind: "failed" };
+      }
+      let removed: RemovedLines | null = null;
+      this.#editTasks(path, ref, (current) => {
+        const deletion = taskOps.deleteTask(current, ref);
+        removed = deletion?.removed ?? null;
+        return deletion;
+      });
+      const inserted = { line: added.focus, raw: lines[0]?.text ?? "" };
+      if (removed === null) {
+        // Cannot happen within one step; never leave the task in both lists.
+        this.#editTasks(target, null, (current) => taskOps.deleteTask(current, inserted));
+        this.#toast(TASK_CHANGED);
+        return { kind: "failed" };
+      }
+      const id = this.#toast(movedTaskMessage(project), "Undo");
+      this.#moveUndos.set(id, {
+        kind: "task",
+        source: path,
+        target,
+        removed,
+        inserted,
+        generation,
+      });
+      return { kind: "moved", path: target };
+    });
+  }
+
+  /**
+   * Makes sure the task list at `path` can be edited: created (empty,
+   * create-only) when missing, read when not read yet. Returns why it
+   * cannot, or `null`.
+   */
+  async #ensureTaskList(path: string): Promise<string | null> {
+    if (classifyPath(path, createPathFilter(this.#config))?.kind !== "tasks") {
+      return TASK_LIST_HIDDEN;
+    }
+    const generation = this.#generation;
+    const entry = this.#index.get(path);
+    if (!entry) {
+      let written: WrittenFile;
+      try {
+        written = await this.#storage.writeFile(path, "", { expectedHash: null });
+      } catch (error) {
+        const storageError = toStorageError(error);
+        return storageError.kind === "Conflict" ? TASK_LIST_APPEARED : storageError.message;
+      }
+      if (generation !== this.#generation) return WORKSPACE_CLOSED;
+      this.#addCreated(written, "");
+      this.#tasks.set(path, "", written.hash);
+      this.#publishTasks();
+      return null;
+    }
+    if (this.#sessions.has(path) || this.#tasks.get(path)) return null;
+    if (entry.size > MAX_SUMMARY_BYTES) return TASK_LIST_TOO_LARGE;
+    let file: FileContents;
+    try {
+      file = await this.#storage.readFile(path);
+    } catch (error) {
+      return toStorageError(error).message;
+    }
+    if (generation !== this.#generation) return WORKSPACE_CLOSED;
+    if (!this.#sessions.has(path) && !this.#tasks.get(path)) {
+      this.#tasks.set(path, file.contents, file.hash);
+    }
+    return null;
+  }
+
+  /** How many notes and tasks a project has, for the delete confirmation. */
+  projectContents(key: string): ProjectContents {
+    const project = findProjectByKey(this.workspace, key);
+    if (!project) return { notes: 0, tasks: 0 };
+    const path = project.tasks?.path;
+    const doc = path === undefined ? null : this.#currentTasks(path);
+    const tasks =
+      path === undefined ? 0 : (doc?.blocks.length ?? this.summaries.get(path)?.openTasks ?? 0);
+    return { notes: project.notes.length, tasks };
+  }
+
+  /**
+   * Renames an active or archived project (its folder) to the typed name.
+   * Open notes keep their state; links to its notes are updated. A toast
+   * can undo it.
+   */
+  async renameProject(key: string, input: string): Promise<RenameOutcome> {
+    if (this.phase.kind !== "ready") return { kind: "failed" };
+    const archived = isArchivedKey(key);
+    const name = projectNameOf(key);
+    if (input.trim() === name) return { kind: "renamed", path: key };
+    const others = (archived ? this.workspace.archived : this.workspace.projects)
+      .map((project) => project.name)
+      .filter((other) => other !== name);
+    const validation = validateProjectName(input, others);
+    if (!validation.ok) return { kind: "invalid", reason: validation.reason };
+    const to = projectKey(validation.name, archived);
+    if (classifyPath(projectTasksPath(to), createPathFilter(this.#config))?.kind !== "tasks") {
+      return { kind: "invalid", reason: PROJECT_IGNORED };
+    }
+    const generation = this.#generation;
+    return this.#serial(async (): Promise<RenameOutcome> => {
+      if (generation !== this.#generation || !findProjectByKey(this.workspace, key)) {
+        return { kind: "failed" };
+      }
+      const outcome = await this.#moveFolder(key, to, "renamed");
+      if (outcome === "conflict") {
+        return { kind: "invalid", reason: projectExistsMessage(validation.name) };
+      }
+      if (outcome === "failed") return { kind: "failed" };
+      const id = this.#toast(renamedProjectMessage(name, validation.name), "Undo");
+      this.#moveUndos.set(id, { kind: "folder", from: key, to, generation });
+      return { kind: "renamed", path: to };
+    });
+  }
+
+  /** Moves a project into `_archive/`; a toast can undo it. */
+  async archiveProject(name: string): Promise<void> {
+    if (this.phase.kind !== "ready" || name === INBOX) return;
+    const generation = this.#generation;
+    await this.#serial(async () => {
+      if (generation !== this.#generation || !findProject(this.workspace, name)) return;
+      const taken = this.workspace.archived.find(
+        (project) => project.name.toLowerCase() === name.toLowerCase(),
+      );
+      if (taken) {
+        this.#toast(archivedExistsMessage(taken.name));
+        return;
+      }
+      const to = projectKey(name, true);
+      const outcome = await this.#moveFolder(name, to, "archived");
+      if (outcome === "conflict") this.#toast(archivedExistsMessage(name));
+      if (outcome !== "moved") return;
+      const id = this.#toast(archivedProjectMessage(name), "Undo");
+      this.#moveUndos.set(id, { kind: "folder", from: name, to, generation });
+    });
+  }
+
+  /** Moves an archived project back; refused while an active project has its name. */
+  async unarchiveProject(name: string): Promise<void> {
+    if (this.phase.kind !== "ready") return;
+    const generation = this.#generation;
+    const from = projectKey(name, true);
+    await this.#serial(async () => {
+      if (generation !== this.#generation || !findProjectByKey(this.workspace, from)) return;
+      const taken = this.workspace.projects.find(
+        (project) => project.name.toLowerCase() === name.toLowerCase(),
+      );
+      if (taken) {
+        this.#toast(unarchiveTakenMessage(taken.name, name));
+        return;
+      }
+      const outcome = await this.#moveFolder(from, name, "unarchived");
+      if (outcome === "conflict") this.#toast(unarchiveTakenMessage(name, name));
+      if (outcome !== "moved") return;
+      const id = this.#toast(unarchivedProjectMessage(name), "Undo");
+      this.#moveUndos.set(id, { kind: "folder", from, to: name, generation });
+    });
+  }
+
+  /**
+   * Moves a project folder to the system trash, after saving pending edits
+   * of its files. There is no undo toast: the trash is the undo.
+   */
+  async deleteProject(key: string): Promise<void> {
+    if (this.phase.kind !== "ready" || key === INBOX) return;
+    const generation = this.#generation;
+    const name = projectNameOf(key);
+    await this.#serial(async () => {
+      if (generation !== this.#generation || !findProjectByKey(this.workspace, key)) return;
+      const held = await this.#holdSessions(key);
+      try {
+        if (held.unsaved.length > 0) {
+          this.#toast(unsavedMoveMessage(held.unsaved));
+          return;
+        }
+        try {
+          await this.#storage.deleteFolder(key);
+        } catch (error) {
+          if (generation === this.#generation) {
+            const message = toStorageError(error).message;
+            this.#toast(projectActionFailedMessage(name, "deleted", message));
+          }
+          return;
+        }
+        if (generation !== this.#generation) return;
+        this.#applyFolderDelete(key, held.sessions);
+      } finally {
+        held.release();
+      }
+      this.#toast(projectTrashedMessage(name));
+    });
+  }
+
+  /** The toast of the most recent project move that can still be undone, or `null`. */
+  get latestProjectUndo(): number | null {
+    let latest: number | null = null;
+    for (const [id, undo] of this.#moveUndos) {
+      if (undo.kind === "folder") latest = latest === null ? id : Math.max(latest, id);
+    }
+    return latest;
+  }
+
+  /** Takes back the move of toast `id`. */
+  async #undoMove(undo: MoveUndo): Promise<void> {
+    if (undo.generation !== this.#generation) return;
+    if (undo.kind === "task") {
+      this.#undoTaskMove(undo);
+      return;
+    }
+    await this.#serial(async () => {
+      if (undo.generation !== this.#generation) return;
+      if (undo.kind === "note") {
+        const outcome = await this.#moveNoteTo(undo.to, undo.from);
+        if (outcome.kind === "invalid") this.#toast(outcome.reason);
+        return;
+      }
+      const outcome = await this.#moveFolder(undo.to, undo.from, "moved back");
+      if (outcome === "conflict") this.#toast(projectExistsMessage(projectNameOf(undo.from)));
+    });
+  }
+
+  #undoTaskMove(undo: Extract<MoveUndo, { kind: "task" }>): void {
+    const target = this.#currentTasks(undo.target);
+    const line = target ? taskOps.locateTask(target, undo.inserted) : null;
+    const block = target && line !== null ? taskOps.blockOf(target, line) : null;
+    if (!block || block.line !== line) {
+      this.#toast(TASK_CHANGED);
+      return;
+    }
+    const taken = this.#editTasks(undo.target, undo.inserted, (doc) =>
+      taskOps.deleteTask(doc, undo.inserted),
+    );
+    if (!taken) return;
+    const restored = this.#editTasks(undo.source, null, (doc) =>
+      taskOps.restoreLines(doc, undo.removed),
+    );
+    if (restored) this.#requestTaskFocus(undo.source, restored.focus);
+    else this.#toast(TASK_NOT_RESTORED);
+  }
+
+  /**
+   * Saves pending edits of the sessions inside `folder` and holds them, so
+   * none writes while the folder moves. `unsaved` are the paths whose edits
+   * could not be saved.
+   */
+  async #holdSessions(
+    folder: string,
+  ): Promise<{ sessions: SaveSession[]; unsaved: string[]; release: () => void }> {
+    const sessions = [...this.#sessions.values()].filter((session) =>
+      isInside(session.path, folder),
+    );
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const held = await Promise.all(
+      sessions.map(
+        (session) =>
+          new Promise<boolean>((resolve) => {
+            session
+              .exclusive(async () => {
+                resolve(true);
+                await gate;
+              })
+              // A session closed meanwhile has nothing left to save.
+              .catch(() => resolve(false));
+          }),
+      ),
+    );
+    const kept = sessions.filter((_, index) => held[index] === true);
+    const unsaved = kept.filter((session) => session.dirty).map((session) => session.path);
+    return { sessions: kept, unsaved, release };
+  }
+
+  /**
+   * Moves the folder `from` to `to` after saving the pending edits inside
+   * it, then updates everything that knows its paths in one step, and the
+   * links that point into or out of it. Runs in the change queue.
+   */
+  async #moveFolder(from: string, to: string, action: string): Promise<FolderOutcome> {
+    const generation = this.#generation;
+    const name = projectNameOf(from);
+    const held = await this.#holdSessions(from);
+    try {
+      if (held.unsaved.length > 0) {
+        this.#toast(unsavedMoveMessage(held.unsaved));
+        return "failed";
+      }
+      let entries: readonly FileEntry[];
+      try {
+        entries = (await this.#storage.renameFolder(from, to)).entries;
+      } catch (error) {
+        if (generation !== this.#generation) return "failed";
+        const storageError = toStorageError(error);
+        if (storageError.kind === "Conflict") return "conflict";
+        this.#toast(projectActionFailedMessage(name, action, storageError.message));
+        return "failed";
+      }
+      if (generation !== this.#generation) return "failed";
+      this.#applyFolderMove(from, to, entries);
+    } finally {
+      held.release();
+    }
+    const moves: PathMove[] = [{ from, to, folder: true }];
+    this.#retargetAll(moves);
+    return "moved";
+  }
+
+  /** Puts every path under `from` under `to`, everywhere the app keeps paths. */
+  #applyFolderMove(from: string, to: string, entries: readonly FileEntry[]): void {
+    const move: PathMove = { from, to, folder: true };
+    const rename = (path: string) => applyMove(path, move);
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity -- local to this call, never rendered
+    const fresh = new Map(entries.map((entry) => [entry.path, entry]));
+    const pairs: [string, string][] = [];
+    const files: FileEntry[] = [];
+    for (const file of this.#files) {
+      const target = rename(file.path);
+      if (target === null) {
+        files.push(file);
+        continue;
+      }
+      pairs.push([file.path, target]);
+      files.push(fresh.get(target) ?? { ...file, path: target });
+      fresh.delete(target);
+    }
+    files.push(...fresh.values());
+    this.#files = files;
+    this.workspace = buildWorkspace(files, this.#config);
+
+    const unread: string[] = [];
+    for (const [old, target] of pairs) {
+      if (!this.#store.rename(old, target)) unread.push(target);
+      if (this.#tasks.rename(old, target)) this.#tasksChanged = true;
+      if (isTaskListPath(target)) continue;
+      if (this.#searchable(old) && this.#searchable(target)) this.#search.renameNote(old, target);
+      else if (this.#searchable(old)) this.#search.removeNote(old);
+      else if (this.#searchable(target)) unread.push(target);
+    }
+    this.#search.renameRecent(rename);
+
+    for (const session of [...this.#sessions.values()]) {
+      const target = rename(session.path);
+      if (target === null) continue;
+      const old = session.path;
+      // Same file, same contents: nothing to check again.
+      session.moveTo(target, session.hash ?? "");
+      if (this.#sessions.get(old) === session) this.#sessions.delete(old);
+      this.#sessions.set(target, session);
+    }
+    if (pairs.length > 0) {
+      this.editorChanges = [
+        ...this.editorChanges,
+        ...pairs.map(([old, target]): EditorPathChange => ({
+          kind: "rename",
+          from: old,
+          to: target,
+        })),
+      ];
+    }
+
+    if (this.folder === from) this.folder = to;
+    const item = rename(this.item);
+    if (item !== null) {
+      this.item = item;
+      const doc = this.document;
+      const docPath = doc ? rename(doc.path) : null;
+      if (doc && docPath !== null) {
+        const session = this.#sessions.get(docPath);
+        this.document =
+          session && doc.status === "ready"
+            ? { status: "ready", path: docPath, text: session.text, modified: doc.modified }
+            : { ...doc, path: docPath };
+      }
+    }
+    const focus = this.taskFocus;
+    const focusPath = focus ? rename(focus.path) : null;
+    if (focus && focusPath !== null) this.taskFocus = { ...focus, path: focusPath };
+    const reveal = this.editorReveal;
+    const revealPath = reveal ? rename(reveal.path) : null;
+    if (reveal && revealPath !== null) this.editorReveal = { ...reveal, path: revealPath };
+    this.#remapHideDone((key) => rename(key));
+    this.#remapUndo([move]);
+
+    this.#enqueue(unread, this.#generation);
+    this.#publishTasks();
+  }
+
+  /** Forgets everything inside a deleted folder; selects the inbox if it was selected. */
+  #applyFolderDelete(folder: string, sessions: readonly SaveSession[]): void {
+    const gone = (path: string) => isInside(path, folder);
+    const removed = this.#files.filter((file) => gone(file.path)).map((file) => file.path);
+    this.#files = this.#files.filter((file) => !gone(file.path));
+    this.workspace = buildWorkspace(this.#files, this.#config);
+    this.#store.retain((path) => !gone(path));
+    this.#search.retainNotes((path) => !gone(path));
+    if (this.#tasks.retain((path) => !gone(path))) this.#tasksChanged = true;
+    for (const session of sessions) {
+      session.dispose();
+      if (this.#sessions.get(session.path) === session) this.#sessions.delete(session.path);
+    }
+    if (removed.length > 0) {
+      this.editorChanges = [
+        ...this.editorChanges,
+        ...removed.map((path): EditorPathChange => ({ kind: "forget", path })),
+      ];
+    }
+    this.#remapHideDone((key) => (gone(key) ? "" : null));
+    for (const [id, undo] of [...this.#moveUndos]) {
+      const paths = undo.kind === "task" ? [undo.source, undo.target] : [undo.from, undo.to];
+      if (paths.some((path) => gone(path) || path === folder)) this.dismissToast(id);
+    }
+    for (const [id, deleted] of [...this.#deleted]) if (gone(deleted.path)) this.dismissToast(id);
+    for (const [id, task] of [...this.#deletedTasks]) if (gone(task.path)) this.dismissToast(id);
+    if (this.folder === folder || gone(this.item)) this.#select(INBOX);
+    this.#publishTasks();
+  }
+
+  /**
+   * Updates the remembered hidden done tasks after paths moved: `rename`
+   * returns the new key, `""` to drop it, or `null` to keep it.
+   */
+  #remapHideDone(rename: (key: string) => string | null): void {
+    let changed = false;
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity -- replaced, never mutated
+    const next = new Set<string>();
+    for (const key of this.hideDone) {
+      const target = key === ALL_TASKS ? null : rename(key);
+      if (target === null) next.add(key);
+      else {
+        changed = true;
+        if (target !== "") next.add(target);
+      }
+    }
+    if (!changed) return;
+    this.hideDone = next;
+    this.#saveHideDone();
+  }
+
+  /** Saves the hidden done tasks of the open workspace (only that field). */
+  #saveHideDone(): void {
+    if (this.phase.kind !== "ready") return;
+    const keys = [...this.hideDone].map((item) => (item === ALL_TASKS ? ALL_TASKS_KEY : item));
+    const root = this.phase.root;
+    this.#updateSettings((settings) => withHideDone(settings, root, keys));
+  }
+
+  /** Keeps undo toasts pointing at the files they belong to after paths moved. */
+  #remapUndo(moves: readonly PathMove[]): void {
+    const map = (path: string) => movedPath(path, moves);
+    for (const [id, deleted] of this.#deleted) {
+      this.#deleted.set(id, { ...deleted, path: map(deleted.path) });
+    }
+    for (const [id, task] of this.#deletedTasks) {
+      this.#deletedTasks.set(id, { ...task, path: map(task.path) });
+    }
+    for (const [id, undo] of this.#moveUndos) {
+      if (undo.kind === "task") {
+        this.#moveUndos.set(id, { ...undo, source: map(undo.source), target: map(undo.target) });
+      } else if (undo.kind === "note") {
+        this.#moveUndos.set(id, { ...undo, to: map(undo.to) });
+      } else {
+        // The folder itself moved: the undo moves it back from where it is now.
+        const to = moves.reduce((key, move) => (key === move.from ? move.to : key), undo.to);
+        this.#moveUndos.set(id, { ...undo, to: map(to) });
+      }
+    }
+  }
+
+  /**
+   * Rewrites links in every known task list that point at files `moves`
+   * moved, or that leave a list `moves` moved. Each list changes through
+   * its session like any task edit.
+   */
+  #retargetAll(moves: readonly PathMove[]): void {
+    const back = reverseMoves(moves);
+    for (const path of this.#tasks.paths()) {
+      const before = movedPath(path, back);
+      const current = this.#currentTasks(path);
+      if (!current || retargetLinks(current.text, before, moves, path) === null) continue;
+      this.#editTasks(path, null, (doc) => {
+        const edits = retargetLinks(doc.text, before, moves, path);
+        return edits ? { text: edits.text, focus: null } : null;
+      });
+    }
   }
 
   /** Commits pending changes and syncs now, lifting stops and retry delays. */
@@ -1691,6 +2385,7 @@ export class AppState {
     this.#deleted.delete(id);
     this.#toastActions.delete(id);
     this.#deletedTasks.delete(id);
+    this.#moveUndos.delete(id);
     this.toasts = this.toasts.filter((toast) => toast.id !== id);
   }
 
@@ -2050,10 +2745,12 @@ export class AppState {
       ...this.#deleted.keys(),
       ...this.#deletedTasks.keys(),
       ...this.#toastActions.keys(),
+      ...this.#moveUndos.keys(),
     ]);
     if (ids.size === 0) return;
     this.#deleted.clear();
     this.#deletedTasks.clear();
+    this.#moveUndos.clear();
     this.#toastActions.clear();
     this.toasts = this.toasts.filter((toast) => !ids.has(toast.id));
   }
@@ -2750,7 +3447,7 @@ export class AppState {
       this.#schedulePublish();
     }
 
-    if (this.folder !== ALL_TASKS && !findProject(this.workspace, this.folder)) {
+    if (this.folder !== ALL_TASKS && !findProjectByKey(this.workspace, this.folder)) {
       this.#select(INBOX);
     } else if (this.item === ALL_TASKS) {
       // The All tasks view follows the task index; there is no document to reload.

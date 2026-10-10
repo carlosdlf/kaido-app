@@ -2,6 +2,7 @@
   import { onMount, tick, untrack } from "svelte";
   import {
     ALL_TASKS,
+    archivedEntries,
     listItems,
     listSummary,
     listTitle,
@@ -26,12 +27,22 @@
   import { openTaskCount, type InsertPosition, type TaskRef } from "$lib/core/taskDocument";
   import { allTaskRows, taskRows, type RowOptions } from "$lib/core/taskRows";
   import { taskGroups } from "$lib/core/taskIndex";
-  import { isTaskListPath } from "$lib/core/workspace";
+  import {
+    findProjectByKey,
+    isTaskListPath,
+    projectKeyOf,
+    projectNameOf,
+  } from "$lib/core/workspace";
+  import { noteMoveTargets, taskMoveTargets } from "$lib/core/moveTargets";
+  import { folderOf } from "$lib/core/pathMoves";
+  import { baseName } from "$lib/core/saveMachine";
   import { EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN } from "$lib/config/settings";
   import { sameAccelerator } from "$lib/core/accelerator";
   import { folderName } from "$lib/core/workspaceLocation";
   import { oversizedTasksMessage, TASK_CHANGED, type AppState } from "./appState.svelte";
   import SettingsDialog from "./SettingsDialog.svelte";
+  import MovePicker from "./MovePicker.svelte";
+  import ConfirmDialog from "./ConfirmDialog.svelte";
   import SetupBanner from "./SetupBanner.svelte";
   import { APP_VERSION } from "./version";
   import EditorPane from "./EditorPane.svelte";
@@ -61,6 +72,7 @@
   });
 
   const entries = $derived(sidebarEntries(app.workspace, app.summaries));
+  const archived = $derived(archivedEntries(app.workspace));
   const items = $derived(listItems(app.workspace, app.folder, app.summaries));
   const workspaceName = $derived(app.phase.kind === "ready" ? folderName(app.phase.root) : "");
 
@@ -185,6 +197,60 @@
     return { text: "", alert: false };
   });
 
+  /** Where a note or task is being moved, while the picker is shown. */
+  type MoveRequest = { kind: "note"; path: string } | { kind: "task"; path: string; ref: TaskRef };
+  let moveRequest: MoveRequest | null = $state.raw(null);
+  const moveTargets = $derived.by(() => {
+    const request = moveRequest;
+    if (!request) return [];
+    return request.kind === "note"
+      ? noteMoveTargets(app.workspace, folderOf(request.path))
+      : taskMoveTargets(app.workspace, projectKeyOf(request.path));
+  });
+
+  async function chooseMoveTarget(folder: string): Promise<string | null> {
+    const request = moveRequest;
+    if (!request) return null;
+    const outcome =
+      request.kind === "note"
+        ? await app.moveNote(request.path, folder)
+        : await app.moveTaskToProject(request.path, request.ref, folder);
+    return outcome.kind === "invalid" ? outcome.reason : null;
+  }
+
+  function closeMovePicker() {
+    const request = moveRequest;
+    moveRequest = null;
+    // The row the item had may be gone; focus goes to what is selected now.
+    if (request?.kind === "note") listFocus += 1;
+    else taskFocusFallback += 1;
+  }
+
+  /** The project waiting for the delete confirmation. */
+  let deleteRequest: { key: string; name: string; notes: number; tasks: number } | null =
+    $state.raw(null);
+
+  function requestDelete(key: string) {
+    if (!findProjectByKey(app.workspace, key)) return;
+    deleteRequest = { key, name: projectNameOf(key), ...app.projectContents(key) };
+  }
+
+  async function confirmDelete() {
+    const request = deleteRequest;
+    deleteRequest = null;
+    if (!request) return;
+    await app.deleteProject(request.key);
+    await tick();
+    shell?.querySelector<HTMLElement>("[data-nav-id][aria-current='page']")?.focus();
+  }
+
+  function plural(count: number, word: string): string {
+    return `${count} ${word}${count === 1 ? "" : "s"}`;
+  }
+
+  /** A modal dialog of the shell is shown; global shortcuts wait. */
+  const modalOpen = $derived(moveRequest !== null || deleteRequest !== null);
+
   /** The search palette is shown. */
   let paletteOpen = $state(false);
   /** What had focus before the palette opened, for commands that replace it. */
@@ -248,7 +314,7 @@
    */
   function handleKeydownCapture(event: KeyboardEvent) {
     // The settings dialog handles its own keys, such as a shortcut being recorded.
-    if (event.isComposing || settingsOpen) return;
+    if (event.isComposing || settingsOpen || modalOpen) return;
     if (isSettingsShortcut(event, mac)) {
       event.preventDefault();
       event.stopPropagation();
@@ -317,6 +383,9 @@
     onopennote: (path: string, ref: TaskRef) => app.openTaskNote(path, ref),
     oncreatenote: (path: string, ref: TaskRef) => void app.createNoteFromTask(path, ref),
     oncopytext: (text: string) => copyText(text, "Copied the task text"),
+    onmovetoproject: (path: string, ref: TaskRef) => {
+      moveRequest = { kind: "task", path, ref };
+    },
     onundo: undoLatest,
     onstale: () => app.notify(TASK_CHANGED),
   });
@@ -360,6 +429,11 @@
     if (id !== null) void undo(id);
   }
 
+  function undoProject() {
+    const id = app.latestProjectUndo;
+    if (id !== null) void undo(id);
+  }
+
   const NOT_TYPED = new Set([
     "checkbox",
     "radio",
@@ -378,7 +452,7 @@
   }
 
   function handleKeydown(event: KeyboardEvent) {
-    if (event.defaultPrevented || event.isComposing) return;
+    if (event.defaultPrevented || event.isComposing || modalOpen) return;
     if (isSyncShortcut(event, mac)) {
       // Works everywhere, the editor included; the browser would offer to save the page.
       event.preventDefault();
@@ -440,6 +514,13 @@
       {syncShortcut}
       onsearch={openPalette}
       {searchShortcut}
+      {archived}
+      onrenameproject={(key, name) => app.renameProject(key, name)}
+      onarchive={(name) => void app.archiveProject(name)}
+      onunarchive={(name) => void app.unarchiveProject(name)}
+      ondeleteproject={requestDelete}
+      oncopypath={copyPath}
+      onundo={undoProject}
       onsettings={() => openSettings()}
       {settingsShortcut}
     />
@@ -465,6 +546,7 @@
       onrename={(id, name) => app.renameNote(id, name)}
       ondelete={(id) => void app.deleteNote(id)}
       oncopypath={copyPath}
+      onmove={(id) => (moveRequest = { kind: "note", path: id })}
       onundo={undoLatest}
       focusRequest={listFocus}
     />
@@ -544,6 +626,33 @@
     oncancelclone={() => void app.cancelClone()}
     onback={() => (switching = false)}
   />
+{/if}
+
+{#if moveRequest && app.phase.kind === "ready"}
+  <MovePicker
+    title={moveRequest.kind === "note"
+      ? `Move ${baseName(moveRequest.path)} to…`
+      : "Move task to project…"}
+    targets={moveTargets}
+    returnFocus={null}
+    onchoose={chooseMoveTarget}
+    onclose={closeMovePicker}
+  />
+{/if}
+
+{#if deleteRequest}
+  <ConfirmDialog
+    title="Delete project"
+    confirmLabel="Delete"
+    danger
+    onconfirm={() => void confirmDelete()}
+    oncancel={() => (deleteRequest = null)}
+  >
+    Delete project <strong>{deleteRequest.name}</strong>? Its folder ({plural(
+      deleteRequest.notes,
+      "note",
+    )}, {plural(deleteRequest.tasks, "task")}) moves to the system trash.
+  </ConfirmDialog>
 {/if}
 
 {#if settingsOpen}

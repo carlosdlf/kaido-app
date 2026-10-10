@@ -1,4 +1,5 @@
-//! Workspace file operations: listing notes, reading and atomic writes.
+//! Workspace file operations: listing notes, reading, atomic writes, and
+//! renaming, moving and deleting single notes.
 //!
 //! Everything here is synchronous and free of Tauri types; the command layer
 //! runs it on a blocking thread.
@@ -179,7 +180,7 @@ pub fn list_files(root: &Path) -> AppResult<Vec<FileEntry>> {
     Ok(out)
 }
 
-fn walk(root: &Path, entries: fs::ReadDir, out: &mut Vec<FileEntry>) {
+pub(crate) fn walk(root: &Path, entries: fs::ReadDir, out: &mut Vec<FileEntry>) {
     for dir_entry in entries.flatten() {
         let name = dir_entry.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -441,7 +442,7 @@ fn publish_new(
 
 /// Splits a validated relative path into its folder (empty for the root) and
 /// file name.
-fn split_parent(rel: &str) -> (&str, &str) {
+pub(crate) fn split_parent(rel: &str) -> (&str, &str) {
     rel.rsplit_once('/').unwrap_or(("", rel))
 }
 
@@ -573,7 +574,7 @@ fn move_to_new_name(
     to: &str,
     link: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> AppResult<()> {
-    let rename_err = |e: io::Error| AppError::from_io(&e, "rename", from);
+    let rename_err = |e: io::Error| move_error(&e, "rename", from, to);
     match link(from_path, to_path) {
         Ok(()) => match fs::remove_file(from_path) {
             // Removed meanwhile by another program: the note lives at `to`.
@@ -599,14 +600,188 @@ fn move_to_new_name(
     }
 }
 
+/// Maps the failure of renaming or moving `from` to `to`. Moving to another
+/// drive or file system is refused, never done as a copy.
+pub(crate) fn move_error(err: &io::Error, action: &str, from: &str, to: &str) -> AppError {
+    match err.kind() {
+        io::ErrorKind::CrossesDevices => AppError::Io(format!(
+            "could not {action} {from} to {to}: they are on different drives or file systems"
+        )),
+        io::ErrorKind::AlreadyExists => AppError::Conflict(format!("{to} already exists")),
+        _ => AppError::from_io(err, action, from),
+    }
+}
+
+/// Moves a note to another path in the workspace, possibly in another
+/// folder, and returns the entry of the note at its new path with the hash of
+/// its bytes. Missing folders of `to` are created (and removed again if the
+/// move fails).
+///
+/// Within one folder this is [`rename_file`]. Across folders the same rules
+/// apply, plus:
+/// - both folders must be real folders: a path that goes through a link to a
+///   folder is refused with `InvalidPath`, so a note never lands somewhere
+///   other than where the listing shows it;
+/// - a note that is a symlink is refused with `InvalidPath`, since a relative
+///   link would point somewhere else from its new folder;
+/// - a move to another drive or file system is refused with `Io`; the note is
+///   never copied.
+pub fn move_file(root: &Path, from: &str, to: &str) -> AppResult<WrittenFile> {
+    move_file_with(root, from, to, |a, b| fs::hard_link(a, b), has_entry_named)
+}
+
+fn move_file_with(
+    root: &Path,
+    from: &str,
+    to: &str,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    entry_exists: impl FnOnce(&Path, &str) -> bool,
+) -> AppResult<WrittenFile> {
+    ensure_note(from)?;
+    ensure_note(to)?;
+    let (from_dir, from_name) = split_parent(from);
+    let (to_dir, to_name) = split_parent(to);
+    if from_dir == to_dir {
+        return rename_file_with(root, from, to, link, entry_exists);
+    }
+    let source = real_folder(root, from_dir, from, false)?;
+    let from_path = source.join(from_name);
+    let from_meta = existing_entry(root, &from_path, from)?;
+    if from_meta.file_type().is_symlink() {
+        return Err(AppError::InvalidPath(format!(
+            "{from} is a link; links can only be renamed within their folder"
+        )));
+    }
+    let hash = content_hash(&read_bytes(&from_path, from)?);
+    let (dest, missing) = folder_chain(root, to_dir, to, false)?;
+    let to_path = dest.join(to_name);
+    if missing.is_empty() {
+        match fs::symlink_metadata(&to_path) {
+            Ok(_) => return Err(AppError::Conflict(format!("{to} already exists"))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(AppError::from_io(&e, "check", to)),
+        }
+    }
+    let created = create_folders(&missing, to)?;
+    let moved = ensure_parent_inside(root, &to_path, to).and_then(|()| {
+        #[cfg(test)]
+        tests::run_before_publish_hook();
+        move_to_new_name(&from_path, &to_path, from, to, link)
+    });
+    if let Err(err) = moved {
+        remove_empty_folders(&created);
+        return Err(err);
+    }
+    sync_parent(&from_path);
+    sync_parent(&to_path);
+    let meta = fs::metadata(&to_path).map_err(|e| AppError::from_io(&e, "read", to))?;
+    Ok(WrittenFile {
+        entry: entry(to.to_owned(), &meta),
+        hash,
+    })
+}
+
+/// Resolves the folder `rel` (empty for the root) without following links:
+/// every part of it must be a real folder. `label` names the entry the
+/// caller acts on; `is_target` says whether that entry is the folder itself
+/// (rather than something inside it), for the error messages.
+pub(crate) fn real_folder(
+    root: &Path,
+    rel: &str,
+    label: &str,
+    is_target: bool,
+) -> AppResult<PathBuf> {
+    let (path, missing) = folder_chain(root, rel, label, is_target)?;
+    if missing.is_empty() {
+        Ok(path)
+    } else {
+        Err(AppError::NotFound(format!("{label} was not found")))
+    }
+}
+
+/// Walks the folder `rel` (empty for the root) from the workspace root
+/// without following links. Returns its path and the folders of the chain
+/// that do not exist yet, outermost first. Each existing part must be a real
+/// folder: a link is `InvalidPath`, anything else `NotADirectory`.
+pub(crate) fn folder_chain(
+    root: &Path,
+    rel: &str,
+    label: &str,
+    is_target: bool,
+) -> AppResult<(PathBuf, Vec<PathBuf>)> {
+    let mut path = root.to_path_buf();
+    let mut missing = Vec::new();
+    if rel.is_empty() {
+        return Ok((path, missing));
+    }
+    let rel_path = paths::validate_relative(rel)?;
+    let count = rel_path.components().count();
+    for (index, part) in rel_path.components().enumerate() {
+        path.push(part);
+        if !missing.is_empty() {
+            missing.push(path.clone());
+            continue;
+        }
+        let last = is_target && index + 1 == count;
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(AppError::InvalidPath(if last {
+                    format!("{label} is a link to a folder, which the app does not follow")
+                } else {
+                    format!("{label} is inside a linked folder, which the app does not follow")
+                }));
+            }
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(AppError::NotADirectory(if last {
+                    format!("{label} is not a folder")
+                } else {
+                    format!("a parent of {label} is not a folder")
+                }));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => missing.push(path.clone()),
+            Err(e) => return Err(AppError::from_io(&e, "open", label)),
+        }
+    }
+    Ok((path, missing))
+}
+
+/// Creates the folders `missing` (outermost first) and returns the ones it
+/// created. If one fails, those created so far are removed again.
+pub(crate) fn create_folders(missing: &[PathBuf], label: &str) -> AppResult<Vec<PathBuf>> {
+    let mut created = Vec::new();
+    for dir in missing {
+        match fs::create_dir(dir) {
+            Ok(()) => created.push(dir.clone()),
+            // Created meanwhile by another program: use it if it is a folder.
+            Err(e)
+                if e.kind() == io::ErrorKind::AlreadyExists
+                    && fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) => {}
+            Err(e) => {
+                remove_empty_folders(&created);
+                return Err(AppError::from_io(&e, "create the folder for", label));
+            }
+        }
+    }
+    Ok(created)
+}
+
+/// Removes folders created by [`create_folders`], innermost first, as long as
+/// they are still empty. Best effort.
+pub(crate) fn remove_empty_folders(created: &[PathBuf]) {
+    for dir in created.iter().rev() {
+        let _ = fs::remove_dir(dir);
+    }
+}
+
 /// Whether two different names only differ in letter case.
-fn is_case_variant(a: &str, b: &str) -> bool {
+pub(crate) fn is_case_variant(a: &str, b: &str) -> bool {
     a != b && a.to_lowercase() == b.to_lowercase()
 }
 
 /// Whether two `symlink_metadata` results describe the same directory entry.
 #[cfg(unix)]
-fn same_entry(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+pub(crate) fn same_entry(a: &fs::Metadata, b: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     a.dev() == b.dev() && a.ino() == b.ino()
 }
@@ -616,7 +791,7 @@ fn same_entry(a: &fs::Metadata, b: &fs::Metadata) -> bool {
 /// compares what is; it is only consulted for names that differ in case and
 /// when the folder has no entry with the exact new name.
 #[cfg(not(unix))]
-fn same_entry(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+pub(crate) fn same_entry(a: &fs::Metadata, b: &fs::Metadata) -> bool {
     a.file_type() == b.file_type()
         && a.len() == b.len()
         && a.modified().ok() == b.modified().ok()
@@ -626,7 +801,7 @@ fn same_entry(a: &fs::Metadata, b: &fs::Metadata) -> bool {
 /// Whether `dir` has an entry named exactly `name` (case-sensitive). When
 /// the folder cannot be read this answers `true`, so a rename is refused
 /// rather than risking to replace a file.
-fn has_entry_named(dir: &Path, name: &str) -> bool {
+pub(crate) fn has_entry_named(dir: &Path, name: &str) -> bool {
     match fs::read_dir(dir) {
         Ok(entries) => entries.flatten().any(|e| e.file_name() == name),
         Err(_) => true,
@@ -656,7 +831,7 @@ pub fn delete_file(root: &Path, rel: &str, expected_hash: &str) -> AppResult<()>
 /// rather than asking Finder, which would need the Apple Events permission
 /// and play a sound.
 #[cfg(target_os = "macos")]
-fn move_to_os_trash(path: &Path) -> Result<(), trash::Error> {
+pub(crate) fn move_to_os_trash(path: &Path) -> Result<(), trash::Error> {
     use trash::macos::{DeleteMethod, TrashContextExtMacos};
     let mut context = trash::TrashContext::default();
     context.set_delete_method(DeleteMethod::NsFileManager);
@@ -665,7 +840,7 @@ fn move_to_os_trash(path: &Path) -> Result<(), trash::Error> {
 
 /// Moves `path` to the OS trash.
 #[cfg(not(target_os = "macos"))]
-fn move_to_os_trash(path: &Path) -> Result<(), trash::Error> {
+pub(crate) fn move_to_os_trash(path: &Path) -> Result<(), trash::Error> {
     trash::delete(path)
 }
 
@@ -714,7 +889,7 @@ fn delete_file_with(
 /// as a name too long for the trash's info file), `Unknown` (no home folder,
 /// an unreadable mount table, or on Windows an aborted operation), and every
 /// error from the Windows and macOS trash.
-fn trash_unavailable(err: &trash::Error, path: &Path) -> bool {
+pub(crate) fn trash_unavailable(err: &trash::Error, path: &Path) -> bool {
     #[cfg(all(
         unix,
         not(target_os = "macos"),
@@ -743,7 +918,7 @@ fn trash_unavailable(err: &trash::Error, path: &Path) -> bool {
 /// Maps a trash error that is not about the trash being unavailable. The
 /// message never includes the trash error's own text, which holds absolute
 /// paths.
-fn trash_failure(err: &trash::Error, path: &Path, rel: &str) -> AppError {
+pub(crate) fn trash_failure(err: &trash::Error, path: &Path, rel: &str) -> AppError {
     #[cfg(all(
         unix,
         not(target_os = "macos"),
@@ -849,7 +1024,7 @@ fn sweep_temp_files_older_than(root: &Path, age: Duration) -> usize {
 }
 
 #[cfg(unix)]
-fn sync_parent(target: &Path) {
+pub(crate) fn sync_parent(target: &Path) {
     if let Some(dir) = target.parent() {
         if let Ok(dir) = fs::File::open(dir) {
             let _ = dir.sync_all();
@@ -858,7 +1033,7 @@ fn sync_parent(target: &Path) {
 }
 
 #[cfg(not(unix))]
-fn sync_parent(_target: &Path) {
+pub(crate) fn sync_parent(_target: &Path) {
     // Windows has no portable way to sync a directory entry.
 }
 
@@ -2111,6 +2286,268 @@ mod tests {
         assert!(outside.join("secret.md").exists());
         assert!(!root.join("b.md").exists());
         assert!(!root.join(".git/b.md").exists());
+    }
+
+    // Move.
+
+    fn move_kind(root: &Path, from: &str, to: &str) -> &'static str {
+        move_file(root, from, to).unwrap_err().kind()
+    }
+
+    #[test]
+    fn moves_a_note_to_another_folder_creating_it() {
+        let (_dir, root) = workspace();
+        put(&root, "a/note.md", "body");
+        put(&root, "b/keep.md", "x");
+        let written = move_file(&root, "a/note.md", "b/note.md").unwrap();
+        assert_eq!(written.entry.path, "b/note.md");
+        assert_eq!(written.entry.size, 4);
+        assert!(written.entry.modified > 0);
+        assert_eq!(written.hash, content_hash(b"body"));
+        assert_eq!(read(&root, "b/note.md").unwrap(), "body");
+        assert!(root.join("a").is_dir());
+
+        // Missing folders are created, any depth.
+        move_file(&root, "b/note.md", "new/deep/Renamed.md").unwrap();
+        // To and from the root.
+        move_file(&root, "new/deep/Renamed.md", "root.md").unwrap();
+        move_file(&root, "root.md", "a/tasks.md").unwrap();
+        assert_eq!(listed(&root), ["a/tasks.md", "b/keep.md"]);
+        assert!(root.join("new/deep").is_dir());
+        for dir in ["a", "b", "new/deep"] {
+            assert!(leftovers(&root.join(dir)).is_empty(), "{dir}");
+        }
+    }
+
+    #[test]
+    fn move_within_a_folder_is_a_rename() {
+        let (_dir, root) = workspace();
+        put(&root, "p/a.md", "x");
+        put(&root, "p/taken.md", "y");
+        assert_eq!(
+            move_file(&root, "p/a.md", "p/A.md").unwrap().entry.path,
+            "p/A.md"
+        );
+        assert_eq!(move_kind(&root, "p/A.md", "p/taken.md"), "Conflict");
+        assert_eq!(move_kind(&root, "p/A.md", "p/A.md"), "Conflict");
+        assert_eq!(listed(&root), ["p/A.md", "p/taken.md"]);
+    }
+
+    #[test]
+    fn move_never_replaces_an_existing_entry() {
+        let (_dir, root) = workspace();
+        put(&root, "a/n.md", "mine");
+        put(&root, "b/n.md", "theirs");
+        fs::create_dir_all(root.join("c/n.md")).unwrap();
+        let err = move_file(&root, "a/n.md", "b/n.md").unwrap_err();
+        assert_eq!(err.kind(), "Conflict");
+        assert_eq!(err.to_string(), "b/n.md already exists");
+        assert_eq!(move_kind(&root, "a/n.md", "c/n.md"), "Conflict");
+        assert_eq!(read(&root, "a/n.md").unwrap(), "mine");
+        assert_eq!(read(&root, "b/n.md").unwrap(), "theirs");
+    }
+
+    #[test]
+    fn move_conflicts_with_a_note_created_right_before_linking() {
+        let (_dir, root) = workspace();
+        put(&root, "a/n.md", "mine");
+        fs::create_dir(root.join("b")).unwrap();
+        let target = root.join("b/n.md");
+        before_publish(move || fs::write(target, "theirs").unwrap());
+        assert_eq!(move_kind(&root, "a/n.md", "b/n.md"), "Conflict");
+        assert_eq!(read(&root, "a/n.md").unwrap(), "mine");
+        assert_eq!(read(&root, "b/n.md").unwrap(), "theirs");
+    }
+
+    #[test]
+    fn a_failed_move_removes_the_folders_it_created() {
+        let (_dir, root) = workspace();
+        put(&root, "a/n.md", "mine");
+        let refuse = |_: &Path, _: &Path| Err(io::Error::from(io::ErrorKind::AlreadyExists));
+        let err = move_file_with(&root, "a/n.md", "x/y/n.md", refuse, has_entry_named).unwrap_err();
+        assert_eq!(err.kind(), "Conflict");
+        assert!(!root.join("x").exists());
+        assert_eq!(read(&root, "a/n.md").unwrap(), "mine");
+    }
+
+    #[test]
+    fn move_falls_back_without_hard_links() {
+        let (_dir, root) = workspace();
+        put(&root, "a/n.md", "body");
+        let written =
+            move_file_with(&root, "a/n.md", "b/n.md", unsupported, has_entry_named).unwrap();
+        assert_eq!(written.entry.path, "b/n.md");
+        assert_eq!(listed(&root), ["b/n.md"]);
+    }
+
+    #[test]
+    fn moving_to_another_file_system_is_refused_with_a_clear_message() {
+        let err = io::Error::from(io::ErrorKind::CrossesDevices);
+        let mapped = move_error(&err, "move", "a/n.md", "b/n.md");
+        assert_eq!(mapped.kind(), "Io");
+        assert_eq!(
+            mapped.to_string(),
+            "could not move a/n.md to b/n.md: they are on different drives or file systems"
+        );
+        let exists = move_error(
+            &io::Error::from(io::ErrorKind::AlreadyExists),
+            "move",
+            "a",
+            "b",
+        );
+        assert_eq!(exists, AppError::Conflict("b already exists".into()));
+        let denied = move_error(
+            &io::Error::from(io::ErrorKind::PermissionDenied),
+            "move",
+            "a",
+            "b",
+        );
+        assert_eq!(denied.kind(), "PermissionDenied");
+    }
+
+    #[test]
+    fn move_accepts_only_notes() {
+        let (_dir, root) = workspace();
+        put(&root, CONFIG_FILE, "{}");
+        put(&root, "a/n.md", "x");
+        put(&root, "a/n.txt", "x");
+        for (from, to) in [
+            (CONFIG_FILE, "a/config.md"),
+            ("a/n.md", ".kaido/n.md"),
+            ("a/n.md", ".git/n.md"),
+            ("a/n.md", "node_modules/n.md"),
+            ("a/n.md", "b/n.txt"),
+            ("a/n.txt", "b/n.md"),
+            ("a/n.md", "../n.md"),
+            ("a/n.md", "b//n.md"),
+            ("a/n.md", ""),
+            ("", "b/n.md"),
+        ] {
+            assert_eq!(move_kind(&root, from, to), "InvalidPath", "{from} -> {to}");
+        }
+        assert_eq!(listed(&root), ["a/n.md"]);
+        assert!(!root.join(".git").exists());
+        assert!(!root.join("b").exists());
+    }
+
+    #[test]
+    fn move_reports_missing_notes_and_bad_folders() {
+        let (_dir, root) = workspace();
+        put(&root, "file.md", "x");
+        put(&root, "a/n.md", "x");
+        fs::create_dir(root.join("a/dir.md")).unwrap();
+        let err = move_file(&root, "a/missing.md", "b/missing.md").unwrap_err();
+        assert_eq!(err.to_string(), "a/missing.md was not found");
+        assert_eq!(move_kind(&root, "gone/n.md", "b/n.md"), "NotFound");
+        assert_eq!(move_kind(&root, "a/dir.md", "b/dir.md"), "InvalidPath");
+        assert_eq!(move_kind(&root, "a/n.md", "file.md/n.md"), "NotADirectory");
+        assert_eq!(
+            move_kind(&root, "a/n.md", "file.md/x/n.md"),
+            "NotADirectory"
+        );
+        assert_eq!(move_kind(&root, "file.md/n.md", "b/n.md"), "NotADirectory");
+        let limit = usize::try_from(MAX_FILE_SIZE).unwrap();
+        fs::write(root.join("a/big.md"), "a".repeat(limit + 1)).unwrap();
+        assert_eq!(move_kind(&root, "a/big.md", "b/big.md"), "TooLarge");
+        assert!(!root.join("b").exists());
+    }
+
+    #[test]
+    fn creating_folders_tolerates_ones_that_appeared() {
+        let (_dir, root) = workspace();
+        fs::create_dir(root.join("there")).unwrap();
+        let missing = [root.join("there"), root.join("there/new")];
+        let created = create_folders(&missing, "there/new/n.md").unwrap();
+        assert_eq!(created, [root.join("there/new")]);
+        put(&root, "file", "x");
+        let blocked = [root.join("ok"), root.join("file"), root.join("file/x")];
+        let err = create_folders(&blocked, "file/x/n.md").unwrap_err();
+        assert_eq!(err.kind(), "Io");
+        // What it created before the failure is removed again.
+        assert!(!root.join("ok").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn moving_into_a_read_only_folder_is_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, root) = workspace();
+        put(&root, "a/n.md", "x");
+        fs::create_dir(root.join("ro")).unwrap();
+        if crate::test_support::skip_if_privileged("moving_into_a_read_only_folder") {
+            return;
+        }
+        fs::set_permissions(root.join("ro"), fs::Permissions::from_mode(0o500)).unwrap();
+        let into = move_file(&root, "a/n.md", "ro/n.md");
+        let below = move_file(&root, "a/n.md", "ro/new/n.md");
+        fs::set_permissions(root.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(into.unwrap_err().kind(), "PermissionDenied");
+        assert_eq!(below.unwrap_err().kind(), "PermissionDenied");
+        assert_eq!(listed(&root), ["a/n.md"]);
+        assert!(!root.join("ro/new").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_checks_the_new_name_through_the_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, root) = workspace();
+        put(&root, "a/n.md", "x");
+        fs::create_dir(root.join("b")).unwrap();
+        if crate::test_support::skip_if_privileged("move_checks_the_new_name") {
+            return;
+        }
+        // Listable but not searchable: entries cannot be checked.
+        fs::set_permissions(root.join("b"), fs::Permissions::from_mode(0o600)).unwrap();
+        let result = move_file(&root, "a/n.md", "b/n.md");
+        let deeper = move_file(&root, "a/n.md", "b/c/n.md");
+        fs::set_permissions(root.join("b"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result.unwrap_err().kind(), "PermissionDenied");
+        assert_eq!(deeper.unwrap_err().kind(), "PermissionDenied");
+        assert_eq!(listed(&root), ["a/n.md"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_never_goes_through_folder_links_or_moves_note_links() {
+        use std::os::unix::fs::symlink;
+        let (_dir, root) = workspace();
+        let (_outside_dir, outside) = workspace();
+        put(&root, "a/n.md", "x");
+        put(&root, "real/r.md", "r");
+        put(&root, "a/target.md", "t");
+        symlink(root.join("real"), root.join("alias")).unwrap();
+        symlink(&outside, root.join("out")).unwrap();
+        symlink("target.md", root.join("a/link.md")).unwrap();
+        let err = move_file(&root, "a/n.md", "alias/n.md").unwrap_err();
+        assert_eq!(err.kind(), "InvalidPath");
+        assert_eq!(
+            err.to_string(),
+            "alias/n.md is inside a linked folder, which the app does not follow"
+        );
+        assert_eq!(move_kind(&root, "a/n.md", "alias/sub/n.md"), "InvalidPath");
+        assert_eq!(move_kind(&root, "a/n.md", "out/n.md"), "InvalidPath");
+        assert_eq!(move_kind(&root, "a/n.md", "out/new/n.md"), "InvalidPath");
+        assert_eq!(move_kind(&root, "alias/r.md", "b/r.md"), "InvalidPath");
+        // A relative note link would point elsewhere from another folder.
+        let err = move_file(&root, "a/link.md", "b/link.md").unwrap_err();
+        assert_eq!(err.kind(), "InvalidPath");
+        assert_eq!(
+            err.to_string(),
+            "a/link.md is a link; links can only be renamed within their folder"
+        );
+        // Within its folder it is renamed like `rename_file` does.
+        move_file(&root, "a/link.md", "a/renamed.md").unwrap();
+        assert!(
+            fs::symlink_metadata(root.join("a/renamed.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+        assert!(!root.join("real/n.md").exists());
+        assert!(!root.join("b").exists());
+        assert_eq!(read(&root, "a/n.md").unwrap(), "x");
     }
 
     // Delete.

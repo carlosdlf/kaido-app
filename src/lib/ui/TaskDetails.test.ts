@@ -249,6 +249,7 @@ describe("Task context menu", () => {
     expect(menu.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Edit F2",
       "Create note from task",
+      "Move to project…",
       "Copy text",
       "Delete Del",
     ]);

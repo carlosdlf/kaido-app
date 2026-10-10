@@ -43,6 +43,8 @@ describe("TauriStorage", () => {
     ["readFile", ["a.md"], "read_file", { path: "a.md" }, read],
     ["writeFile", ["a.md", "x"], "write_file", { path: "a.md", contents: "x" }, written],
     ["renameFile", ["a.md", "b.md"], "rename_file", { from: "a.md", to: "b.md" }, written],
+    ["moveFile", ["a.md", "b/a.md"], "move_file", { from: "a.md", to: "b/a.md" }, written],
+    ["renameFolder", ["a", "b"], "rename_folder", { from: "a", to: "b" }, { entries: [entry] }],
     ["readSettings", [], "read_settings", undefined, "{}"],
     ["readSettings", [], "read_settings", undefined, null],
   ] as const)("%s calls %s", async (method, args, command, commandArgs, response) => {
@@ -141,6 +143,21 @@ describe("TauriStorage", () => {
     invoke.mockResolvedValue(null);
     await expect(storage.deleteFile("a.md", "ab12")).resolves.toBeUndefined();
     expect(invoke).toHaveBeenCalledWith("delete_file", { path: "a.md", expectedHash: "ab12" });
+  });
+
+  it("deletes folders", async () => {
+    invoke.mockResolvedValue(null);
+    await expect(storage.deleteFolder("a")).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("delete_folder", { path: "a" });
+  });
+
+  it("rejects unexpected move responses", async () => {
+    invoke.mockResolvedValue({ path: "b.md" });
+    await expect(storage.moveFile("a.md", "b/a.md")).rejects.toMatchObject({ kind: "Io" });
+    invoke.mockResolvedValue({ entries: [{ path: "b/a.md" }] });
+    await expect(storage.renameFolder("a", "b")).rejects.toMatchObject({ kind: "Io" });
+    invoke.mockResolvedValue({ deleted: true });
+    await expect(storage.deleteFolder("a")).rejects.toMatchObject({ kind: "Io" });
   });
 
   it("rejects unexpected rename and delete responses", async () => {

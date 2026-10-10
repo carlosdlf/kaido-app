@@ -2,7 +2,14 @@
 
 import { fileStem, noteTitle } from "./markdown";
 import { openTaskCount, parseTaskDocument, type TaskDocument } from "./taskDocument";
-import { INBOX, isTaskListPath, type Project, type Workspace } from "./workspace";
+import {
+  findProjectByKey,
+  INBOX,
+  isTaskListPath,
+  projectKey,
+  type Project,
+  type Workspace,
+} from "./workspace";
 
 /** Sidebar entry that groups the task lists of every project. */
 export const ALL_TASKS = "all-tasks";
@@ -52,6 +59,20 @@ export function sidebarEntries(workspace: Workspace, summaries: Summaries): Side
   }));
 }
 
+/** An archived project in the sidebar. */
+export interface ArchivedEntry {
+  name: string;
+  /** Its key and folder, `_archive/<name>`. */
+  key: string;
+}
+
+export function archivedEntries(workspace: Workspace): ArchivedEntry[] {
+  return workspace.archived.map((project) => ({
+    name: project.name,
+    key: projectKey(project.name, true),
+  }));
+}
+
 /** Sum of open tasks, or `null` while any count is still unknown. */
 export function totalOpen(entries: readonly SidebarEntry[]): number | null {
   let total = 0;
@@ -97,7 +118,7 @@ export function listItems(
     };
     return [all, ...taskListItems(workspace, summaries)];
   }
-  const project = workspace.projects.find((candidate) => candidate.name === selection);
+  const project = findProjectByKey(workspace, selection);
   if (!project) return [];
   return [
     ...tasksItem(project, "tasks.md", summaries),
@@ -130,7 +151,7 @@ export function listSummary(workspace: Workspace, selection: string, summaries: 
     const open = totalOpen(sidebarEntries(workspace, summaries));
     return `${open ?? "…"} open · ${lists} ${lists === 1 ? "list" : "lists"}`;
   }
-  const project = workspace.projects.find((candidate) => candidate.name === selection);
+  const project = findProjectByKey(workspace, selection);
   if (!project) return "";
   return `${plural(project.notes.length, "note")} · ${countLabel(openCount(project, summaries), "task")}`;
 }
@@ -253,6 +274,15 @@ export class SummaryStore {
 
   set(path: string, summary: FileSummary): void {
     this.#map.set(path, summary);
+  }
+
+  /** Moves a summary to another path; returns whether there was one. */
+  rename(from: string, to: string): boolean {
+    const summary = this.#map.get(from);
+    if (!summary || from === to) return false;
+    this.#map.delete(from);
+    this.#map.set(to, summary);
+    return true;
   }
 
   /** Removes every path for which `keep` returns false; returns whether anything was removed. */

@@ -19,6 +19,7 @@ import type {
   ChangeListener,
   CloseHandler,
   FileContents,
+  FolderMove,
   GitVersion,
   OpenedWorkspace,
   ScaffoldResult,
@@ -43,6 +44,7 @@ const WrittenFileSchema = v.object({
   modified: v.number(),
   hash: v.string(),
 });
+const FolderMoveSchema = v.object({ entries: v.array(FileEntrySchema) });
 const ChangeEventSchema = v.object({
   paths: v.array(v.string()),
   entries: v.array(FileEntrySchema),
@@ -160,6 +162,18 @@ export class TauriStorage implements Storage {
 
   async deleteFile(path: string, expectedHash: string): Promise<void> {
     await call(NoResult, "delete_file", { path, expectedHash });
+  }
+
+  moveFile(from: string, to: string): Promise<WrittenFile> {
+    return call(WrittenFileSchema, "move_file", { from, to });
+  }
+
+  renameFolder(from: string, to: string): Promise<FolderMove> {
+    return call(FolderMoveSchema, "rename_folder", { from, to });
+  }
+
+  async deleteFolder(path: string): Promise<void> {
+    await call(NoResult, "delete_folder", { path });
   }
 
   readSettings(): Promise<string | null> {

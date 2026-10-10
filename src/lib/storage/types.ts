@@ -75,6 +75,11 @@ export interface WrittenFile extends FileEntry {
   hash: string;
 }
 
+/** What a folder move did: the Markdown files it moved, at their new paths. */
+export interface FolderMove {
+  entries: FileEntry[];
+}
+
 export interface Storage {
   /** Asks the user for a folder. Resolves to its absolute path, or `null` if cancelled. */
   pickWorkspaceFolder(): Promise<string | null>;
@@ -91,6 +96,25 @@ export interface Storage {
    * to another folder is `InvalidPath`. A case-only rename is allowed.
    */
   renameFile(from: string, to: string): Promise<WrittenFile>;
+  /**
+   * Moves a note or task list to any folder of the workspace, creating
+   * missing folders, and returns the metadata and hash of the file at `to`.
+   * Never replaces an existing file (`Conflict`); a case-only rename is
+   * allowed.
+   */
+  moveFile(from: string, to: string): Promise<WrittenFile>;
+  /**
+   * Moves a whole folder (a project, or one in `_archive/`) to `to`,
+   * creating the parent of `to` when missing. `Conflict` if `to` exists;
+   * `InvalidPath` for the workspace root, `inbox`, `_archive` itself, dot
+   * folders or a `to` inside `from`.
+   */
+  renameFolder(from: string, to: string): Promise<FolderMove>;
+  /**
+   * Moves a project folder to the system trash, with the same refusals as
+   * `renameFolder` and the same trash rules as `deleteFile`.
+   */
+  deleteFolder(path: string): Promise<void>;
   /**
    * Deletes a note, moving it to the system trash where there is one. The
    * file must still have `expectedHash`, else `Conflict`.

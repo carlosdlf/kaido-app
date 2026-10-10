@@ -5,11 +5,12 @@
 //! Each repository has two async locks (see [`OpLock`]); waiting commands do
 //! not hold a thread, and the UI keeps working meanwhile.
 //! - `git` serializes `git_commit` and `git_sync`.
-//! - `tree` protects the working tree: `write_file`, `rename_file` and
-//!   `delete_file` hold it shared, and a sync holds it exclusively only while
-//!   it rebases (and resolves conflicts). File writes never wait for `git
-//!   add` or `git commit`: the commit is limited to a pathspec and tolerates
-//!   atomic writes landing meanwhile; the next commit picks them up.
+//! - `tree` protects the working tree: `write_file`, `rename_file`,
+//!   `delete_file`, `move_file`, `rename_folder` and `delete_folder` hold it
+//!   shared, and a sync holds it exclusively only while it rebases (and
+//!   resolves conflicts). File writes never wait for `git add` or `git
+//!   commit`: the commit is limited to a pathspec and tolerates atomic
+//!   writes landing meanwhile; the next commit picks them up.
 //!
 //! There is one pair per repository, not per open: the key is the
 //! repository's git common folder (shared by its worktrees), or the

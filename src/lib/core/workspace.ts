@@ -164,6 +164,38 @@ export function findProject(workspace: Workspace, name: string): Project | undef
   return workspace.projects.find((project) => project.name === name);
 }
 
+/**
+ * The key of a project: its folder, `<name>` for an active project and
+ * `_archive/<name>` for an archived one. Selections and folder moves use it.
+ */
+export function projectKey(name: string, archived: boolean): string {
+  return archived ? `${ARCHIVE_DIR}/${name}` : name;
+}
+
+/** Whether a project key names an archived project. */
+export function isArchivedKey(key: string): boolean {
+  return key.startsWith(`${ARCHIVE_DIR}/`);
+}
+
+/** The project name of a key, without `_archive/`. */
+export function projectNameOf(key: string): string {
+  return isArchivedKey(key) ? key.slice(ARCHIVE_DIR.length + 1) : key;
+}
+
+/** The active or archived project with this key. */
+export function findProjectByKey(workspace: Workspace, key: string): Project | undefined {
+  if (!isArchivedKey(key)) return findProject(workspace, key);
+  const name = projectNameOf(key);
+  return workspace.archived.find((project) => project.name === name);
+}
+
+/** The key of the project a shown path belongs to (`inbox` for loose root files). */
+export function projectKeyOf(path: string): string {
+  const role = classifyPath(path, ACCEPT_ALL);
+  if (!role) return INBOX;
+  return projectKey(role.project, role.archived);
+}
+
 /** Payload of a filesystem change notification. */
 export interface ChangeEvent {
   /** Changed, created or removed paths. */

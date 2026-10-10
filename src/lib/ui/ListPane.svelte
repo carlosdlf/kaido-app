@@ -31,6 +31,8 @@
     onrename: (id: string, name: string) => Promise<RenameOutcome>;
     ondelete: (id: string) => void;
     oncopypath: (id: string) => void;
+    /** Asks where to move a note. */
+    onmove?: (id: string) => void;
     /** `Ctrl+Z` / `Cmd+Z` in the list: undoes the most recent delete, if it can still be undone. */
     onundo?: () => void;
     /** Each new value moves focus to the selected row. */
@@ -50,15 +52,17 @@
     onrename,
     ondelete,
     oncopypath,
+    onmove,
     onundo,
     focusRequest = 0,
   }: Props = $props();
 
-  const MENU_ITEMS: readonly MenuItem[] = [
+  const menuItems: readonly MenuItem[] = $derived([
     { id: "rename", label: "Rename", shortcut: { aria: "F2", hint: "F2" } },
+    ...(onmove ? [{ id: "move", label: "Move to…" }] : []),
     { id: "copy-path", label: "Copy path" },
     { id: "delete", label: "Delete", shortcut: { aria: "Delete", hint: "Del" } },
-  ];
+  ]);
 
   /** Rows rendered above and below the visible ones. */
   const OVERSCAN = 8;
@@ -156,6 +160,12 @@
     if (action === "rename") {
       menu = null;
       startRename(target);
+      return;
+    }
+    if (action === "move" && onmove) {
+      // The picker takes focus and gives it back to the list.
+      menu = null;
+      onmove(target);
       return;
     }
     closeMenu(true);
@@ -449,7 +459,7 @@
       label="Note actions"
       x={menu.x}
       y={menu.y}
-      items={MENU_ITEMS}
+      items={menuItems}
       onselect={chooseMenuItem}
       onclose={closeMenu}
     />

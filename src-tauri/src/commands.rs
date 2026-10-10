@@ -15,6 +15,7 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::clone::{self, CloneControl, GitVersion};
 use crate::error::{AppError, AppResult};
+use crate::folder_ops::{self, MovedFolder};
 use crate::fs_ops::{self, FileContents, FileEntry, WriteCondition, WrittenFile};
 use crate::git::GitOptions;
 use crate::settings::SettingsDir;
@@ -37,6 +38,9 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         write_file,
         rename_file,
         delete_file,
+        move_file,
+        rename_folder,
+        delete_folder,
         read_settings,
         write_settings,
         git_status,
@@ -240,6 +244,38 @@ pub async fn delete_file(
         fs_ops::delete_file(root, &path, &expected_hash)
     })
     .await
+}
+
+/// Moves a note to another path, possibly in another folder; see
+/// [`fs_ops::move_file`].
+#[tauri::command]
+pub async fn move_file(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+) -> AppResult<WrittenFile> {
+    file_op(&state, move |root| fs_ops::move_file(root, &from, &to)).await
+}
+
+/// Renames, archives or unarchives a project folder; see
+/// [`folder_ops::rename_folder`].
+#[tauri::command]
+pub async fn rename_folder(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+) -> AppResult<MovedFolder> {
+    file_op(&state, move |root| {
+        folder_ops::rename_folder(root, &from, &to)
+    })
+    .await
+}
+
+/// Moves a project folder to the system trash; see
+/// [`folder_ops::delete_folder`].
+#[tauri::command]
+pub async fn delete_folder(state: State<'_, AppState>, path: String) -> AppResult<()> {
+    file_op(&state, move |root| folder_ops::delete_folder(root, &path)).await
 }
 
 #[tauri::command]
@@ -721,6 +757,9 @@ mod tests {
         for cmd in [
             "rename_file",
             "delete_file",
+            "move_file",
+            "rename_folder",
+            "delete_folder",
             "git_status",
             "git_commit",
             "git_sync",
@@ -930,6 +969,100 @@ mod tests {
         assert_eq!(error_kind(rename("p/b.md", "b.md")), "InvalidPath");
         assert_eq!(error_kind(rename("p/missing.md", "p/c.md")), "NotFound");
         assert!(dir.path().join("p/b.md").exists());
+    }
+
+    #[test]
+    fn move_file_through_ipc() {
+        let (_app, webview, _settings) = app();
+        let dir = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({ "from": "a/n.md", "to": "b/n.md" });
+        assert_eq!(
+            error_kind(invoke(&webview, "move_file", args)),
+            "NoWorkspace"
+        );
+        invoke(
+            &webview,
+            "open_workspace",
+            serde_json::json!({ "path": dir.path() }),
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("a/n.md"), "body").unwrap();
+        std::fs::create_dir(dir.path().join("c")).unwrap();
+        std::fs::write(dir.path().join("c/n.md"), "x").unwrap();
+        let move_file = |from: &str, to: &str| {
+            invoke(
+                &webview,
+                "move_file",
+                serde_json::json!({ "from": from, "to": to }),
+            )
+        };
+        let moved = move_file("a/n.md", "b/sub/n.md").unwrap();
+        assert_eq!(moved["path"], "b/sub/n.md");
+        assert_eq!(moved["size"], 4);
+        assert!(moved["modified"].as_u64().unwrap() > 0);
+        assert_eq!(moved["hash"], fs_ops::content_hash(b"body"));
+        assert_eq!(moved.as_object().unwrap().len(), 4);
+        assert_eq!(error_kind(move_file("b/sub/n.md", "c/n.md")), "Conflict");
+        assert_eq!(
+            error_kind(move_file("b/sub/n.md", ".git/n.md")),
+            "InvalidPath"
+        );
+        assert_eq!(error_kind(move_file("a/n.md", "c/m.md")), "NotFound");
+        assert!(dir.path().join("b/sub/n.md").exists());
+    }
+
+    #[test]
+    fn folder_commands_through_ipc() {
+        // Successful deletes use the OS trash and are tested in `folder_ops`
+        // with the trash replaced.
+        let (_app, webview, _settings) = app();
+        let dir = tempfile::tempdir().unwrap();
+        let rename = |from: &str, to: &str| {
+            invoke(
+                &webview,
+                "rename_folder",
+                serde_json::json!({ "from": from, "to": to }),
+            )
+        };
+        let delete = |path: &str| {
+            invoke(
+                &webview,
+                "delete_folder",
+                serde_json::json!({ "path": path }),
+            )
+        };
+        assert_eq!(error_kind(rename("a", "b")), "NoWorkspace");
+        assert_eq!(error_kind(delete("a")), "NoWorkspace");
+        invoke(
+            &webview,
+            "open_workspace",
+            serde_json::json!({ "path": dir.path() }),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("a/sub")).unwrap();
+        std::fs::write(dir.path().join("a/tasks.md"), "- [ ] t\n").unwrap();
+        std::fs::write(dir.path().join("a/sub/n.md"), "x").unwrap();
+        std::fs::create_dir(dir.path().join("inbox")).unwrap();
+        std::fs::create_dir(dir.path().join("taken")).unwrap();
+
+        let moved = rename("a", "_archive/a").unwrap();
+        let entries = moved["entries"].as_array().unwrap();
+        assert_eq!(moved.as_object().unwrap().len(), 1);
+        let paths: Vec<_> = entries.iter().map(|e| e["path"].clone()).collect();
+        assert_eq!(paths, ["_archive/a/sub/n.md", "_archive/a/tasks.md"]);
+        assert_eq!(entries[1]["size"], 8);
+        assert!(entries[1]["modified"].as_u64().unwrap() > 0);
+        assert_eq!(entries[1].as_object().unwrap().len(), 3);
+        rename("_archive/a", "a").unwrap();
+
+        assert_eq!(error_kind(rename("a", "taken")), "Conflict");
+        assert_eq!(error_kind(rename("inbox", "b")), "InvalidPath");
+        assert_eq!(error_kind(rename("missing", "b")), "NotFound");
+        assert_eq!(error_kind(delete("inbox")), "InvalidPath");
+        assert_eq!(error_kind(delete("_archive")), "InvalidPath");
+        assert_eq!(error_kind(delete("missing")), "NotFound");
+        assert!(dir.path().join("a/sub/n.md").exists());
     }
 
     #[test]
@@ -1166,6 +1299,36 @@ mod tests {
         // The hash does not match, so the file stays; what matters is that
         // the command only ran once the lock was free.
         assert_eq!(error_kind(deleter.join().unwrap()), "Conflict");
+
+        // So do moves and folder operations.
+        std::fs::create_dir(dir.path().join("p")).unwrap();
+        for (cmd, args) in [
+            (
+                "move_file",
+                serde_json::json!({ "from": "renamed.md", "to": "q/moved.md" }),
+            ),
+            (
+                "rename_folder",
+                serde_json::json!({ "from": "p", "to": "_archive/p" }),
+            ),
+            ("delete_folder", serde_json::json!({ "path": "inbox" })),
+        ] {
+            let guard = lock.tree.try_write().unwrap();
+            finished.store(false, Ordering::SeqCst);
+            let worker = spawn(cmd, args);
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(!finished.load(Ordering::SeqCst), "{cmd}");
+            drop(guard);
+            assert!(wait_for(&finished), "{cmd}");
+            let result = worker.join().unwrap();
+            if cmd == "delete_folder" {
+                assert_eq!(error_kind(result), "InvalidPath");
+            } else {
+                result.unwrap();
+            }
+        }
+        assert!(dir.path().join("q/moved.md").exists());
+        assert!(dir.path().join("_archive/p").is_dir());
     }
 
     #[test]

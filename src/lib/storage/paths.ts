@@ -1,4 +1,4 @@
-import { isStoragePath, WORKSPACE_CONFIG_PATH } from "$lib/core/workspace";
+import { ARCHIVE_DIR, INBOX, isStoragePath, WORKSPACE_CONFIG_PATH } from "$lib/core/workspace";
 import { StorageError } from "./errors";
 
 /** Largest file storage reads or writes: 8 MiB. */
@@ -53,4 +53,51 @@ export function checkRenamePaths(from: string, to: string): void {
   if (folderOf(from) !== folderOf(to)) {
     throw new StorageError("InvalidPath", "A note can only be renamed within its folder.");
   }
+}
+
+/** Checks the paths of a move: both notes or task lists, anywhere in the workspace. */
+export function checkMovePaths(from: string, to: string): void {
+  checkNotePath(from);
+  checkNotePath(to);
+}
+
+/**
+ * Checks a project folder given to `renameFolder` or `deleteFolder`: `<name>`
+ * or `_archive/<name>`, never the workspace root, the inbox (in any case),
+ * `_archive` itself, hidden folders, `node_modules` or deeper folders.
+ */
+export function checkFolderPath(path: string): void {
+  if (path === "" || path.includes("\0") || path.includes("\\")) {
+    throw new StorageError(
+      "InvalidPath",
+      "The folder path is empty or contains invalid characters.",
+    );
+  }
+  if (path.startsWith("/") || /^[A-Za-z]:\//.test(path)) {
+    throw new StorageError("InvalidPath", "The path must be relative to the workspace.");
+  }
+  const segments = path.split("/");
+  const name = segments[0] === ARCHIVE_DIR && segments.length === 2 ? segments[1] : segments[0];
+  if (segments.length > (segments[0] === ARCHIVE_DIR ? 2 : 1) || name === undefined) {
+    throw new StorageError("InvalidPath", "Only project folders can be moved or deleted.");
+  }
+  if (name === "" || name === "." || name === ".." || name.startsWith(".")) {
+    throw new StorageError("InvalidPath", "Hidden folders cannot be moved or deleted.");
+  }
+  if (name === ARCHIVE_DIR || name === "node_modules") {
+    throw new StorageError("InvalidPath", `${name} cannot be moved or deleted.`);
+  }
+  if (name.toLowerCase() === INBOX) {
+    throw new StorageError("InvalidPath", "the inbox cannot be renamed, archived or deleted");
+  }
+}
+
+/**
+ * Checks the folders of a folder move: both project folders. Moving a
+ * folder onto itself is a `Conflict`, as in the desktop backend.
+ */
+export function checkFolderMove(from: string, to: string): void {
+  checkFolderPath(from);
+  checkFolderPath(to);
+  if (to === from) throw new StorageError("Conflict", `${to} already exists.`);
 }

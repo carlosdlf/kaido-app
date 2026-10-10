@@ -35,6 +35,7 @@
   /* Status */
   --color-success: #6ccb8a;
   --color-danger: #f2837a;
+  --color-on-danger: #0d0e10;
   /* Paused, needs attention but nothing failed: a yellow distinct from the accent. */
   --color-warning: #e8c66a;
   --color-conflict-bg: #1f1a12;
@@ -114,6 +115,9 @@
   /* Settings dialog and start screen. */
   --dialog-width: 560px;
   --dialog-max-height: 80vh;
+  /* Move pickers and confirmations. */
+  --picker-width: 440px;
+  --picker-max-height: 50vh;
   --start-width: 520px;
   /* Quick capture window: one row, and a project picker row. */
   --capture-height: 52px;

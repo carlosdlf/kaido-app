@@ -2,6 +2,7 @@ mod capture;
 mod clone;
 mod commands;
 mod error;
+mod folder_ops;
 mod fs_ops;
 mod git;
 mod paths;
