@@ -171,6 +171,83 @@ describe("Sidebar project actions", () => {
     await waitFor(() => expect(nav().getByRole("button", { name: /inbox/ })).toHaveFocus());
   });
 
+  it("keeps focus in the delete dialog opened from the menu, by mouse and Shift+F10", async () => {
+    const { user, storage } = await ready();
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+    fireEvent.contextMenu(projectRow("api"));
+    // The row behind the dialog never takes focus while it is open.
+    const rowFocus = vi.fn();
+    projectRow("api").addEventListener("focus", rowFocus);
+    await user.click(screen.getByRole("menuitem", { name: /Delete/ }));
+    await settle();
+    expect(rowFocus).not.toHaveBeenCalled();
+    let dialog = within(screen.getByRole("alertdialog", { name: "Delete project" }));
+    expect(dialog.getByRole("button", { name: "Cancel" })).toHaveFocus();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(projectRow("api")).toHaveFocus());
+
+    await user.keyboard("{Shift>}{F10}{/Shift}{End}{Enter}");
+    await settle();
+    dialog = within(screen.getByRole("alertdialog", { name: "Delete project" }));
+    expect(dialog.getByRole("button", { name: "Cancel" })).toHaveFocus();
+    // Enter on the focused Cancel button keeps the project.
+    await user.keyboard("{Enter}");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(projectRow("api")).toHaveFocus());
+    expect(exists(storage, "api/spec.md")).toBe(true);
+  });
+
+  it("never lets keys act behind the delete dialog", async () => {
+    const { user, storage } = await ready();
+    projectRow("api").focus();
+    await user.keyboard("{Delete}");
+    const dialog = within(screen.getByRole("alertdialog", { name: "Delete project" }));
+    const cancel = dialog.getByRole("button", { name: "Cancel" });
+    // Focus moved behind the dialog comes back.
+    projectRow("web").focus();
+    expect(cancel).toHaveFocus();
+    // Keys pressed while nothing inside has focus stay with the dialog.
+    cancel.blur();
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    expect(cancel).toHaveFocus();
+    cancel.blur();
+    await user.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(dialog.getByRole("button", { name: "Delete" })).toHaveFocus();
+    cancel.blur();
+    await user.keyboard("{Tab}");
+    expect(cancel).toHaveFocus();
+    cancel.blur();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(projectRow("api")).toHaveFocus());
+    expect(exists(storage, "api/spec.md")).toBe(true);
+  });
+
+  it("focuses the project where it went after archiving or unarchiving from the menu", async () => {
+    const { user, app } = await ready();
+    fireEvent.contextMenu(projectRow("web"));
+    await user.click(screen.getByRole("menuitem", { name: "Archive" }));
+    await app.settled();
+    // The Archived group is collapsed, so its heading takes focus.
+    await waitFor(() => expect(nav().getByRole("button", { name: "archived (2)" })).toHaveFocus());
+    await user.click(nav().getByRole("button", { name: "archived (2)" }));
+    projectRow("web").focus();
+    await user.keyboard("{Shift>}{F10}{/Shift}");
+    await user.click(screen.getByRole("menuitem", { name: "Unarchive" }));
+    await app.settled();
+    await waitFor(() => expect(projectRow("web")).toHaveFocus());
+    expect(document.activeElement).not.toBe(document.body);
+
+    // Shown archived projects take focus themselves.
+    fireEvent.contextMenu(projectRow("api"));
+    await user.click(screen.getByRole("menuitem", { name: "Archive" }));
+    await app.settled();
+    await waitFor(() => expect(projectRow("api")).toHaveFocus());
+    expect(projectRow("api").dataset["navId"]).toBe("_archive/api");
+  });
+
   it("cancels the delete with a click outside", async () => {
     const { user, storage } = await ready();
     projectRow("web").focus();
@@ -274,7 +351,7 @@ describe("Moving notes and tasks", () => {
     await vi.waitFor(async () =>
       expect(await fileText(storage, "web/tasks.md")).toBe("- [ ] w\n- [ ] ship\n  - [ ] sub\n"),
     );
-    expect(await fileText(storage, "api/tasks.md")).toBe("");
+    await vi.waitFor(async () => expect(await fileText(storage, "api/tasks.md")).toBe(""));
     expect(screen.getAllByText("Moved task to web").length).toBeGreaterThan(0);
     // Focus goes back to the task list.
     await waitFor(() =>

@@ -720,6 +720,23 @@ export function deleteTask(doc: TaskDocument, ref: TaskRef): TaskDeletion | null
   };
 }
 
+/**
+ * Deletes a task block that `appendLines` added, like `deleteTask`. When the
+ * block ended a file that had no final line break, the line before it loses
+ * its break again, so the text is as it was before the block was appended.
+ */
+export function deleteAppendedTask(doc: TaskDocument, ref: TaskRef): TaskDeletion | null {
+  const deletion = deleteTask(doc, ref);
+  if (!deletion || deletion.removed.next !== null) return deletion;
+  if (deletion.removed.lines.at(-1)?.eol !== "") return deletion;
+  const lines = splitLines(deletion.text);
+  const last = lines.at(-1);
+  if (!last || last.eol === "") return deletion;
+  lines[lines.length - 1] = { text: last.text, eol: "" };
+  const text = joinLines(lines);
+  return { ...deletion, text, removed: { ...deletion.removed, textAfter: text } };
+}
+
 function focusAfterRemoval(text: string, index: number): number | null {
   const next = parseTaskDocument(text);
   let previous: number | null = null;

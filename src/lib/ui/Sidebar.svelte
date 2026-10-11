@@ -20,7 +20,7 @@
   import { syncAnnouncement, type SyncIcon, type SyncView } from "$lib/core/syncStatus";
   import { nextListIndex } from "$lib/core/listNavigation";
   import { ALL_TASKS, type ArchivedEntry, type SidebarEntry } from "$lib/core/views";
-  import { INBOX, isArchivedKey, projectNameOf } from "$lib/core/workspace";
+  import { INBOX, isArchivedKey, projectKey, projectNameOf } from "$lib/core/workspace";
   import type { ProjectOutcome, RenameOutcome } from "./appState.svelte";
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
 
@@ -56,8 +56,10 @@
     archived?: ArchivedEntry[];
     /** Renames a project (by key) to the typed name. */
     onrenameproject?: (key: string, name: string) => Promise<RenameOutcome>;
-    onarchive?: (name: string) => void;
-    onunarchive?: (name: string) => void;
+    /** Archives a project; resolves when done, so focus can follow the row. */
+    onarchive?: (name: string) => Promise<unknown>;
+    /** Unarchives a project; resolves when done, so focus can follow the row. */
+    onunarchive?: (name: string) => Promise<unknown>;
     /** Asks to delete a project (by key); the caller confirms. */
     ondeleteproject?: (key: string) => void;
     oncopypath?: (key: string) => void;
@@ -217,12 +219,40 @@
     return id !== INBOX && id !== ALL_TASKS && order.includes(id);
   }
 
+  function navRow(id: string): HTMLButtonElement | null {
+    return nav?.querySelector<HTMLButtonElement>(`[data-nav-id="${CSS.escape(id)}"]`) ?? null;
+  }
+
+  function selectedRow(): HTMLButtonElement | null {
+    return nav?.querySelector<HTMLButtonElement>("[data-nav-id][aria-current='page']") ?? null;
+  }
+
   /** Focuses the row of `id`, or the selected row when it is gone. */
   async function focusNav(id: string) {
     await tick();
+    (navRow(id) ?? selectedRow())?.focus();
+  }
+
+  let archivedToggle: HTMLButtonElement | undefined = $state();
+
+  /**
+   * Runs an archive or unarchive, then focuses the project where it is now
+   * (the collapsed Archived group when it went there), or where it was if
+   * it did not move.
+   */
+  async function moveAndFocus(
+    action: ((name: string) => Promise<unknown>) | undefined,
+    key: string,
+    next: string,
+  ) {
+    await action?.(projectNameOf(key));
+    await tick();
+    const moved = navRow(key) === null;
     const row =
-      nav?.querySelector<HTMLButtonElement>(`[data-nav-id="${CSS.escape(id)}"]`) ??
-      nav?.querySelector<HTMLButtonElement>("[data-nav-id][aria-current='page']");
+      navRow(next) ??
+      navRow(key) ??
+      (moved && isArchivedKey(next) ? archivedToggle : null) ??
+      selectedRow();
     row?.focus();
   }
 
@@ -268,19 +298,17 @@
         startRename(key);
         return;
       case "archive":
-        void focusNav(key);
-        onarchive?.(key);
+        void moveAndFocus(onarchive, key, projectKey(projectNameOf(key), true));
         return;
       case "unarchive":
-        void focusNav(key);
-        onunarchive?.(projectNameOf(key));
+        void moveAndFocus(onunarchive, key, projectNameOf(key));
         return;
       case "copy-path":
         void focusNav(key);
         oncopypath?.(key);
         return;
       default:
-        void focusNav(key);
+        // The dialog takes focus and gives it back to the row when it closes.
         ondeleteproject?.(key);
     }
   }
@@ -543,6 +571,7 @@
         <button
           type="button"
           class="heading toggle"
+          bind:this={archivedToggle}
           aria-expanded={showArchived}
           aria-controls="archived-projects"
           onclick={() => (showArchived = !showArchived)}

@@ -10,7 +10,11 @@ import {
   movedNoteMessage,
   movedTaskMessage,
   noteExistsThereMessage,
+  linksNotUpdatedMessage,
   projectActionFailedMessage,
+  taskMoveFailedMessage,
+  taskNotMovedBackMessage,
+  unsavedOnSwitchMessage,
   projectExistsMessage,
   projectTrashedMessage,
   renamedProjectMessage,
@@ -461,7 +465,7 @@ describe("AppState.deleteProject", () => {
     const { storage, app } = await started();
     vi.spyOn(storage, "deleteFolder").mockRejectedValueOnce(new StorageError("Io", "no trash"));
     await app.deleteProject("api");
-    expect(messages(app)).toEqual([projectActionFailedMessage("api", "deleted", "no trash")]);
+    expect(messages(app)).toEqual(["Could not delete api: no trash"]);
     expect(findProject(app.workspace, "api")).toBeDefined();
     await app.deleteProject("inbox");
     expect(exists(storage, "inbox/tasks.md")).toBe(true);
@@ -647,5 +651,253 @@ describe("moves: edge cases", () => {
     await wait(app);
     await app.undoDelete(id);
     expect(messages(app).at(-1)).toMatch(/not restored|changed/);
+  });
+});
+
+describe("review fixes", () => {
+  const first = { line: 0, raw: "- [ ] read [spec](../api/spec.md)" };
+  const other = { line: 1, raw: "- [ ] other" };
+
+  it("keeps a task in its list when the target list cannot be saved", async () => {
+    const { storage, app } = await started();
+    storage.setReadOnly("web/tasks.md");
+    await expect(app.moveTaskToProject("inbox/tasks.md", first, "web")).resolves.toEqual({
+      kind: "failed",
+    });
+    expect(messages(app)).toEqual([taskMoveFailedMessage("web", "web/tasks.md is read-only.")]);
+    await wait(app);
+    expect(await read(storage, "inbox/tasks.md")).toBe(files["inbox/tasks.md"]);
+    expect(app.taskDocs.get("inbox/tasks.md")?.text).toBe(files["inbox/tasks.md"]);
+    expect(app.taskDocs.get("web/tasks.md")?.text).toBe("- [ ] w\n");
+    // Once writable, the retried save does not bring the task back there.
+    storage.setReadOnly("web/tasks.md", false);
+    await wait(app, 60_000);
+    expect(await read(storage, "web/tasks.md")).toBe("- [ ] w\n");
+    expect(await read(storage, "inbox/tasks.md")).toBe(files["inbox/tasks.md"]);
+  });
+
+  it("keeps a task in its new list when its old list cannot be saved on undo", async () => {
+    const { storage, app } = await started();
+    await app.moveTaskToProject("inbox/tasks.md", other, "web");
+    await wait(app);
+    storage.setReadOnly("inbox/tasks.md");
+    await app.undoDelete(lastToast(app));
+    expect(messages(app).at(-1)).toBe(taskNotMovedBackMessage("inbox/tasks.md is read-only."));
+    storage.setReadOnly("inbox/tasks.md", false);
+    await wait(app, 60_000);
+    expect(await read(storage, "web/tasks.md")).toBe("- [ ] w\n- [ ] other\n");
+    expect(await read(storage, "inbox/tasks.md")).toBe("- [ ] read [spec](../api/spec.md)\n");
+  });
+
+  it("does not add a final line break when undoing a move into a list without one", async () => {
+    const { storage, app } = await started({ "web/tasks.md": "- [ ] w" });
+    await app.moveTaskToProject("inbox/tasks.md", other, "web");
+    await wait(app);
+    expect(await read(storage, "web/tasks.md")).toBe("- [ ] w\n- [ ] other");
+    await app.undoDelete(lastToast(app));
+    await wait(app);
+    expect(await read(storage, "web/tasks.md")).toBe("- [ ] w");
+    expect(await read(storage, "inbox/tasks.md")).toBe(files["inbox/tasks.md"]);
+  });
+
+  it("undoes a task move after a link update changed the moved line", async () => {
+    const { storage, app } = await started();
+    await app.moveTaskToProject("inbox/tasks.md", first, "web");
+    const taskUndo = lastToast(app);
+    await app.moveNote("api/spec.md", "inbox");
+    await wait(app);
+    expect(await read(storage, "web/tasks.md")).toBe(
+      "- [ ] w\n- [ ] read [spec](../inbox/spec.md)\n",
+    );
+    await expect(app.undoDelete(taskUndo)).resolves.toBe("task");
+    await wait(app);
+    expect(messages(app)).not.toContain(TASK_CHANGED);
+    expect(await read(storage, "web/tasks.md")).toBe("- [ ] w\n");
+    // The changed line keeps the change and still reaches the note.
+    expect(await read(storage, "inbox/tasks.md")).toBe(
+      "- [ ] read [spec](../inbox/spec.md)\n- [ ] other\n",
+    );
+  });
+
+  it("keeps the project when the system trash is not available", async () => {
+    const { storage, app } = await started();
+    app.selectFolder("api");
+    storage.trashUnavailable = true;
+    await app.deleteProject("api");
+    expect(messages(app)).toEqual([
+      "Could not delete api: the system trash is not available here. Nothing was deleted.",
+    ]);
+    expect(exists(storage, "api/spec.md")).toBe(true);
+    expect(storage.trash).toEqual([]);
+    expect(findProject(app.workspace, "api")).toBeDefined();
+    expect(app.folder).toBe("api");
+  });
+
+  it("undoes a note move into the project its old folder became", async () => {
+    const { storage, app } = await started();
+    await app.moveNote("api/spec.md", "web");
+    const noteUndo = lastToast(app);
+    await app.renameProject("api", "core");
+    await wait(app);
+    await app.undoDelete(noteUndo);
+    await wait(app);
+    expect(exists(storage, "core/spec.md")).toBe(true);
+    expect(exists(storage, "api/spec.md")).toBe(false);
+    expect(findProject(app.workspace, "api")).toBeUndefined();
+  });
+
+  it("undoes a note move into its archived project, and restores deleted notes there", async () => {
+    const { storage, app } = await started();
+    await app.moveNote("api/spec.md", "web");
+    const noteUndo = lastToast(app);
+    await app.deleteNote("api/docs/deep.md");
+    const deleteUndo = lastToast(app);
+    await app.archiveProject("api");
+    await wait(app);
+    await app.undoDelete(noteUndo);
+    await app.undoDelete(deleteUndo);
+    await wait(app);
+    expect(exists(storage, "_archive/api/spec.md")).toBe(true);
+    expect(exists(storage, "_archive/api/docs/deep.md")).toBe(true);
+    expect(exists(storage, "api/spec.md")).toBe(false);
+    expect(findProject(app.workspace, "api")).toBeUndefined();
+  });
+
+  it("opens a captured note from its toast after its project moved", async () => {
+    const { app } = await started();
+    await app.capture("note", "Plan", "api");
+    const open = lastToast(app);
+    await app.renameProject("api", "core");
+    await wait(app);
+    await app.runToastAction(open);
+    expect(app.item).toBe("core/Plan.md");
+  });
+
+  it("does not map the old place of a moved note through a later file move", async () => {
+    const { storage, app } = await started();
+    await app.moveNote("inbox/idea.md", "web");
+    const noteUndo = lastToast(app);
+    // Another note takes the old place and moves away again.
+    storage.setExternal("inbox/idea.md", "# Another\n");
+    await app.settled();
+    await app.moveNote("inbox/idea.md", "api");
+    await wait(app);
+    await app.undoDelete(noteUndo);
+    await wait(app);
+    expect(await read(storage, "inbox/idea.md")).toBe("# Idea\n");
+    expect(await read(storage, "api/idea.md")).toBe("# Another\n");
+  });
+
+  it("updates links in task lists that were not read yet, and names those it cannot", async () => {
+    const storage = new MemoryStorage({
+      folders: {
+        [ROOT]: {
+          ...files,
+          "big/tasks.md": `- [ ] [s](../api/spec.md)\n${"a".repeat(1024 * 1024)}`,
+          "bad/tasks.md": "- [ ] [s](../api/spec.md)\n",
+        },
+      },
+      settings: JSON.stringify({ version: 1, workspace: ROOT }),
+    });
+    // Background reads never run, so no list is read before the move.
+    const app = new AppState(storage, { defer: () => undefined, schedule: (task) => task() });
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    const readFile = storage.readFile.bind(storage);
+    vi.spyOn(storage, "readFile").mockImplementation((path) =>
+      path === "bad/tasks.md"
+        ? Promise.reject(new StorageError("Io", "unreadable"))
+        : readFile(path),
+    );
+    await app.moveNote("api/spec.md", "web");
+    await app.flush();
+    expect((await readFile("inbox/tasks.md")).contents).toBe(
+      "- [ ] read [spec](../web/spec.md)\n- [ ] other\n",
+    );
+    expect((await readFile("_archive/old/tasks.md")).contents).toBe(
+      "- [ ] [s](../../web/spec.md)\n",
+    );
+    expect(messages(app)).toContain(linksNotUpdatedMessage(["bad/tasks.md", "big/tasks.md"]));
+  });
+
+  it("switches workspaces right after a folder move while a check is still running", async () => {
+    const { storage, app } = await started();
+    storage.addFolder("/other", { "inbox/x.md": "" });
+    app.selectFolder("api");
+    await open(app, "api/spec.md");
+    const readFile = storage.readFile.bind(storage);
+    // The check of the moved note after the watcher's report never finishes.
+    vi.spyOn(storage, "readFile").mockImplementation((path) =>
+      path === "core/spec.md" ? new Promise(() => undefined) : readFile(path),
+    );
+    await app.renameProject("api", "core");
+    await vi.advanceTimersByTimeAsync(0);
+    const opening = app.openWorkspace("/other");
+    await vi.advanceTimersByTimeAsync(20_000);
+    await opening;
+    expect(messages(app)).not.toContain(unsavedOnSwitchMessage(["core/spec.md"]));
+    expect(app.phase).toMatchObject({ kind: "ready", root: "/other" });
+  });
+
+  it("holds task edits, note reads and new notes inside a folder while it moves", async () => {
+    const { storage, app } = await started();
+    app.selectFolder("api");
+    await app.settled();
+    const renameFolder = storage.renameFolder.bind(storage);
+    let finish: () => void = () => undefined;
+    const waiting = new Promise<void>((resolve) => (finish = resolve));
+    // The folder moves on disk, but the answer comes late (e.g. after a lock).
+    vi.spyOn(storage, "renameFolder").mockImplementation(async (from, to) => {
+      const moved = await renameFolder(from, to);
+      await waiting;
+      return moved;
+    });
+    const renaming = app.renameProject("api", "core");
+    await vi.advanceTimersByTimeAsync(0);
+    app.toggleTask("web/tasks.md", { line: 0, raw: "- [ ] w" });
+    app.selectItem("api/tasks.md");
+    app.toggleTask("api/tasks.md", { line: 2, raw: "  - [ ] sub" });
+    app.selectItem("api/spec.md");
+    const creating = app.createNote();
+    await vi.advanceTimersByTimeAsync(2_000);
+    // Outside the folder nothing waits.
+    expect(await read(storage, "web/tasks.md")).toBe("- [x] w\n");
+    finish();
+    await renaming;
+    await creating;
+    await wait(app);
+    expect(exists(storage, "api/tasks.md")).toBe(false);
+    expect(
+      [...(storage.folders.get(ROOT)?.keys() ?? [])].filter((path) => path.startsWith("api/")),
+    ).toEqual([]);
+    expect(await read(storage, "core/tasks.md")).toContain("  - [x] sub");
+    expect(app.item).toMatch(/^core\//);
+    expect(findProject(app.workspace, "api")).toBeUndefined();
+    expect(conflictCopies(storage)).toEqual([]);
+  });
+
+  it("opens a note selected while its folder moves, at its new place", async () => {
+    const { storage, app } = await started();
+    const renameFolder = storage.renameFolder.bind(storage);
+    let finish: () => void = () => undefined;
+    const waiting = new Promise<void>((resolve) => (finish = resolve));
+    vi.spyOn(storage, "renameFolder").mockImplementation(async (from, to) => {
+      const moved = await renameFolder(from, to);
+      await waiting;
+      return moved;
+    });
+    app.selectFolder("api");
+    const renaming = app.renameProject("api", "core");
+    await vi.advanceTimersByTimeAsync(0);
+    app.selectItem("api/spec.md");
+    await vi.advanceTimersByTimeAsync(0);
+    finish();
+    await renaming;
+    await app.settled();
+    expect(app.document).toMatchObject({
+      status: "ready",
+      path: "core/spec.md",
+      text: "# Spec\nbody",
+    });
   });
 });

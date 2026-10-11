@@ -230,8 +230,12 @@
   let deleteRequest: { key: string; name: string; notes: number; tasks: number } | null =
     $state.raw(null);
 
+  /** The project row, where focus goes back when the dialog is cancelled. */
+  let deleteReturn: HTMLElement | null = $state.raw(null);
+
   function requestDelete(key: string) {
     if (!findProjectByKey(app.workspace, key)) return;
+    deleteReturn = shell?.querySelector<HTMLElement>(`[data-nav-id="${CSS.escape(key)}"]`) ?? null;
     deleteRequest = { key, name: projectNameOf(key), ...app.projectContents(key) };
   }
 
@@ -516,8 +520,8 @@
       {searchShortcut}
       {archived}
       onrenameproject={(key, name) => app.renameProject(key, name)}
-      onarchive={(name) => void app.archiveProject(name)}
-      onunarchive={(name) => void app.unarchiveProject(name)}
+      onarchive={(name) => app.archiveProject(name)}
+      onunarchive={(name) => app.unarchiveProject(name)}
       ondeleteproject={requestDelete}
       oncopypath={copyPath}
       onundo={undoProject}
@@ -645,6 +649,7 @@
     title="Delete project"
     confirmLabel="Delete"
     danger
+    returnFocus={deleteReturn}
     onconfirm={() => void confirmDelete()}
     oncancel={() => (deleteRequest = null)}
   >

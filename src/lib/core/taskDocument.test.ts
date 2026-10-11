@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  deleteAppendedTask,
+  appendLines,
   blockOf,
   cleanTaskText,
   deleteTask as deleteAt,
@@ -410,6 +412,29 @@ describe("insertTask", () => {
     expect(insertTask(doc("text"), "a", { after: 0 })).toBeNull();
     expect(insertTask(doc("# A"), "a", { section: 1 })).toBeNull();
     expect(insertTask(doc("# A"), "a", { section: -2 })).toBeNull();
+  });
+});
+
+describe("deleteAppendedTask", () => {
+  const append = (text: string, added: string) => {
+    const edit = appendLines(parseTaskDocument(text), splitLines(added));
+    if (!edit) throw new Error("not appended");
+    return edit.text;
+  };
+  const take = (text: string, raw: string) =>
+    deleteAppendedTask(parseTaskDocument(text), { line: 0, raw })?.text ?? null;
+
+  it("gives back a list without a final line break unchanged", () => {
+    const text = append("- [ ] w", "- [ ] x\n  - [ ] y\n");
+    expect(text).toBe("- [ ] w\n- [ ] x\n  - [ ] y");
+    expect(take(text, "- [ ] x")).toBe("- [ ] w");
+  });
+
+  it("keeps the final break of lists that had one, and blocks not at the end", () => {
+    expect(take(append("- [ ] w\n", "- [ ] x\n"), "- [ ] x")).toBe("- [ ] w\n");
+    expect(take("- [ ] x\n- [ ] w", "- [ ] x")).toBe("- [ ] w");
+    expect(take("- [ ] x", "- [ ] x")).toBe("");
+    expect(take("- [ ] w", "- [ ] gone")).toBeNull();
   });
 });
 

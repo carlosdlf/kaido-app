@@ -138,7 +138,10 @@ fn rename_folder_with(
             Err(e) => return Err(AppError::from_io(&e, "check", to)),
         }
     }
-    ensure_links_keep_pointing(&from_path, from, to)?;
+    // On a case-insensitive volume a link through the old name (`../a/x`)
+    // still reaches the folder after a case-only rename (`a` to `A`).
+    let fold_case = ignore_case && same_parent && fs_ops::is_case_variant(from_name, to_name);
+    ensure_links_keep_pointing(&from_path, from, to, fold_case)?;
 
     let created = fs_ops::create_folders(&missing, to)?;
     let result = if case_only {
@@ -188,10 +191,22 @@ fn has_case_variant(dir: &Path, name: &str, except: Option<&str>) -> bool {
 /// to `to` if a relative link inside it would point somewhere else after the
 /// move: a link into the folder must reach the same entry at its new place,
 /// and a link out of it the same location as before. Absolute links are
-/// unaffected.
-fn ensure_links_keep_pointing(from_path: &Path, from: &str, to: &str) -> AppResult<()> {
-    let from_parts: Vec<String> = from.split('/').map(str::to_owned).collect();
-    let to_parts: Vec<String> = to.split('/').map(str::to_owned).collect();
+/// unaffected. With `fold_case`, names are compared ignoring letter case.
+fn ensure_links_keep_pointing(
+    from_path: &Path,
+    from: &str,
+    to: &str,
+    fold_case: bool,
+) -> AppResult<()> {
+    let fold = |parts: Vec<String>| -> Vec<String> {
+        if fold_case {
+            parts.into_iter().map(|p| p.to_lowercase()).collect()
+        } else {
+            parts
+        }
+    };
+    let from_parts = fold(from.split('/').map(str::to_owned).collect());
+    let to_parts = fold(to.split('/').map(str::to_owned).collect());
     let mut stack = vec![(from_path.to_path_buf(), Vec::<String>::new())];
     while let Some((dir, inner)) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -211,8 +226,8 @@ fn ensure_links_keep_pointing(from_path: &Path, from: &str, to: &str) -> AppResu
                 let Ok(target) = fs::read_link(entry.path()) else {
                     continue;
                 };
-                let before = resolve_lexically(&from_parts, &here, &target);
-                let after = resolve_lexically(&to_parts, &here, &target);
+                let before = resolve_lexically(&from_parts, &here, &target).map(fold);
+                let after = resolve_lexically(&to_parts, &here, &target).map(fold);
                 let moves_along = match (&before, &after) {
                     // Into the folder: must reach the same entry after it moved.
                     (Some(before), Some(after)) if before.starts_with(&from_parts) => {
@@ -349,16 +364,17 @@ fn native_rename_no_replace(from: &Path, to: &Path) -> Option<io::Result<()>> {
 
 /// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` (an existing target is
 /// an error) and without `MOVEFILE_COPY_ALLOWED` (another volume is an
-/// error instead of a copy).
+/// error instead of a copy). Paths are passed in extended-length form (see
+/// [`extended_length`]), so folders deeper than 260 characters can move.
+/// It never answers `None`: there is no check-then-rename fallback here.
 #[cfg(windows)]
 fn native_rename_no_replace(from: &Path, to: &Path) -> Option<io::Result<()>> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
     let wide = |path: &Path| -> Vec<u16> {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
+        let mut out = extended_length(&path.as_os_str().encode_wide().collect::<Vec<u16>>());
+        out.push(0);
+        out
     };
     let (from, to) = (wide(from), wide(to));
     // SAFETY: both arguments are valid NUL-terminated wide strings that
@@ -371,20 +387,72 @@ fn native_rename_no_replace(from: &Path, to: &Path) -> Option<io::Result<()>> {
     })
 }
 
+/// The extended-length form of a Windows path, given as UTF-16, which lifts
+/// the 260-character limit of the file APIs:
+///
+/// - `C:\x` becomes `\\?\C:\x`;
+/// - `\\server\share\x` becomes `\\?\UNC\server\share\x`;
+/// - `/` is turned into `\` first, since extended-length paths are not
+///   normalized by Windows.
+///
+/// Paths that already start with `\\?\` or `\\.\` are returned as they are.
+/// Relative paths, drive-relative paths (`C:x`), rooted paths without a
+/// drive (`\x`) and paths with `.` or `..` parts are only normalized for
+/// `/`, since the prefix would change their meaning.
+#[cfg(any(windows, test))]
+fn extended_length(path: &[u16]) -> Vec<u16> {
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+    if path.starts_with(&wide(r"\\?\")) || path.starts_with(&wide(r"\\.\")) {
+        return path.to_vec();
+    }
+    let backslash = u16::from(b'\\');
+    let path: Vec<u16> = path
+        .iter()
+        .map(|&c| if c == u16::from(b'/') { backslash } else { c })
+        .collect();
+    if path
+        .split(|&c| c == backslash)
+        .any(|part| part == wide(".") || part == wide(".."))
+    {
+        return path;
+    }
+    let is_letter = |c: u16| u8::try_from(c).is_ok_and(|b| b.is_ascii_alphabetic());
+    let (prefix, rest) = match path.as_slice() {
+        [drive, colon, sep, ..]
+            if is_letter(*drive) && *colon == u16::from(b':') && *sep == backslash =>
+        {
+            (wide(r"\\?\"), path.as_slice())
+        }
+        [a, b, c, rest @ ..] if *a == backslash && *b == backslash && *c != backslash => {
+            let mut unc = wide(r"\\?\UNC\");
+            unc.push(*c);
+            (unc, rest)
+        }
+        _ => return path,
+    };
+    let mut out = prefix;
+    out.extend_from_slice(rest);
+    out
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
 fn native_rename_no_replace(_from: &Path, _to: &Path) -> Option<io::Result<()>> {
     None
 }
 
+/// Start of the `Io` message [`delete_folder`] returns when the system trash
+/// cannot be used. The frontend matches on it, so it must not change.
+pub const TRASH_UNAVAILABLE_PREFIX: &str = "The system trash is not available for this folder";
+
 /// Moves the project folder `rel` to the OS trash (see
 /// [`ensure_project_folder`] for which folders are accepted). There is no
 /// hash precondition: the app asks the user first.
 ///
-/// The fallback rules are those of [`fs_ops::delete_file`]: only on Linux and
-/// other freedesktop systems, and only when the trash folders themselves
-/// cannot be used, the folder is removed permanently instead (links inside
-/// it are removed, never followed). Any other trash failure is reported and
-/// the folder is left in place.
+/// A project is never removed permanently. Unlike notes in
+/// [`fs_ops::delete_file`], when the trash folders themselves cannot be used
+/// (Linux and other freedesktop systems) the folder is kept and the result
+/// is `Io` with a message starting with [`TRASH_UNAVAILABLE_PREFIX`]. Any
+/// other trash failure is reported as well and the folder is left in place.
 pub fn delete_folder(root: &Path, rel: &str) -> AppResult<()> {
     delete_folder_with(root, rel, fs_ops::move_to_os_trash)
 }
@@ -398,9 +466,9 @@ fn delete_folder_with(
     let path = fs_ops::real_folder(root, rel, rel, true)?;
     match move_to_trash(&path) {
         Ok(()) => Ok(()),
-        Err(err) if fs_ops::trash_unavailable(&err, &path) => {
-            fs::remove_dir_all(&path).map_err(|e| AppError::from_io(&e, "delete", rel))
-        }
+        Err(err) if fs_ops::trash_unavailable(&err, &path) => Err(AppError::Io(format!(
+            "{TRASH_UNAVAILABLE_PREFIX}; {rel} was not deleted"
+        ))),
         Err(err) => Err(fs_ops::trash_failure(&err, &path, rel)),
     }
 }
@@ -587,6 +655,40 @@ mod tests {
         assert!(root.join("c/n.md").exists());
         let err = check_then_rename(&root.join("c"), &root.join("file/x")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn extended_length_paths() {
+        let ext = |path: &str| -> String {
+            let wide: Vec<u16> = path.encode_utf16().collect();
+            String::from_utf16(&extended_length(&wide)).unwrap()
+        };
+        assert_eq!(ext(r"C:\Users\me\notes\a"), r"\\?\C:\Users\me\notes\a");
+        assert_eq!(ext(r"d:\a"), r"\\?\d:\a");
+        assert_eq!(ext("C:/Users/me/a"), r"\\?\C:\Users\me\a");
+        assert_eq!(ext(r"\\server\share\a"), r"\\?\UNC\server\share\a");
+        assert_eq!(ext("//server/share/a"), r"\\?\UNC\server\share\a");
+        // Already extended or a device path: unchanged.
+        assert_eq!(ext(r"\\?\C:\a"), r"\\?\C:\a");
+        assert_eq!(ext(r"\\?\UNC\server\share"), r"\\?\UNC\server\share");
+        assert_eq!(ext(r"\\.\C:\a"), r"\\.\C:\a");
+        // Not absolute, or not safe to prefix: unchanged.
+        for same in [
+            r"a\b",
+            r"C:a",
+            r"\a",
+            r"\\\a",
+            r"C:\a\..\b",
+            r"C:\.\a",
+            "",
+            "1:\\a",
+        ] {
+            assert_eq!(ext(same), same, "{same}");
+        }
+        assert_eq!(ext(r"C:\a\..b"), r"\\?\C:\a\..b");
+        // A path over 260 characters keeps every character.
+        let long = format!(r"C:\{}", "x".repeat(300));
+        assert_eq!(ext(&long), format!(r"\\?\{long}"));
     }
 
     #[test]
@@ -903,6 +1005,44 @@ mod tests {
         }
 
         #[test]
+        fn case_only_rename_keeps_links_through_the_old_name_when_case_is_ignored() {
+            // Regression: on Windows and macOS a link like `../a/x.md` was
+            // treated as broken by renaming `a` to `A`.
+            let (_dir, root) = workspace();
+            put(&root, "a/x.md", "x");
+            put(&root, "b/t.md", "t");
+            symlink("../a/x.md", root.join("a/self.md")).unwrap();
+            symlink("../b/t.md", root.join("a/sibling.md")).unwrap();
+            let insensitive =
+                |from: &str, to: &str| rename_folder_with(&root, from, to, true, rename_no_replace);
+            // Case-sensitive: the link to the old name would break.
+            assert_eq!(rename_kind(&root, "a", "A"), "InvalidPath");
+            // Only the case-only rename of the same folder folds case.
+            assert_eq!(insensitive("a", "c").unwrap_err().kind(), "InvalidPath");
+            assert_eq!(
+                insensitive("a", "_archive/A").unwrap_err().kind(),
+                "InvalidPath"
+            );
+            // The test volume is case-sensitive, so `A/self.md` now dangles and
+            // is not listed; on a case-insensitive one it reaches `A/x.md`.
+            assert_eq!(
+                paths_of(&insensitive("a", "A").unwrap()),
+                ["A/sibling.md", "A/x.md"]
+            );
+            assert!(
+                fs::symlink_metadata(root.join("A/self.md"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            // Back to the old name, folding case again.
+            assert_eq!(
+                paths_of(&insensitive("A", "a").unwrap()),
+                ["a/self.md", "a/sibling.md", "a/x.md"]
+            );
+        }
+
+        #[test]
         fn links_in_hidden_folders_are_not_checked() {
             let (_dir, root) = workspace();
             put(&root, "a/n.md", "x");
@@ -1028,17 +1168,40 @@ mod tests {
         }
 
         #[test]
-        fn removes_permanently_only_when_the_trash_cannot_be_used() {
+        fn keeps_the_folder_when_the_trash_cannot_be_used() {
+            // Regression: a project used to be removed permanently here while
+            // the app said it went to the trash.
             let (_dir, root) = workspace();
             let (_outside_dir, outside) = workspace();
             put(&outside, "secret.md", "s");
             put(&root, "a/n.md", "x");
+            put(&root, "_archive/b/n.md", "x");
             symlink(&outside, root.join("a/out")).unwrap();
-            symlink(outside.join("secret.md"), root.join("a/secret.md")).unwrap();
-            delete_folder_with(&root, "a", unavailable).unwrap();
-            assert!(!root.join("a").exists());
-            // Links inside are removed, never followed.
+            for rel in ["a", "_archive/b"] {
+                let err = delete_folder_with(&root, rel, unavailable).unwrap_err();
+                assert_eq!(err.kind(), "Io", "{rel}");
+                assert!(
+                    err.to_string().starts_with(TRASH_UNAVAILABLE_PREFIX),
+                    "{rel}"
+                );
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "The system trash is not available for this folder; {rel} was not deleted"
+                    )
+                );
+                assert!(root.join(rel).join("n.md").exists(), "{rel}");
+            }
+            assert!(root.join("a/out").exists());
             assert_eq!(fs::read_to_string(outside.join("secret.md")).unwrap(), "s");
+            let json =
+                serde_json::to_value(delete_folder_with(&root, "a", unavailable).unwrap_err())
+                    .unwrap();
+            assert_eq!(json["kind"], "Io");
+            assert_eq!(
+                json["message"],
+                "The system trash is not available for this folder; a was not deleted"
+            );
         }
 
         #[test]
@@ -1054,18 +1217,6 @@ mod tests {
             .unwrap_err();
             assert_eq!(err.kind(), "PermissionDenied");
             assert!(root.join("a/n.md").exists());
-        }
-
-        #[test]
-        fn fallback_remove_failure_is_reported() {
-            let (_dir, root) = workspace();
-            put(&root, "a/n.md", "x");
-            let err = delete_folder_with(&root, "a", |path| {
-                fs::remove_dir_all(path).unwrap();
-                unavailable(path)
-            })
-            .unwrap_err();
-            assert_eq!(err.kind(), "NotFound");
         }
     }
 }

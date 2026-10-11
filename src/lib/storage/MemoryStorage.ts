@@ -7,7 +7,10 @@
  * conditional writes based on content hashes. Renames stay within a folder,
  * moves may go anywhere, and neither replaces a file; folder moves and
  * deletes take every file inside along and are reported as a rescan, like
- * the file watcher does. Deleted files are kept in `trash`. A fake git
+ * the file watcher does. Deleted files are kept in `trash`, unless
+ * `trashUnavailable` simulates a folder the system trash cannot take, which
+ * is then refused and kept. Empty folders can be added with
+ * `addEmptyFolder`; a folder move refuses them as targets. A fake git
  * repository (`git`) commits snapshots of the files and simulates an
  * upstream, paused states and failures.
  */
@@ -115,6 +118,10 @@ export class MemoryStorage implements Storage {
   /** Fails the next clone with this error. */
   cloneError: StorageError | null = null;
   #heldClone: { resolve: () => void; reject: (error: StorageError) => void } | null = null;
+  /** `deleteFolder` refuses like the backend does when the system trash cannot take a folder. */
+  trashUnavailable = false;
+  /** Empty folders of each workspace, by root; they hold no file to list. */
+  readonly #emptyFolders = new Map<string, Set<string>>();
   #closeHandler: CloseHandler | null = null;
   readonly #now: () => number;
   readonly #echoWrites: boolean;
@@ -150,6 +157,15 @@ export class MemoryStorage implements Storage {
     const modified = this.#now();
     for (const [path, contents] of Object.entries(files)) stored.set(path, { contents, modified });
     this.folders.set(root, stored);
+  }
+
+  /** Adds an empty folder (workspace-relative) to the open workspace. */
+  addEmptyFolder(path: string): void {
+    this.#files();
+    const root = this.root ?? "";
+    const folders = this.#emptyFolders.get(root) ?? new Set<string>();
+    folders.add(path);
+    this.#emptyFolders.set(root, folders);
   }
 
   /** Marks a file of the open workspace as read-only (or writable again). */
@@ -291,7 +307,10 @@ export class MemoryStorage implements Storage {
     const files = this.#files();
     const moved = this.#inside(from);
     if (moved.length === 0) throw new StorageError("NotFound", `${from} does not exist.`);
-    if (this.#inside(to).length > 0) throw new StorageError("Conflict", `${to} already exists.`);
+    const empty = this.#emptyFolders.get(this.root ?? "");
+    if (this.#inside(to).length > 0 || empty?.has(to)) {
+      throw new StorageError("Conflict", `${to} already exists.`);
+    }
     const entries: FileEntry[] = [];
     for (const path of moved) {
       const file = files.get(path);
@@ -312,6 +331,12 @@ export class MemoryStorage implements Storage {
     const files = this.#files();
     const removed = this.#inside(path);
     if (removed.length === 0) throw new StorageError("NotFound", `${path} does not exist.`);
+    if (this.trashUnavailable) {
+      throw new StorageError(
+        "Io",
+        `The system trash is not available for this folder; ${path} was not deleted`,
+      );
+    }
     for (const inside of removed) {
       const file = files.get(inside);
       if (!file) continue;

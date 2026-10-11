@@ -473,9 +473,30 @@ describe("MemoryStorage.renameFolder", () => {
       entries: [{ path: "A/x.md", size: 1, modified: 1001 }],
     });
   });
+
+  it("refuses an existing empty target folder, like the backend", async () => {
+    const store = await opened({ "a/x.md": "x" });
+    store.addEmptyFolder("b");
+    await expect(store.renameFolder("a", "b")).rejects.toMatchObject({ kind: "Conflict" });
+    expect(await store.listFiles()).toEqual([{ path: "a/x.md", size: 1, modified: 1001 }]);
+    await expect(store.renameFolder("a", "c")).resolves.toMatchObject({
+      entries: [{ path: "c/x.md" }],
+    });
+  });
 });
 
 describe("MemoryStorage.deleteFolder", () => {
+  it("keeps the folder when the system trash is not available", async () => {
+    const store = await opened({ "a/x.md": "x" });
+    store.trashUnavailable = true;
+    await expect(store.deleteFolder("a")).rejects.toMatchObject({
+      kind: "Io",
+      message: "The system trash is not available for this folder; a was not deleted",
+    });
+    expect(store.trash).toEqual([]);
+    expect(await store.listFiles()).toHaveLength(1);
+  });
+
   it("moves every file of the folder to the trash and reports a rescan", async () => {
     const store = await opened({ "a/tasks.md": "t", "a/n.md": "n", "b/x.md": "x" });
     const listener = vi.fn();

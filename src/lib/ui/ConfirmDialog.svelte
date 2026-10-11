@@ -30,6 +30,12 @@
   let dialog: HTMLElement | undefined = $state();
   let cancelButton: HTMLButtonElement | undefined = $state();
   let previous: HTMLElement | null = null;
+  /** Set once the dialog answered, so giving focus back is not undone. */
+  let closed = false;
+
+  function inside(target: EventTarget | null): boolean {
+    return dialog !== undefined && target instanceof Node && dialog.contains(target);
+  }
 
   onMount(() => {
     previous =
@@ -40,9 +46,31 @@
           : null;
     // The safe choice has focus, so Enter right away changes nothing.
     cancelButton?.focus();
+
+    // The dialog is modal: focus that ends up behind it (e.g. moved by
+    // code) comes back, and keys never act on what is behind it.
+    const pullFocus = (event: FocusEvent) => {
+      if (closed || inside(event.target)) return;
+      cancelButton?.focus();
+    };
+    const guardKeys = (event: KeyboardEvent) => {
+      if (closed || inside(event.target)) return;
+      handleKeydown(event);
+      if (event.defaultPrevented) return;
+      event.preventDefault();
+      event.stopPropagation();
+      cancelButton?.focus();
+    };
+    window.addEventListener("focusin", pullFocus, true);
+    window.addEventListener("keydown", guardKeys, true);
+    return () => {
+      window.removeEventListener("focusin", pullFocus, true);
+      window.removeEventListener("keydown", guardKeys, true);
+    };
   });
 
   function giveBack() {
+    closed = true;
     if (previous?.isConnected) previous.focus();
   }
 
@@ -70,10 +98,15 @@
     const first = buttons[0];
     const last = buttons.at(-1);
     if (!first || !last) return;
-    if (event.shiftKey && document.activeElement === first) {
+    const current = document.activeElement;
+    if (!inside(current)) {
+      event.preventDefault();
+      event.stopPropagation();
+      (event.shiftKey ? last : first).focus();
+    } else if (event.shiftKey && current === first) {
       event.preventDefault();
       last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
+    } else if (!event.shiftKey && current === last) {
       event.preventDefault();
       first.focus();
     }

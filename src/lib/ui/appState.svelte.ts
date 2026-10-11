@@ -68,6 +68,7 @@ import * as taskOps from "$lib/core/taskDocument";
 import type {
   InsertPosition,
   RemovedLines,
+  SourceLine,
   TaskDocument,
   TaskEdit,
   TaskRef,
@@ -220,6 +221,14 @@ interface DeletedTask {
   generation: number;
 }
 
+/** What a toast button other than Undo does, with the file it is about. */
+interface ToastAction {
+  path: string;
+  /** The file exists (it moves along with moves), or is still to be created. */
+  exists: boolean;
+  run: (path: string) => Promise<void>;
+}
+
 /** A move an undo toast can take back. */
 type MoveUndo =
   /** A note now at `to`, which goes back to `from`. */
@@ -233,6 +242,8 @@ type MoveUndo =
       target: string;
       removed: RemovedLines;
       inserted: TaskRef;
+      /** The block's lines as they were put into `target`. */
+      lines: readonly string[];
       generation: number;
     };
 
@@ -438,6 +449,14 @@ export function taskMoveFailedMessage(project: string, message: string): string 
   return `The task could not be moved to ${project}: ${message}`;
 }
 
+export function taskNotMovedBackMessage(message: string): string {
+  return `The task could not be moved back: ${message}`;
+}
+
+export function linksNotUpdatedMessage(paths: readonly string[]): string {
+  return `Links in ${paths.join(", ")} could not be updated`;
+}
+
 export function unsavedMoveMessage(paths: readonly string[]): string {
   return `Changes to ${paths.join(", ")} could not be saved, so nothing was changed.`;
 }
@@ -464,6 +483,16 @@ export function unarchiveTakenMessage(existing: string, name: string): string {
 
 export function projectTrashedMessage(name: string): string {
   return `Project ${name} moved to the trash`;
+}
+
+/** How the backend says a folder was kept because the system trash cannot take it. */
+const TRASH_UNAVAILABLE_PREFIX = "The system trash is not available for this folder";
+
+export function deleteProjectFailedMessage(name: string, error: StorageError): string {
+  if (error.kind === "Io" && error.message.startsWith(TRASH_UNAVAILABLE_PREFIX)) {
+    return `Could not delete ${name}: the system trash is not available here. Nothing was deleted.`;
+  }
+  return `Could not delete ${name}: ${error.message}`;
 }
 
 export function projectActionFailedMessage(name: string, action: string, message: string): string {
@@ -711,7 +740,9 @@ export class AppState {
   readonly #moveUndos = new Map<number, MoveUndo>();
   /** Other toast actions, by toast id. */
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- private bookkeeping, never rendered
-  readonly #toastActions = new Map<number, () => Promise<void>>();
+  readonly #toastActions = new Map<number, ToastAction>();
+  /** The folder being moved or deleted, and when that is done (moves run one at a time). */
+  #moving: { folder: string; done: Promise<void> } | null = null;
   /** Tasks a note is being created from, by path and line text. */
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- private bookkeeping, never rendered
   readonly #creatingFromTask = new Set<string>();
@@ -974,6 +1005,10 @@ export class AppState {
   async createNote(): Promise<void> {
     if (this.phase.kind !== "ready") return;
     const generation = this.#generation;
+    // A project being moved gets the note where it ends up.
+    const moved = this.#moveOf(newNoteFolder(this.folder));
+    if (moved) await moved;
+    if (generation !== this.#generation || this.phase.kind !== "ready") return;
     const folder = newNoteFolder(this.folder);
     const isIgnored = createPathFilter(this.#config);
     // Names are compared case-insensitively, since many file systems are.
@@ -1064,7 +1099,7 @@ export class AppState {
       if (generation !== this.#generation) return { kind: "failed" };
       const moves: PathMove[] = [{ from: path, to, folder: false }];
       this.#remapUndo(moves);
-      this.#retargetAll(moves);
+      await this.#retargetAll(moves);
       return { kind: "renamed", path: to };
     });
   }
@@ -1322,7 +1357,11 @@ export class AppState {
     const id = this.#toast(missingNoteMessage(baseName(link.path)), "Create");
     const title = textWithoutLinks(task.text);
     const generation = this.#generation;
-    this.#toastActions.set(id, () => this.#createLinkedNote(link.path, title, generation));
+    this.#toastActions.set(id, {
+      path: link.path,
+      exists: false,
+      run: (path) => this.#createLinkedNote(path, title, generation),
+    });
   }
 
   /**
@@ -1558,7 +1597,7 @@ export class AppState {
     const path = this.#addCreated(created.written, contents).path;
     const message = capturedNoteMessage(path);
     const id = this.#toast(message, "Open");
-    this.#toastActions.set(id, async () => this.openNote(path));
+    this.#toastActions.set(id, { path, exists: true, run: async (at) => this.openNote(at) });
     return { ok: true, message };
   }
 
@@ -1567,7 +1606,7 @@ export class AppState {
     const action = this.#toastActions.get(id);
     if (!action) return this.undoDelete(id);
     this.dismissToast(id);
-    await action();
+    await action.run(action.path);
     return "create";
   }
 
@@ -1686,7 +1725,7 @@ export class AppState {
     if (selected && this.item === to) this.folder = projectKeyOf(to);
     const moves: PathMove[] = [{ from: path, to, folder: false }];
     this.#remapUndo(moves);
-    this.#retargetAll(moves);
+    await this.#retargetAll(moves);
     return { kind: "moved", path: to };
   }
 
@@ -1726,16 +1765,26 @@ export class AppState {
         this.#toast(taskMoveFailedMessage(project, TASK_LIST_UNAVAILABLE));
         return { kind: "failed" };
       }
+      const inserted = { line: added.focus, raw: lines[0]?.text ?? "" };
+      // The task leaves its list only once it is safely in the other one.
+      const failure = await this.#saveNow(target);
+      if (generation !== this.#generation) return { kind: "failed" };
+      if (failure !== null) {
+        this.#editTasks(target, null, (current) => taskOps.deleteAppendedTask(current, inserted));
+        this.#toast(taskMoveFailedMessage(project, failure));
+        return { kind: "failed" };
+      }
       let removed: RemovedLines | null = null;
       this.#editTasks(path, ref, (current) => {
         const deletion = taskOps.deleteTask(current, ref);
-        removed = deletion?.removed ?? null;
+        // Changed while the other list was saved: it stays where it is.
+        if (!deletion || taskOps.joinLines(deletion.removed.lines) !== blockText) return null;
+        removed = deletion.removed;
         return deletion;
       });
-      const inserted = { line: added.focus, raw: lines[0]?.text ?? "" };
       if (removed === null) {
-        // Cannot happen within one step; never leave the task in both lists.
-        this.#editTasks(target, null, (current) => taskOps.deleteTask(current, inserted));
+        // Never leave the task in both lists.
+        this.#editTasks(target, null, (current) => taskOps.deleteAppendedTask(current, inserted));
         this.#toast(TASK_CHANGED);
         return { kind: "failed" };
       }
@@ -1746,6 +1795,7 @@ export class AppState {
         target,
         removed,
         inserted,
+        lines: lines.map((line) => line.text),
         generation,
       });
       return { kind: "moved", path: target };
@@ -1902,13 +1952,12 @@ export class AppState {
           await this.#storage.deleteFolder(key);
         } catch (error) {
           if (generation === this.#generation) {
-            const message = toStorageError(error).message;
-            this.#toast(projectActionFailedMessage(name, "deleted", message));
+            this.#toast(deleteProjectFailedMessage(name, toStorageError(error)));
           }
           return;
         }
         if (generation !== this.#generation) return;
-        this.#applyFolderDelete(key, held.sessions);
+        this.#applyFolderDelete(key);
       } finally {
         held.release();
       }
@@ -1929,7 +1978,7 @@ export class AppState {
   async #undoMove(undo: MoveUndo): Promise<void> {
     if (undo.generation !== this.#generation) return;
     if (undo.kind === "task") {
-      this.#undoTaskMove(undo);
+      await this.#undoTaskMove(undo);
       return;
     }
     await this.#serial(async () => {
@@ -1944,23 +1993,74 @@ export class AppState {
     });
   }
 
-  #undoTaskMove(undo: Extract<MoveUndo, { kind: "task" }>): void {
-    const target = this.#currentTasks(undo.target);
-    const line = target ? taskOps.locateTask(target, undo.inserted) : null;
-    const block = target && line !== null ? taskOps.blockOf(target, line) : null;
-    if (!block || block.line !== line) {
-      this.#toast(TASK_CHANGED);
-      return;
-    }
-    const taken = this.#editTasks(undo.target, undo.inserted, (doc) =>
-      taskOps.deleteTask(doc, undo.inserted),
-    );
-    if (!taken) return;
-    const restored = this.#editTasks(undo.source, null, (doc) =>
-      taskOps.restoreLines(doc, undo.removed),
-    );
-    if (restored) this.#requestTaskFocus(undo.source, restored.focus);
-    else this.#toast(TASK_NOT_RESTORED);
+  /**
+   * Moves a task back: restores it in its old list, and only once that is
+   * saved takes it out of the list it was moved to. Runs in the change queue.
+   */
+  #undoTaskMove(undo: Extract<MoveUndo, { kind: "task" }>): Promise<void> {
+    return this.#serial(async () => {
+      if (undo.generation !== this.#generation) return;
+      const target = this.#currentTasks(undo.target);
+      const line = target ? taskOps.locateTask(target, undo.inserted) : null;
+      const block = target && line !== null ? taskOps.blockOf(target, line) : null;
+      if (!target || !block || block.line !== line) {
+        this.#toast(TASK_CHANGED);
+        return;
+      }
+      // Lines unchanged since the move go back as they were; lines changed
+      // since (e.g. by a link update) keep the change, with links for the old list.
+      const now = target.lines.slice(block.line, block.end);
+      const lines = now.map((current, index): SourceLine => {
+        const original = undo.removed.lines[index];
+        if (original && current.text === undo.lines[index]) return original;
+        const eol = original?.eol ?? current.eol;
+        const text = retargetLinks(current.text, undo.target, [], undo.source)?.text;
+        return { text: text ?? current.text, eol };
+      });
+      const removed = { ...undo.removed, lines };
+      const restored = this.#editTasks(undo.source, null, (doc) =>
+        taskOps.restoreLines(doc, removed),
+      );
+      if (restored?.focus == null) {
+        this.#toast(TASK_NOT_RESTORED);
+        return;
+      }
+      const back = { line: restored.focus, raw: lines[0]?.text ?? "" };
+      const failure = await this.#saveNow(undo.source);
+      if (undo.generation !== this.#generation) return;
+      if (failure !== null) {
+        this.#editTasks(undo.source, null, (doc) => taskOps.deleteTask(doc, back));
+        this.#toast(taskNotMovedBackMessage(failure));
+        return;
+      }
+      const taken = this.#editTasks(undo.target, undo.inserted, (doc) =>
+        taskOps.deleteAppendedTask(doc, undo.inserted),
+      );
+      if (!taken) {
+        // Changed in its new list meanwhile: it stays there, and only there.
+        this.#editTasks(undo.source, null, (doc) => taskOps.deleteTask(doc, back));
+        return;
+      }
+      this.#requestTaskFocus(undo.source, restored.focus);
+    });
+  }
+
+  /** When the folder move that `path` is part of is done, or `null` if none is. */
+  #moveOf(path: string): Promise<void> | null {
+    const moving = this.#moving;
+    if (!moving || (path !== moving.folder && !isInside(path, moving.folder))) return null;
+    return moving.done;
+  }
+
+  /**
+   * Saves the pending edits of the session at `path` now. Returns why they
+   * could not be saved, or `null` once they are on disk.
+   */
+  async #saveNow(path: string): Promise<string | null> {
+    const session = this.#sessions.get(path);
+    if (!session) return TASK_LIST_UNAVAILABLE;
+    await session.flush();
+    return session.status.kind === "failed" ? session.status.message : null;
   }
 
   /**
@@ -1974,8 +2074,15 @@ export class AppState {
     const sessions = [...this.#sessions.values()].filter((session) =>
       isInside(session.path, folder),
     );
-    let release: () => void = () => undefined;
-    const gate = new Promise<void>((resolve) => (release = resolve));
+    let open: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => (open = resolve));
+    // Sessions and reads that start inside the folder meanwhile wait as well.
+    const moving = { folder, done: gate };
+    this.#moving = moving;
+    const release = () => {
+      if (this.#moving === moving) this.#moving = null;
+      open();
+    };
     const held = await Promise.all(
       sessions.map(
         (session) =>
@@ -2025,7 +2132,7 @@ export class AppState {
       held.release();
     }
     const moves: PathMove[] = [{ from, to, folder: true }];
-    this.#retargetAll(moves);
+    await this.#retargetAll(moves);
     return "moved";
   }
 
@@ -2094,6 +2201,8 @@ export class AppState {
           session && doc.status === "ready"
             ? { status: "ready", path: docPath, text: session.text, modified: doc.modified }
             : { ...doc, path: docPath };
+        // A read that waited for the move starts again at the new path.
+        if (doc.status === "loading") void this.#loadDocument(docPath, this.#generation);
       }
     }
     const focus = this.taskFocus;
@@ -2110,8 +2219,10 @@ export class AppState {
   }
 
   /** Forgets everything inside a deleted folder; selects the inbox if it was selected. */
-  #applyFolderDelete(folder: string, sessions: readonly SaveSession[]): void {
+  #applyFolderDelete(folder: string): void {
     const gone = (path: string) => isInside(path, folder);
+    // Including sessions started while the delete waited.
+    const sessions = [...this.#sessions.values()].filter((session) => gone(session.path));
     const removed = this.#files.filter((file) => gone(file.path)).map((file) => file.path);
     this.#files = this.#files.filter((file) => !gone(file.path));
     this.workspace = buildWorkspace(this.#files, this.#config);
@@ -2168,11 +2279,18 @@ export class AppState {
     this.#updateSettings((settings) => withHideDone(settings, root, keys));
   }
 
-  /** Keeps undo toasts pointing at the files they belong to after paths moved. */
+  /**
+   * Keeps undo toasts and toast actions pointing at the files they belong to
+   * after paths moved. A path where nothing is now (a deleted note, the old
+   * place of a moved note, a note still to create) only follows the folder
+   * it was in; a file moved since to that path is something else.
+   */
   #remapUndo(moves: readonly PathMove[]): void {
     const map = (path: string) => movedPath(path, moves);
+    const folders = moves.filter((move) => move.folder);
+    const mapAbsent = (path: string) => movedPath(path, folders);
     for (const [id, deleted] of this.#deleted) {
-      this.#deleted.set(id, { ...deleted, path: map(deleted.path) });
+      this.#deleted.set(id, { ...deleted, path: mapAbsent(deleted.path) });
     }
     for (const [id, task] of this.#deletedTasks) {
       this.#deletedTasks.set(id, { ...task, path: map(task.path) });
@@ -2181,30 +2299,89 @@ export class AppState {
       if (undo.kind === "task") {
         this.#moveUndos.set(id, { ...undo, source: map(undo.source), target: map(undo.target) });
       } else if (undo.kind === "note") {
-        this.#moveUndos.set(id, { ...undo, to: map(undo.to) });
+        this.#moveUndos.set(id, { ...undo, from: mapAbsent(undo.from), to: map(undo.to) });
       } else {
-        // The folder itself moved: the undo moves it back from where it is now.
+        // The folder itself moved: the undo moves it back from where it is
+        // now. Its old place is a top-level name that moves with nothing.
         const to = moves.reduce((key, move) => (key === move.from ? move.to : key), undo.to);
         this.#moveUndos.set(id, { ...undo, to: map(to) });
       }
     }
+    for (const [id, action] of this.#toastActions) {
+      const path = action.exists ? map(action.path) : mapAbsent(action.path);
+      this.#toastActions.set(id, { ...action, path });
+    }
   }
 
   /**
-   * Rewrites links in every known task list that point at files `moves`
-   * moved, or that leave a list `moves` moved. Each list changes through
-   * its session like any task edit.
+   * Rewrites links in every task list that point at files `moves` moved, or
+   * that leave a list `moves` moved. Lists not read yet are read first, so
+   * none is missed; each list changes through its session like any task
+   * edit. Lists that cannot be read or changed are named in one toast.
    */
-  #retargetAll(moves: readonly PathMove[]): void {
+  async #retargetAll(moves: readonly PathMove[]): Promise<void> {
+    const generation = this.#generation;
+    const failed = await this.#readTaskLists();
+    if (generation !== this.#generation) return;
     const back = reverseMoves(moves);
     for (const path of this.#tasks.paths()) {
+      if (failed.includes(path)) continue;
       const before = movedPath(path, back);
       const current = this.#currentTasks(path);
       if (!current || retargetLinks(current.text, before, moves, path) === null) continue;
-      this.#editTasks(path, null, (doc) => {
+      const result = this.#editTasks(path, null, (doc) => {
         const edits = retargetLinks(doc.text, before, moves, path);
         return edits ? { text: edits.text, focus: null } : null;
       });
+      if (result) this.#followLinkEdit(path, current, result.text);
+      else failed.push(path);
+    }
+    if (failed.length > 0) this.#toast(linksNotUpdatedMessage(failed.sort()));
+  }
+
+  /**
+   * Reads every task list of the workspace that is not known yet (or only
+   * as an unsaved text without a session). Returns the lists that cannot
+   * be read: too large or unreadable.
+   */
+  async #readTaskLists(): Promise<string[]> {
+    const generation = this.#generation;
+    const unknown = (path: string) =>
+      !this.#sessions.has(path) && (this.#tasks.get(path)?.hash ?? null) === null;
+    const failed: string[] = [];
+    const reads: Promise<void>[] = [];
+    for (const [path, entry] of this.#index) {
+      if (!isTaskListPath(path) || !unknown(path)) continue;
+      if (entry.size > MAX_SUMMARY_BYTES) {
+        failed.push(path);
+        continue;
+      }
+      reads.push(
+        this.#storage.readFile(path).then(
+          (file) => {
+            if (generation !== this.#generation || !this.#index.has(path) || !unknown(path)) return;
+            const doc = this.#tasks.set(path, file.contents, file.hash);
+            this.#setSummary(path, file.contents, doc);
+            this.#tasksChanged = true;
+          },
+          () => void failed.push(path),
+        ),
+      );
+    }
+    await Promise.all(reads);
+    if (reads.length > 0) this.#schedulePublish();
+    return failed;
+  }
+
+  /** Keeps task move undos able to find a moved task whose line a link update changed. */
+  #followLinkEdit(path: string, before: TaskDocument, text: string): void {
+    const after = taskOps.splitLines(text);
+    for (const [id, undo] of this.#moveUndos) {
+      if (undo.kind !== "task" || undo.target !== path) continue;
+      const line = taskOps.locateTask(before, undo.inserted);
+      const raw = line === null ? undefined : after[line]?.text;
+      if (line === null || raw === undefined || raw === undo.inserted.raw) continue;
+      this.#moveUndos.set(id, { ...undo, inserted: { line, raw } });
     }
   }
 
@@ -2575,6 +2752,9 @@ export class AppState {
     );
     this.#taskEdits.set(session, edits);
     this.#sessions.set(path, session);
+    // Its folder is moving: edits wait and are saved where the list ends up.
+    const moved = this.#moveOf(path);
+    if (moved) void session.exclusive(() => moved).catch(() => undefined);
     return session;
   }
 
@@ -2893,12 +3073,14 @@ export class AppState {
     return close;
   }
 
-  /** Paths of sessions that still have edits to save. */
+  /**
+   * Paths of sessions that still have edits to save. A session that is busy
+   * without edits (e.g. checking a change reported on disk) has none.
+   */
   #unsaved(sessions: Iterable<SaveSession>): string[] {
     const paths: string[] = [];
     for (const session of sessions) {
-      if ((!session.idle || session.dirty) && !paths.includes(session.path))
-        paths.push(session.path);
+      if (session.dirty && !paths.includes(session.path)) paths.push(session.path);
     }
     return paths;
   }
@@ -3247,6 +3429,12 @@ export class AppState {
     if (this.document?.path !== path) this.document = { status: "loading", path };
     const current = () =>
       generation === this.#generation && request === this.#documentRequest && this.item === path;
+    const moved = this.#moveOf(path);
+    if (moved) {
+      // Read where the file is once its folder moved (the move reloads it there).
+      await moved;
+      if (!current()) return;
+    }
     try {
       const file = await this.#storage.readFile(path);
       if (!current()) return;
